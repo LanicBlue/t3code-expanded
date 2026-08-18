@@ -6,6 +6,7 @@ export type SettingsPath =
   | "/settings/keybindings"
   | "/settings/providers"
   | "/settings/integrations"
+  | "/settings/services"
   | "/settings/source-control"
   | "/settings/connections"
   | "/settings/archived";
@@ -30,6 +31,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/keybindings": "Keybindings",
   "/settings/providers": "Providers",
   "/settings/integrations": "Integrations",
+  "/settings/services": "Services",
   "/settings/source-control": "Source Control",
   "/settings/connections": "Connections",
   "/settings/archived": "Archive",
@@ -226,6 +228,26 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Auto-show floating preview",
     to: "/settings/integrations",
     targetId: "browser",
+  },
+  {
+    id: "services",
+    title: "Services",
+    to: "/settings/services",
+  },
+  {
+    id: "project-service-connection",
+    title: "Project Service connection",
+    to: "/settings/services",
+  },
+  {
+    id: "project-service-credential",
+    title: "Project Service credential",
+    to: "/settings/services",
+  },
+  {
+    id: "logical-agents",
+    title: "Logical agents",
+    to: "/settings/services",
   },
   {
     id: "source-control",

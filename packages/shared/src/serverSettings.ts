@@ -3,6 +3,7 @@ import {
   isProviderAvailable,
   type ModelSelection,
   type ProviderDriverKind,
+  type ProviderInstanceId,
   type ServerProvider,
   ServerSettings,
   type ServerSettingsPatch,
@@ -43,6 +44,75 @@ export function isModelSelectionProviderEnabled(
     isProviderDriverKind(selection.instanceId) &&
     getLegacyProviderSettings(settings, selection.instanceId)?.enabled === true
   );
+}
+
+/**
+ * Logical agents whose `providerInstanceId` resolves to no configured
+ * instance — neither an entry in the instance map nor a built-in driver
+ * default (whose id is the driver kind itself). Checked only when a settings
+ * write carries the agent map, so a stale reference can block agent edits
+ * without failing unrelated writes (deleting a provider instance must keep
+ * working); reads stay lenient so deleting a provider instance never breaks
+ * settings loading.
+ */
+export function findLogicalAgentsWithUnresolvedProviderInstances(
+  settings: ServerSettings,
+): ReadonlyArray<{
+  readonly agentId: string;
+  readonly providerInstanceId: ProviderInstanceId;
+}> {
+  const unresolved: Array<{
+    readonly agentId: string;
+    readonly providerInstanceId: ProviderInstanceId;
+  }> = [];
+  for (const [agentId, agent] of Object.entries(settings.logicalAgents)) {
+    // Same resolution rule as isModelSelectionProviderEnabled: an explicit
+    // providerInstances entry, or the legacy default instance of a built-in
+    // driver (whose id is the driver kind itself).
+    const resolvesViaLegacyProvider =
+      isProviderDriverKind(agent.providerInstanceId) &&
+      getLegacyProviderSettings(settings, agent.providerInstanceId) !== undefined;
+    if (
+      settings.providerInstances[agent.providerInstanceId] === undefined &&
+      !resolvesViaLegacyProvider
+    ) {
+      unresolved.push({ agentId, providerInstanceId: agent.providerInstanceId });
+    }
+  }
+  return unresolved;
+}
+
+/**
+ * Agent project bindings that repeat a t3ProjectId+projectId pair. Bindings
+ * are keyed by that pair, so duplicates are rejected at write time (same
+ * gate as the provider-instance check: only when the patch carries the
+ * agent map).
+ */
+export function findDuplicateProjectBindings(settings: ServerSettings): ReadonlyArray<{
+  readonly agentId: string;
+  readonly t3ProjectId: string;
+  readonly projectId: string;
+}> {
+  const duplicates: Array<{
+    readonly agentId: string;
+    readonly t3ProjectId: string;
+    readonly projectId: string;
+  }> = [];
+  for (const [agentId, agent] of Object.entries(settings.logicalAgents)) {
+    const seen = new Set<string>();
+    for (const binding of agent.projectBindings) {
+      const key = JSON.stringify([binding.t3ProjectId, binding.projectId]);
+      if (seen.has(key)) {
+        duplicates.push({
+          agentId,
+          t3ProjectId: binding.t3ProjectId,
+          projectId: binding.projectId,
+        });
+      }
+      seen.add(key);
+    }
+  }
+  return duplicates;
 }
 
 export function resolveSourceControlWriterModelSelection(
@@ -131,6 +201,7 @@ export function applyServerSettingsPatch(
     providerHealthRefreshInterval,
     backgroundActivityProfile,
     backgroundActivity,
+    logicalAgents,
     ...patchForMerge
   } = patch;
   const currentBackgroundActivity = normalizeServerBackgroundActivitySettings(current);
@@ -169,6 +240,23 @@ export function applyServerSettingsPatch(
           }
         : undefined;
   const next = deepMerge(current, patchForMerge);
+  // The client patch carries write-only credential fields, so the merged view
+  // is rebuilt from the current persisted view rather than the deep-merged
+  // object (the server layer applies the credential side effects against the
+  // secret store separately).
+  const projectServiceClientPatch = patch.projectServiceClient;
+  const mergedProjectServiceClient =
+    projectServiceClientPatch !== undefined
+      ? {
+          ...current.projectServiceClient,
+          ...(projectServiceClientPatch.enabled !== undefined
+            ? { enabled: projectServiceClientPatch.enabled }
+            : {}),
+          ...(projectServiceClientPatch.baseUrl !== undefined
+            ? { baseUrl: projectServiceClientPatch.baseUrl }
+            : {}),
+        }
+      : undefined;
   const nextWithReplacementsBase = {
     ...next,
     ...(backgroundActivity !== undefined
@@ -186,6 +274,10 @@ export function applyServerSettingsPatch(
       : {}),
     ...(patch.providerInstances !== undefined
       ? { providerInstances: patch.providerInstances }
+      : {}),
+    ...(logicalAgents !== undefined ? { logicalAgents } : {}),
+    ...(mergedProjectServiceClient !== undefined
+      ? { projectServiceClient: mergedProjectServiceClient }
       : {}),
     ...(patch.sourceControlWriterModelSelection !== undefined
       ? { sourceControlWriterModelSelection: patch.sourceControlWriterModelSelection }

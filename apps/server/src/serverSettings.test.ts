@@ -1,6 +1,8 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   DEFAULT_SERVER_SETTINGS,
+  LogicalAgentId,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerSettings,
@@ -690,5 +692,358 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         "sk-or-secret",
       );
     }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("stores a Project Service credential in the secret store and redacts settings", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const next = yield* serverSettings.updateSettings({
+        projectServiceClient: { enabled: true, newCredential: "psk_key-1.s3cret" },
+      });
+
+      assert.deepEqual(next.projectServiceClient, {
+        enabled: true,
+        baseUrl: DEFAULT_SERVER_SETTINGS.projectServiceClient.baseUrl,
+        keyIdHint: "key-1",
+        credentialSet: true,
+      });
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      assert.notInclude(JSON.stringify(next), "s3cret");
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      assert.notInclude(JSON.stringify(next), "newCredential");
+
+      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+      assert.notInclude(raw, "psk_");
+      assert.notInclude(raw, "s3cret");
+
+      const secretBytes = yield* fileSystem.readFile(
+        `${serverConfig.secretsDir}/project-service-client-credential.bin`,
+      );
+      assert.equal(new TextDecoder().decode(secretBytes), "psk_key-1.s3cret");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("replaces the Project Service credential only when a new one is supplied", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const secretPath = `${serverConfig.secretsDir}/project-service-client-credential.bin`;
+
+      yield* serverSettings.updateSettings({
+        projectServiceClient: { newCredential: "psk_key-1.s3cret" },
+      });
+
+      // A credential-less write keeps the stored one.
+      const kept = yield* serverSettings.updateSettings({
+        projectServiceClient: { baseUrl: "http://127.0.0.1:7601" },
+      });
+      assert.equal(kept.projectServiceClient.keyIdHint, "key-1");
+      assert.equal(kept.projectServiceClient.credentialSet, true);
+      assert.equal(
+        new TextDecoder().decode(yield* fileSystem.readFile(secretPath)),
+        "psk_key-1.s3cret",
+      );
+
+      // A new credential replaces it wholesale.
+      const replaced = yield* serverSettings.updateSettings({
+        projectServiceClient: { newCredential: "psk_key-2.next-secret" },
+      });
+      assert.equal(replaced.projectServiceClient.keyIdHint, "key-2");
+      const storedSecret = new TextDecoder().decode(yield* fileSystem.readFile(secretPath));
+      assert.equal(storedSecret, "psk_key-2.next-secret");
+      assert.notInclude(storedSecret, "s3cret");
+
+      // clearCredential removes it.
+      const cleared = yield* serverSettings.updateSettings({
+        projectServiceClient: { clearCredential: true },
+      });
+      assert.equal(cleared.projectServiceClient.keyIdHint, "");
+      assert.equal(cleared.projectServiceClient.credentialSet, false);
+      const secretAfterClear = yield* fileSystem.exists(secretPath);
+      assert.equal(secretAfterClear, false);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("rejects a malformed Project Service credential without persisting anything", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const error = yield* Effect.flip(
+        serverSettings.updateSettings({
+          projectServiceClient: { enabled: true, newCredential: "not-a-psk-credential" },
+        }),
+      );
+
+      assert.deepInclude(error, {
+        _tag: "ServerSettingsError",
+        operation: "validate",
+      });
+      const settings = yield* serverSettings.getSettings;
+      assert.equal(settings.projectServiceClient.enabled, false);
+      assert.equal(
+        yield* fileSystem.exists(
+          `${serverConfig.secretsDir}/project-service-client-credential.bin`,
+        ),
+        false,
+      );
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("rejects logical agents referencing an unconfigured provider instance", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const error = yield* Effect.flip(
+        serverSettings.updateSettings({
+          logicalAgents: {
+            [LogicalAgentId.make("ag_one")]: {
+              agentName: "Ghost rider",
+              providerInstanceId: ProviderInstanceId.make("ghost_instance"),
+              project: { enabled: false },
+              projectBindings: [],
+            },
+          },
+        }),
+      );
+      assert.deepInclude(error, {
+        _tag: "ServerSettingsError",
+        operation: "validate",
+        providerInstanceId: "ghost_instance",
+      });
+
+      // Driver defaults resolve without an explicit providerInstances entry.
+      const next = yield* serverSettings.updateSettings({
+        logicalAgents: {
+          [LogicalAgentId.make("ag_one")]: {
+            agentName: "Build agent",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            project: { enabled: false },
+            projectBindings: [],
+          },
+        },
+      });
+      assert.equal(next.logicalAgents[LogicalAgentId.make("ag_one")]?.providerInstanceId, "codex");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("renaming a logical agent keeps its id and every other field", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const created = yield* serverSettings.updateSettings({
+        logicalAgents: {
+          [LogicalAgentId.make("ag_stable")]: {
+            agentName: "Build agent",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            project: { enabled: true },
+            projectBindings: [
+              {
+                projectId: "proj_9",
+                projectName: "Wiki migration",
+                t3ProjectId: ProjectId.make("local-1"),
+              },
+            ],
+          },
+        },
+      });
+      const createdAgent = created.logicalAgents[LogicalAgentId.make("ag_stable")]!;
+
+      const renamed = yield* serverSettings.updateSettings({
+        logicalAgents: {
+          [LogicalAgentId.make("ag_stable")]: { ...createdAgent, agentName: "Review agent" },
+        },
+      });
+
+      assert.deepEqual(Object.keys(renamed.logicalAgents), ["ag_stable"]);
+      assert.deepEqual(renamed.logicalAgents[LogicalAgentId.make("ag_stable")], {
+        ...createdAgent,
+        agentName: "Review agent",
+      });
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("deleting a provider instance succeeds while a stored agent references it", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const instance = {
+        [ProviderInstanceId.make("codex_personal")]: {
+          driver: ProviderDriverKind.make("codex"),
+          config: {},
+        },
+      };
+      yield* serverSettings.updateSettings({
+        providerInstances: instance,
+        logicalAgents: {
+          [LogicalAgentId.make("ag_one")]: {
+            agentName: "Build agent",
+            providerInstanceId: ProviderInstanceId.make("codex_personal"),
+            project: { enabled: false },
+            projectBindings: [],
+          },
+        },
+      });
+
+      // Whole-map replacement without the instance must not be blocked by
+      // the stored agent still pointing at it.
+      const next = yield* serverSettings.updateSettings({ providerInstances: {} });
+      assert.deepEqual(next.providerInstances, {});
+      const stored = yield* serverSettings.getSettings;
+      assert.equal(
+        stored.logicalAgents[LogicalAgentId.make("ag_one")]?.providerInstanceId,
+        "codex_personal",
+      );
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect(
+    "a services-only patch succeeds while a stored agent has a stale provider reference",
+    () =>
+      Effect.gen(function* () {
+        const serverConfig = yield* ServerConfig.ServerConfig;
+        const fileSystem = yield* FileSystem.FileSystem;
+        // An out-of-band settings edit leaves an agent referencing an
+        // instance that no longer resolves.
+        yield* fileSystem.writeFileString(
+          serverConfig.settingsPath,
+          '{"logicalAgents":{"ag_ghost":{"agentName":"Ghost","providerInstanceId":"ghost_instance"}}}',
+        );
+
+        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+        const next = yield* serverSettings.updateSettings({
+          projectServiceClient: { enabled: true },
+        });
+
+        assert.equal(next.projectServiceClient.enabled, true);
+      }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("rejects a logical agent with duplicate project bindings", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const binding = (projectId: string, t3ProjectId: string) => ({
+        projectId,
+        projectName: "Wiki",
+        t3ProjectId: ProjectId.make(t3ProjectId),
+      });
+
+      const error = yield* Effect.flip(
+        serverSettings.updateSettings({
+          logicalAgents: {
+            [LogicalAgentId.make("ag_one")]: {
+              agentName: "Build agent",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              project: { enabled: false },
+              projectBindings: [binding("proj_1", "local-1"), binding("proj_1", "local-1")],
+            },
+          },
+        }),
+      );
+
+      assert.deepInclude(error, { _tag: "ServerSettingsError", operation: "validate" });
+      assert.match(error.cause instanceof Error ? error.cause.message : "", /more than once/);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("rejects a non-local Project Service base URL before touching the secret store", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const error = yield* Effect.flip(
+        serverSettings.updateSettings({
+          projectServiceClient: {
+            baseUrl: "https://ps.example.com",
+            newCredential: "psk_key-1.s3cret",
+          },
+        }),
+      );
+
+      assert.deepInclude(error, { _tag: "ServerSettingsError", operation: "validate" });
+      assert.equal(
+        yield* fileSystem.exists(
+          `${serverConfig.secretsDir}/project-service-client-credential.bin`,
+        ),
+        false,
+      );
+      const settings = yield* serverSettings.getSettings;
+      assert.notEqual(settings.projectServiceClient.baseUrl, "https://ps.example.com");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("accepts a private-network Project Service base URL", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const next = yield* serverSettings.updateSettings({
+        projectServiceClient: { baseUrl: "http://10.1.2.3:7600" },
+      });
+
+      assert.equal(next.projectServiceClient.baseUrl, "http://10.1.2.3:7600");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("restores the previous credential when the settings write fails", () =>
+    Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const secretPath = `${serverConfig.secretsDir}/project-service-client-credential.bin`;
+
+      yield* serverSettings.updateSettings({
+        projectServiceClient: { newCredential: "psk_key-1.s3cret" },
+      });
+
+      // Break the settings write seam: the atomic rename cannot land on a
+      // directory, so the next save fails after the secret was replaced.
+      yield* fileSystem.remove(serverConfig.settingsPath);
+      yield* fileSystem.makeDirectory(serverConfig.settingsPath);
+
+      const error = yield* Effect.flip(
+        serverSettings.updateSettings({
+          projectServiceClient: { newCredential: "psk_key-2.next-secret" },
+        }),
+      );
+      assert.deepInclude(error, { _tag: "ServerSettingsError", operation: "write-file" });
+
+      // The previous secret is back and the visible state never moved.
+      assert.equal(
+        new TextDecoder().decode(yield* fileSystem.readFile(secretPath)),
+        "psk_key-1.s3cret",
+      );
+      const settings = yield* serverSettings.getSettings;
+      assert.equal(settings.projectServiceClient.keyIdHint, "key-1");
+      assert.equal(settings.projectServiceClient.credentialSet, true);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect(
+    "removes a just-written credential when the settings write fails and none was stored",
+    () =>
+      Effect.gen(function* () {
+        const serverConfig = yield* ServerConfig.ServerConfig;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+        const secretPath = `${serverConfig.secretsDir}/project-service-client-credential.bin`;
+
+        // Warm the settings file and cache before breaking the write seam.
+        yield* serverSettings.updateSettings({});
+        yield* fileSystem.remove(serverConfig.settingsPath).pipe(Effect.ignore);
+        yield* fileSystem.makeDirectory(serverConfig.settingsPath);
+
+        const error = yield* Effect.flip(
+          serverSettings.updateSettings({
+            projectServiceClient: { newCredential: "psk_key-1.s3cret" },
+          }),
+        );
+        assert.deepInclude(error, { _tag: "ServerSettingsError", operation: "write-file" });
+        assert.equal(yield* fileSystem.exists(secretPath), false);
+      }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 });

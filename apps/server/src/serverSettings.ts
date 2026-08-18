@@ -15,7 +15,9 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SERVER_SETTINGS,
+  isLocalProjectServiceBaseUrl,
   type ModelSelection,
+  parseProjectServiceCredential,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
   ProviderDriverKind,
@@ -48,6 +50,8 @@ import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import {
   applyServerSettingsPatch,
+  findDuplicateProjectBindings,
+  findLogicalAgentsWithUnresolvedProviderInstances,
   isModelSelectionProviderEnabled,
 } from "@t3tools/shared/serverSettings";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
@@ -82,6 +86,10 @@ function providerEnvironmentSecretName(input: {
 }): string {
   return `provider-env-${Buffer.from(input.instanceId, "utf8").toString("base64url")}-${Buffer.from(input.name, "utf8").toString("base64url")}`;
 }
+
+// One client per environment, so one stable secret name; the settings file
+// only records the keyId hint and that a credential exists.
+export const PROJECT_SERVICE_CREDENTIAL_SECRET_NAME = "project-service-client-credential";
 
 function redactProviderEnvironmentVariable(
   variable: ProviderInstanceEnvironmentVariable,
@@ -500,6 +508,191 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  // Resolves the write-only credential fields of a patch into the secret-store
+  // action to apply. Validates the psk_ format here, before any secrets are
+  // written, so a malformed paste fails the update without side effects.
+  type ProjectServiceCredentialWrite =
+    | { readonly kind: "none" }
+    | { readonly kind: "set"; readonly keyId: string; readonly raw: string }
+    | { readonly kind: "clear" };
+
+  const projectServiceCredentialWrite = (
+    patch: ServerSettingsPatch,
+  ): Effect.Effect<ProjectServiceCredentialWrite, ServerSettingsError> => {
+    const clientPatch = patch.projectServiceClient;
+    if (clientPatch === undefined) {
+      return Effect.succeed({ kind: "none" } as const);
+    }
+    const newCredential = clientPatch.newCredential;
+    if (newCredential !== undefined) {
+      const parsed = parseProjectServiceCredential(newCredential);
+      if (parsed === null) {
+        return new ServerSettingsError({
+          settingsPath,
+          operation: "validate",
+          cause: new Error("Project Service credential must have the form psk_<keyId>.<secret>."),
+        });
+      }
+      return Effect.succeed({ kind: "set", keyId: parsed.keyId, raw: newCredential } as const);
+    }
+    if (clientPatch.clearCredential === true) {
+      return Effect.succeed({ kind: "clear" } as const);
+    }
+    return Effect.succeed({ kind: "none" } as const);
+  };
+
+  // Applies the resolved credential action: the raw credential goes to the
+  // secret store, the settings keep only the redacted view. "none" keeps the
+  // stored credential untouched.
+  const applyProjectServiceCredentialWrite = (
+    write: ProjectServiceCredentialWrite,
+    next: ServerSettings,
+  ): Effect.Effect<ServerSettings, ServerSettingsError> =>
+    Effect.gen(function* () {
+      if (write.kind === "none") {
+        return next;
+      }
+      if (write.kind === "clear") {
+        yield* secretStore.remove(PROJECT_SERVICE_CREDENTIAL_SECRET_NAME).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ServerSettingsError({
+                settingsPath,
+                operation: "remove-secret",
+                cause,
+              }),
+          ),
+        );
+        return {
+          ...next,
+          projectServiceClient: {
+            ...next.projectServiceClient,
+            keyIdHint: "",
+            credentialSet: false,
+          },
+        };
+      }
+      yield* secretStore
+        .set(PROJECT_SERVICE_CREDENTIAL_SECRET_NAME, textEncoder.encode(write.raw))
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ServerSettingsError({
+                settingsPath,
+                operation: "write-secret",
+                cause,
+              }),
+          ),
+        );
+      return {
+        ...next,
+        projectServiceClient: {
+          ...next.projectServiceClient,
+          keyIdHint: write.keyId,
+          credentialSet: true,
+        },
+      };
+    });
+
+  // Write-time reference and binding validation. Reads stay lenient (see
+  // findLogicalAgentsWithUnresolvedProviderInstances) so removing a provider
+  // instance can never brick settings loading; the checks themselves run only
+  // on patches that carry the agent map, so a providerInstances-only write
+  // still succeeds when a stored agent references a since-deleted instance.
+  const validateLogicalAgents = (
+    next: ServerSettings,
+  ): Effect.Effect<ServerSettings, ServerSettingsError> => {
+    const unresolved = findLogicalAgentsWithUnresolvedProviderInstances(next);
+    const first = unresolved[0];
+    if (first !== undefined) {
+      return new ServerSettingsError({
+        settingsPath,
+        operation: "validate",
+        providerInstanceId: first.providerInstanceId,
+        cause: new Error(
+          `Logical agent ${first.agentId} references provider instance ${first.providerInstanceId}, which is not configured.`,
+        ),
+      });
+    }
+    const duplicate = findDuplicateProjectBindings(next)[0];
+    if (duplicate !== undefined) {
+      return new ServerSettingsError({
+        settingsPath,
+        operation: "validate",
+        cause: new Error(
+          `Logical agent ${duplicate.agentId} binds T3 project ${duplicate.t3ProjectId} to Project Service project ${duplicate.projectId} more than once.`,
+        ),
+      });
+    }
+    return Effect.succeed(next);
+  };
+
+  // v1 accepts only local Project Service endpoints: the stored client
+  // credential is sent to this base URL, so a non-local host is an
+  // exfiltration path for anyone who can write settings.
+  const validateProjectServiceBaseUrl = (
+    patch: ServerSettingsPatch,
+  ): Effect.Effect<void, ServerSettingsError> => {
+    const baseUrl = patch.projectServiceClient?.baseUrl;
+    if (baseUrl === undefined || isLocalProjectServiceBaseUrl(baseUrl)) {
+      return Effect.void;
+    }
+    return new ServerSettingsError({
+      settingsPath,
+      operation: "validate",
+      cause: new Error(
+        "Project Service base URL must be a loopback or private-network address; non-local endpoints are not supported.",
+      ),
+    });
+  };
+
+  // The credential secret is written before the settings file; if the write
+  // through fails, put the previous secret back so a failed save leaves the
+  // pre-save state intact.
+  const restoreProjectServiceCredential = (
+    previous: Option.Option<Uint8Array>,
+  ): Effect.Effect<void, ServerSettingsError> =>
+    (Option.isSome(previous)
+      ? secretStore.set(PROJECT_SERVICE_CREDENTIAL_SECRET_NAME, previous.value)
+      : secretStore.remove(PROJECT_SERVICE_CREDENTIAL_SECRET_NAME)
+    ).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ServerSettingsError({
+            settingsPath,
+            operation: Option.isSome(previous) ? "write-secret" : "remove-secret",
+            cause,
+          }),
+      ),
+    );
+
+  const withProjectServiceCredentialRollback = <A>(
+    write: ProjectServiceCredentialWrite,
+    proceed: Effect.Effect<A, ServerSettingsError>,
+  ): Effect.Effect<A, ServerSettingsError> =>
+    write.kind === "none"
+      ? proceed
+      : secretStore.get(PROJECT_SERVICE_CREDENTIAL_SECRET_NAME).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ServerSettingsError({
+                settingsPath,
+                operation: "read-secret",
+                cause,
+              }),
+          ),
+          Effect.flatMap((previous) =>
+            proceed.pipe(
+              Effect.catch((error) =>
+                restoreProjectServiceCredential(previous).pipe(
+                  Effect.ignoreCause({ log: true }),
+                  Effect.andThen(Effect.fail(error)),
+                ),
+              ),
+            ),
+          ),
+        );
+
   const revalidateAndEmit = writeSemaphore.withPermits(1)(
     Effect.gen(function* () {
       yield* Cache.invalidate(settingsCache, cacheKey);
@@ -579,12 +772,23 @@ const make = Effect.gen(function* () {
       writeSemaphore.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* getSettingsFromCache;
-          const nextPersisted = yield* persistProviderEnvironmentSecrets(
-            current,
-            applyServerSettingsPatch(current, patch),
+          // All validations fail the update before any secret is written.
+          const credentialWrite = yield* projectServiceCredentialWrite(patch);
+          yield* validateProjectServiceBaseUrl(patch);
+          const nextFromPatch = applyServerSettingsPatch(current, patch);
+          // Whole-map replacement is the agent write shape, so its referential
+          // check runs only when the patch carries the map.
+          const validated = yield* patch.logicalAgents === undefined
+            ? Effect.succeed(nextFromPatch)
+            : validateLogicalAgents(nextFromPatch);
+          const nextPersisted = yield* persistProviderEnvironmentSecrets(current, validated);
+          const next = yield* withProjectServiceCredentialRollback(
+            credentialWrite,
+            applyProjectServiceCredentialWrite(credentialWrite, nextPersisted).pipe(
+              Effect.flatMap(normalizeServerSettings),
+              Effect.tap(writeSettingsAtomically),
+            ),
           );
-          const next = yield* normalizeServerSettings(nextPersisted);
-          yield* writeSettingsAtomically(next);
           yield* Cache.set(settingsCache, cacheKey, next);
           yield* emitChange(next);
           const materialized = yield* materializeProviderEnvironmentSecrets(next);

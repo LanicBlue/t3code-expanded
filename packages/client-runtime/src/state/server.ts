@@ -756,6 +756,16 @@ export function createServerEnvironmentAtoms<R, E>(
       scheduler: configScheduler,
       concurrency: configConcurrency,
     }),
+    // One-shot probe; single-flight per environment so repeated clicks share
+    // the in-flight round-trip.
+    testProjectServiceConnection: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:test-project-service-connection",
+      tag: WS_METHODS.serverTestProjectServiceConnection,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,

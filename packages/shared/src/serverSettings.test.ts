@@ -1,5 +1,8 @@
 import {
   DEFAULT_SERVER_SETTINGS,
+  type LogicalAgentConfig,
+  LogicalAgentId,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -11,6 +14,8 @@ import { createModelSelection } from "./model.ts";
 import {
   applyServerSettingsPatch,
   extractPersistedServerObservabilitySettings,
+  findDuplicateProjectBindings,
+  findLogicalAgentsWithUnresolvedProviderInstances,
   isModelSelectionProviderEnabled,
   normalizePersistedServerSettingString,
   parsePersistedServerObservabilitySettings,
@@ -511,5 +516,150 @@ describe("serverSettings helpers", () => {
     });
 
     expect(resolved.pauseWhenOnBattery).toBe(false);
+  });
+});
+
+describe("project service + logical agents patching", () => {
+  const agentId = LogicalAgentId.make;
+  const agent = (
+    overrides: Partial<{
+      agentName: string;
+      providerInstanceId: ProviderInstanceId;
+    }> = {},
+  ): LogicalAgentConfig => ({
+    agentName: overrides.agentName ?? "Build agent",
+    providerInstanceId: overrides.providerInstanceId ?? ProviderInstanceId.make("codex"),
+    project: { enabled: false },
+    projectBindings: [],
+  });
+
+  it("replaces the agent map wholesale", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      logicalAgents: {
+        [agentId("ag_old")]: agent(),
+        [agentId("ag_kept")]: agent(),
+      },
+    };
+
+    const next = applyServerSettingsPatch(current, {
+      logicalAgents: { [agentId("ag_kept")]: agent({ agentName: "Renamed" }) },
+    });
+
+    expect(Object.keys(next.logicalAgents)).toEqual(["ag_kept"]);
+    expect(next.logicalAgents[agentId("ag_kept")]?.agentName).toBe("Renamed");
+  });
+
+  it("renaming an agent changes nothing else", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      logicalAgents: {
+        [agentId("ag_one")]: {
+          ...agent(),
+          project: { enabled: true },
+          projectBindings: [
+            { projectId: "proj_9", projectName: "Wiki", t3ProjectId: ProjectId.make("local-1") },
+          ],
+        },
+      },
+    };
+
+    const next = applyServerSettingsPatch(current, {
+      logicalAgents: {
+        [agentId("ag_one")]: {
+          ...current.logicalAgents[agentId("ag_one")]!,
+          agentName: "Review agent",
+        },
+      },
+    });
+
+    expect(Object.keys(next.logicalAgents)).toEqual(["ag_one"]);
+    expect(next.logicalAgents[agentId("ag_one")]).toEqual({
+      ...current.logicalAgents[agentId("ag_one")],
+      agentName: "Review agent",
+    });
+  });
+
+  it("strips the write-only credential fields from the merged client settings", () => {
+    const next = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+      projectServiceClient: { enabled: true, newCredential: "psk_k.s3cret" },
+    });
+
+    expect(next.projectServiceClient).toEqual({
+      enabled: true,
+      baseUrl: DEFAULT_SERVER_SETTINGS.projectServiceClient.baseUrl,
+      keyIdHint: "",
+      credentialSet: false,
+    });
+    expect(JSON.stringify(next)).not.toContain("s3cret");
+  });
+
+  it("keeps the stored credential view untouched when no credential is supplied", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      projectServiceClient: {
+        ...DEFAULT_SERVER_SETTINGS.projectServiceClient,
+        keyIdHint: "key-1",
+        credentialSet: true,
+      },
+    };
+
+    const next = applyServerSettingsPatch(current, {
+      projectServiceClient: { baseUrl: "http://127.0.0.1:7601" },
+    });
+
+    expect(next.projectServiceClient).toEqual({
+      ...current.projectServiceClient,
+      baseUrl: "http://127.0.0.1:7601",
+    });
+  });
+
+  it("flags agents whose provider instance resolves nowhere", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      logicalAgents: {
+        [agentId("ag_default")]: agent({ providerInstanceId: ProviderInstanceId.make("codex") }),
+        [agentId("ag_custom")]: agent({
+          providerInstanceId: ProviderInstanceId.make("codex_personal"),
+        }),
+        [agentId("ag_missing")]: agent({
+          providerInstanceId: ProviderInstanceId.make("codex_gone"),
+        }),
+      },
+      providerInstances: {
+        codex_personal: { driver: ProviderDriverKind.make("codex"), config: {} },
+      },
+    };
+
+    expect(findLogicalAgentsWithUnresolvedProviderInstances(settings)).toEqual([
+      { agentId: "ag_missing", providerInstanceId: ProviderInstanceId.make("codex_gone") },
+    ]);
+  });
+
+  it("flags only repeated t3ProjectId+projectId binding pairs", () => {
+    const binding = (projectId: string, t3ProjectId: string, projectName = "n") => ({
+      projectId,
+      projectName,
+      t3ProjectId: ProjectId.make(t3ProjectId),
+    });
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      logicalAgents: {
+        [agentId("ag_clean")]: agent(),
+        [agentId("ag_dup")]: {
+          ...agent(),
+          projectBindings: [
+            binding("proj_1", "local-1"),
+            binding("proj_2", "local-1"),
+            binding("proj_1", "local-1", "renamed"),
+            binding("proj_1", "local-2"),
+          ],
+        },
+      },
+    };
+
+    expect(findDuplicateProjectBindings(settings)).toEqual([
+      { agentId: "ag_dup", t3ProjectId: "local-1", projectId: "proj_1" },
+    ]);
   });
 });

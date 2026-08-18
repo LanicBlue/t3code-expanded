@@ -11,6 +11,11 @@ import {
 } from "./model.ts";
 import { ModelSelection } from "./orchestration.ts";
 import {
+  LogicalAgentConfigMap,
+  ProjectServiceClientSettings,
+  ProjectServiceClientSettingsPatch,
+} from "./projectService.ts";
+import {
   DEFAULT_PREVIEW_APPEARANCE,
   DEFAULT_PREVIEW_ZOOM_FACTOR,
   FILL_PREVIEW_VIEWPORT,
@@ -661,6 +666,15 @@ export const ServerSettings = Schema.Struct({
   providerInstances: Schema.Record(ProviderInstanceId, ProviderInstanceConfig).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+  // External Project Service client. Settings carry only redacted credential
+  // state (keyIdHint + credentialSet); the raw credential lives in the server
+  // secret store. See projectService.ts.
+  projectServiceClient: ProjectServiceClientSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
+  // Logical agents, keyed by immutable LogicalAgentId. Whole-map replacement
+  // on write, like providerInstances above.
+  logicalAgents: LogicalAgentConfigMap.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   observability: ObservabilitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });
 export type ServerSettings = typeof ServerSettings.Type;
@@ -671,6 +685,7 @@ export const ServerSettingsOperation = Schema.Literals([
   "normalize",
   "check-exists",
   "read-file",
+  "validate",
   "read-secret",
   "remove-secret",
   "remove-stale-secret",
@@ -803,6 +818,11 @@ export const ServerSettingsPatch = Schema.Struct({
   // patches risk leaving driver-specific config in a half-merged state.
   // The web UI sends a fully-formed map every time it edits this field.
   providerInstances: Schema.optionalKey(Schema.Record(ProviderInstanceId, ProviderInstanceConfig)),
+  // The Project Service client patch. `newCredential` is write-only and
+  // stripped before persisting; see projectService.ts.
+  projectServiceClient: Schema.optionalKey(ProjectServiceClientSettingsPatch),
+  // Whole-map replacement, same rationale as providerInstances.
+  logicalAgents: Schema.optionalKey(LogicalAgentConfigMap),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 

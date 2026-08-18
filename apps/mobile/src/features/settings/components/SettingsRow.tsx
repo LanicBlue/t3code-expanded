@@ -18,6 +18,8 @@ export function SettingsRow(props: {
   readonly target?: SettingsSheetTarget;
   readonly fullScreenTarget?: SettingsLegalDocumentTarget;
   readonly onPress?: () => void;
+  /** Navigation affordance; omit for rows that lead nowhere. */
+  readonly chevron?: boolean;
 }) {
   const navigation = useNavigation();
   const icon = useThemeColor("--color-icon");
@@ -45,13 +47,15 @@ export function SettingsRow(props: {
           </Text>
         ) : null}
       </View>
-      <SymbolView
-        name="chevron.right"
-        size={16}
-        tintColor={chevron}
-        type="monochrome"
-        weight="semibold"
-      />
+      {props.chevron === false ? null : (
+        <SymbolView
+          name="chevron.right"
+          size={16}
+          tintColor={chevron}
+          type="monochrome"
+          weight="semibold"
+        />
+      )}
     </View>
   );
 

@@ -125,6 +125,8 @@ function LocalSettingsRouteScreen() {
           />
         </SettingsSection>
 
+        <ServicesSettingsSection />
+
         <GeneralSettingsSection />
 
         <SettingsSection title="Appearance">
@@ -511,6 +513,8 @@ function ConfiguredSettingsRouteScreen() {
           />
         </SettingsSection>
 
+        <ServicesSettingsSection />
+
         <GeneralSettingsSection />
 
         <SettingsSection title="Appearance">
@@ -524,6 +528,25 @@ function ConfiguredSettingsRouteScreen() {
         <AppSettingsSection />
       </ScrollView>
     </View>
+  );
+}
+
+/**
+ * The Project Service client and its logical agents are configured on the
+ * desktop's Settings → Services panel. Listed here as a disabled row so the
+ * capability is discoverable instead of silently missing on mobile.
+ */
+function ServicesSettingsSection() {
+  return (
+    <SettingsSection title="Services">
+      <SettingsRow
+        disabled
+        chevron={false}
+        icon="desktopcomputer"
+        label="Project Service & Agents"
+        value="Desktop only"
+      />
+    </SettingsSection>
   );
 }
 
