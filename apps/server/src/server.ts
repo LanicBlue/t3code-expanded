@@ -60,6 +60,8 @@ import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderComma
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
+import * as ProjectConsumerRuntime from "./projectService/ProjectConsumerRuntimeService.ts";
+import * as ProjectServiceWorkClient from "./projectService/ProjectServiceWorkClient.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
 import * as ServerSettings from "./serverSettings.ts";
@@ -247,6 +249,13 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ThreadDeletionReactorLive),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
+  // The Project Consumer runtime is a server-lifetime service like the
+  // reactors: one SDK connection per configured client, started with the
+  // server (see serverRuntimeStartup) and reconfigured on settings changes.
+  // The Work client seam is the same one the MCP tools ride.
+  Layer.provideMerge(
+    ProjectConsumerRuntime.layer.pipe(Layer.provide(ProjectServiceWorkClient.layer)),
+  ),
 );
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
