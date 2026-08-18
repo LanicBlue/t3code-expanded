@@ -22,6 +22,9 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import { ProjectWorkToolkitHandlersLive } from "./toolkits/project/handlers.ts";
+import { ProjectWorkToolkit } from "./toolkits/project/tools.ts";
+import * as ProjectServiceWorkClient from "../projectService/ProjectServiceWorkClient.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -216,6 +219,16 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
   PreviewSnapshotRegistrationLive,
 );
 
+// NB: McpServer.toolkit erases the toolkit's service requirements (this
+// registration layer types as Layer<never, …>), so a handler service that is
+// provided nowhere surfaces only at call time as a Die ("Service not found").
+// The Work client is therefore provided right here, next to the registration
+// it serves — the pair cannot drift apart unnoticed.
+export const ProjectWorkToolkitRegistrationLive = McpServer.toolkit(ProjectWorkToolkit).pipe(
+  Layer.provide(ProjectWorkToolkitHandlersLive),
+  Layer.provide(ProjectServiceWorkClient.layer),
+);
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
@@ -223,4 +236,7 @@ const McpTransportLive = McpServer.layerHttp({
   protocols: [McpProtocol.v2025_06_18],
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
 
-export const layer = PreviewToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+export const layer = Layer.mergeAll(
+  PreviewToolkitRegistrationLive,
+  ProjectWorkToolkitRegistrationLive,
+).pipe(Layer.provideMerge(McpTransportLive));

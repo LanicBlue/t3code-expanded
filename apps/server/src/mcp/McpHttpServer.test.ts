@@ -1,16 +1,29 @@
 import { expect, it } from "@effect/vitest";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentId, PreviewTabId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  LogicalAgentId,
+  type OrchestrationThreadShell,
+  PreviewTabId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { McpProtocol, McpSchema, McpServer } from "effect/unstable/ai";
 import { HttpBody, HttpClient, HttpRouter, HttpServerResponse } from "effect/unstable/http";
 
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -39,6 +52,91 @@ const TestLayer = McpHttpServer.PreviewToolkitRegistrationLive.pipe(
   Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
 );
 
+// Only the work client layer's dependencies are provided here — the project
+// toolkit registration itself must supply the client service. McpServer.toolkit
+// erases service requirements, so a client layer wired nowhere would surface
+// only at call time as an opaque internal error; the test below pins the wiring
+// by driving a real tool call through the registration.
+const projectWorkThreadProject = ProjectId.make("t3-project-mcp-wiring");
+const projectWorkThreadShell: OrchestrationThreadShell = {
+  id: threadId,
+  projectId: projectWorkThreadProject,
+  title: "Wiring",
+  modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "model", options: [] },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: "2026-08-01T00:00:00.000Z",
+  updatedAt: "2026-08-01T00:00:00.000Z",
+  archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
+  session: null,
+  latestUserMessageAt: null,
+  hasPendingApprovals: false,
+  hasPendingUserInput: false,
+  hasActionableProposedPlan: false,
+};
+
+const projectWorkSnapshotQueryLayer = Layer.succeed(
+  ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+  {
+    getCommandReadModel: () => Effect.die("unused"),
+    getSnapshot: () => Effect.die("unused"),
+    getShellSnapshot: () => Effect.die("unused"),
+    getArchivedShellSnapshot: () => Effect.die("unused"),
+    getSnapshotSequence: () => Effect.die("unused"),
+    getCounts: () => Effect.die("unused"),
+    getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+    getProjectShellById: () => Effect.die("unused"),
+    getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+    getThreadCheckpointContext: () => Effect.die("unused"),
+    getFullThreadDiffContext: () => Effect.die("unused"),
+    getThreadShellById: (id) =>
+      Effect.succeed(id === threadId ? Option.some(projectWorkThreadShell) : Option.none()),
+    getThreadDetailById: () => Effect.die("unused"),
+    getThreadDetailSnapshot: () => Effect.die("unused"),
+    searchThreads: () => Effect.die("unused"),
+  },
+);
+
+const ProjectWorkWiringLayer = McpHttpServer.ProjectWorkToolkitRegistrationLive.pipe(
+  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provideMerge(
+    Layer.mergeAll(
+      ServerSettings.ServerSettingsService.layerTest({
+        projectServiceClient: { enabled: true, baseUrl: "http://127.0.0.1:7600" },
+        logicalAgents: {
+          [LogicalAgentId.make("ag_wiring")]: {
+            agentName: "Wiring Agent",
+            providerInstanceId: invocation.providerInstanceId,
+            project: { enabled: true },
+            projectBindings: [
+              {
+                projectId: "proj_wiring",
+                projectName: "Wiring Project",
+                t3ProjectId: projectWorkThreadProject,
+              },
+            ],
+          },
+        },
+      }),
+      ServerSecretStore.layer.pipe(
+        Layer.provideMerge(
+          Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-wiring-" })),
+        ),
+      ),
+      Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make(() => Effect.die("no Project Service HTTP expected")),
+      ),
+      projectWorkSnapshotQueryLayer,
+    ),
+  ),
+);
+
 it("normalizes empty successful notification responses to accepted", () => {
   const notificationResponse = McpHttpServer.normalizeMcpHttpResponse(
     HttpServerResponse.text("", { status: 200, contentType: "application/json" }),
@@ -50,6 +148,31 @@ it("normalizes empty successful notification responses to accepted", () => {
   );
   expect(resultResponse.status).toBe(200);
 });
+
+it.effect(
+  "answers structured unavailability for project tools wired through the registration",
+  () =>
+    Effect.gen(function* () {
+      // The client layer is provided by the registration itself; this test only
+      // supplies its dependencies. With the integration enabled but no stored
+      // credential, a wired composition answers a structured refusal — a client
+      // layer wired nowhere would Die as an opaque internal tool error.
+      const server = yield* McpServer.McpServer;
+      const result = yield* server
+        .callTool({ name: "project_work_list", arguments: {} })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+      expect(result.isError).toBe(true);
+      // The refusal text comes from the unavailability vocabulary — a client
+      // layer wired nowhere would answer the generic internal-tool-error text.
+      expect(result.content).toEqual([
+        { type: "text", text: "No Project Service client credential is stored." },
+      ]);
+    }).pipe(Effect.provide(ProjectWorkWiringLayer.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
 
 it.effect("returns bounded structural preview snapshot failures", () =>
   Effect.scoped(

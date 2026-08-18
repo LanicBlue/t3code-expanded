@@ -16,6 +16,7 @@ import {
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ServerSettings as ServerSettingsValues,
   ProviderSessionStartInput,
   ThreadId,
   TurnId,
@@ -1962,9 +1963,16 @@ validation.layer("ProviderServiceLive validation", (it) => {
 describe("agent browser access", () => {
   const revokedThreads: Array<ThreadId> = [];
 
-  const startSessionWith = (enableAgentBrowserAccess: boolean, threadId: ThreadId) =>
+  const startSessionWith = (
+    enableAgentBrowserAccess: boolean,
+    threadId: ThreadId,
+    settingsOverrides?: Partial<
+      Parameters<typeof ServerSettings.ServerSettingsService.layerTest>[0]
+    >,
+  ) =>
     Effect.gen(function* () {
       const issued: Array<ThreadId> = [];
+      const issuedCapabilities: Array<ReadonlySet<string> | undefined> = [];
       const codex = makeFakeCodexAdapter();
       const providerAdapterLayer = Layer.succeed(
         ProviderAdapterRegistry.ProviderAdapterRegistry,
@@ -1980,13 +1988,18 @@ describe("agent browser access", () => {
         issueMcpCredential: (request) =>
           Effect.sync(() => {
             issued.push(request.threadId);
+            issuedCapabilities.push(request.capabilities);
             return undefined;
           }),
         revokeMcpCredential: (revoked) => Effect.sync(() => void revokedThreads.push(revoked)),
       }).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
-        Layer.provide(ServerSettings.ServerSettingsService.layerTest({ enableAgentBrowserAccess })),
+        Layer.provide(
+          ServerSettings.ServerSettingsService.layerTest(
+            settingsOverrides ?? { enableAgentBrowserAccess },
+          ),
+        ),
         Layer.provide(serverConfigTestLayer),
         Layer.provide(AnalyticsService.layerTest),
         Layer.provide(
@@ -2007,7 +2020,7 @@ describe("agent browser access", () => {
         });
       }).pipe(Effect.provide(providerLayer));
 
-      return issued;
+      return { issued, issuedCapabilities };
     });
 
   // Credential issuance is the observable that matters: it is the only place a
@@ -2015,7 +2028,7 @@ describe("agent browser access", () => {
   // what actually denies every provider and external MCP client.
   it.effect("requests no MCP credential when agent browser access is off", () =>
     Effect.gen(function* () {
-      const issued = yield* startSessionWith(false, asThreadId("thread-browser-off"));
+      const { issued } = yield* startSessionWith(false, asThreadId("thread-browser-off"));
 
       assert.deepEqual(issued, []);
     }).pipe(Effect.provide(NodeServices.layer)),
@@ -2039,9 +2052,37 @@ describe("agent browser access", () => {
     Effect.gen(function* () {
       const threadId = asThreadId("thread-browser-on");
 
-      const issued = yield* startSessionWith(true, threadId);
+      const { issued, issuedCapabilities } = yield* startSessionWith(true, threadId);
 
       assert.deepEqual(issued, [threadId]);
+      assert.deepEqual(issuedCapabilities, [new Set(["preview"])]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  // The Browser setting and the Project scopes are independent: withholding
+  // browser access must not take the whole `t3-code` server — and with it the
+  // Project tools — away from an agent whose Project work is enabled.
+  it.effect("still issues a project-only credential with browser access off", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-project-keeps-mcp");
+      revokedThreads.length = 0;
+
+      const { issued, issuedCapabilities } = yield* startSessionWith(false, threadId, {
+        enableAgentBrowserAccess: false,
+        projectServiceClient: { enabled: true },
+        logicalAgents: {
+          ag_codex: {
+            agentName: "Codex Agent",
+            providerInstanceId: codexInstanceId,
+            project: { enabled: true },
+            projectBindings: [],
+          },
+        } as ServerSettingsValues["logicalAgents"],
+      });
+
+      assert.deepEqual(issued, [threadId]);
+      assert.deepEqual(issuedCapabilities, [new Set(["project.work.read", "project.work.write"])]);
+      assert.deepEqual(revokedThreads, []);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

@@ -14,6 +14,12 @@ import * as McpProviderSession from "./McpProviderSession.ts";
 export interface McpCredentialRequest {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
+  /**
+   * Capability scopes for the credential. Derived from live settings by the
+   * attachment path so a browser-off session can still carry Project scopes;
+   * defaults to preview-only for callers that never derived a set.
+   */
+  readonly capabilities?: ReadonlySet<McpInvocationContext.McpCapability>;
 }
 
 export interface McpIssuedCredential {
@@ -128,7 +134,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         threadId: ThreadId.make(request.threadId),
         providerSessionId,
         providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
-        capabilities: new Set(["preview"]),
+        capabilities: request.capabilities
+          ? new Set(request.capabilities)
+          : new Set<McpInvocationContext.McpCapability>(["preview"]),
         issuedAt,
       };
       yield* SynchronizedRef.update(state, ({ records }) => {
