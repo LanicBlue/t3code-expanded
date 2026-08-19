@@ -79,7 +79,7 @@ const RUN_VIEW = {
   positionId: "pos_1",
   workspaceRef: "ws",
   state: "open",
-  runRevision: 3,
+  runRevision: "run:3",
   agentId: "ag_one",
   executorRef: "client-1:ag_one",
   task: { prompt: "Summarize the wiki" },
@@ -93,7 +93,7 @@ const POSITION_VIEW = {
   owner: { type: "standalone", workDefinitionId: "wd_1" },
   displayName: "Summarizer",
   executor: { type: "agent", executorRef: "client-1:ag_one" },
-  assignmentRevision: 5,
+  assignmentRevision: "position:5",
 };
 
 const OPERATION_VIEW = {
@@ -163,7 +163,7 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
         {
           runId: "run_9",
           positionId: "pos_1",
-          runRevision: 3,
+          runRevision: "run:3",
           state: "open",
           agentId: "ag_one",
           task: { prompt: "Summarize the wiki" },
@@ -172,7 +172,7 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
         },
       ]);
       assert.deepEqual(positions, [
-        { positionId: "pos_1", displayName: "Summarizer", assignmentRevision: 5 },
+        { positionId: "pos_1", displayName: "Summarizer", assignmentRevision: "position:5" },
       ]);
 
       const listMyRequest = requests.find((request) => request.url.includes("/work-runs/my"));
@@ -230,8 +230,8 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
             projectId: "proj_ps_1",
             projectGeneration: 7,
             runId: "run_9",
-            expectedRunRevision: 3,
-            expectedAssignmentRevision: 5,
+            expectedRunRevision: "run:3",
+            expectedAssignmentRevision: "position:5",
             agentId: "ag_one",
             result: { kind: "standalone", output: "done" },
           },
@@ -251,8 +251,8 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
         const command = body.command as Record<string, unknown>;
         assert.equal(command.agentId, "ag_one");
         assert.equal(command.runId, "run_9");
-        assert.equal(command.expectedRunRevision, 3);
-        assert.equal(command.expectedAssignmentRevision, 5);
+        assert.equal(command.expectedRunRevision, "run:3");
+        assert.equal(command.expectedAssignmentRevision, "position:5");
         assert.deepEqual(command.result, { kind: "standalone", output: "done" });
       }).pipe(Effect.provide(makeLayer(client)));
     },
@@ -271,8 +271,8 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
             projectId: "proj_ps_1",
             projectGeneration: 7,
             runId: "run_9",
-            expectedRunRevision: 3,
-            expectedAssignmentRevision: 5,
+            expectedRunRevision: "run:3",
+            expectedAssignmentRevision: "position:5",
             agentId: "ag_one",
             result: {},
           },

@@ -92,7 +92,13 @@ export type ProjectServiceWorkClientError =
 
 // ── Wire records (the subset the tools surface; extra fields drop) ──
 
-const AggregateRevisionSchema = PositiveInt;
+/**
+ * The wire's aggregate revisions are OPAQUE STRING TOKENS ("run:4",
+ * "position:2") — the service's token() parser rejects bare numbers, so every
+ * record field and submit fence carries the token verbatim (issue #6 E2E:
+ * decoding them as PositiveInt rejected every real response).
+ */
+const AggregateRevisionSchema = Schema.String;
 
 export const ProjectWorkPositionRecord = Schema.Struct({
   positionId: Schema.String,
@@ -278,8 +284,8 @@ export class ProjectServiceWorkClient extends Context.Service<
     readonly submitRun: (
       input: WorkCallContext & {
         readonly runId: string;
-        readonly expectedRunRevision: number;
-        readonly expectedAssignmentRevision: number;
+        readonly expectedRunRevision: string;
+        readonly expectedAssignmentRevision: string;
         readonly agentId: string;
         readonly result: Readonly<Record<string, unknown>>;
       },
@@ -556,8 +562,8 @@ export const make = Effect.gen(function* () {
   const submitRunArgs = (
     input: WorkCallContext & {
       readonly runId: string;
-      readonly expectedRunRevision: number;
-      readonly expectedAssignmentRevision: number;
+      readonly expectedRunRevision: string;
+      readonly expectedAssignmentRevision: string;
       readonly agentId: string;
       readonly result: Readonly<Record<string, unknown>>;
     },

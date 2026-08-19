@@ -227,8 +227,8 @@ const handlers = {
     }),
   project_work_submit: (input: {
     readonly runId: string;
-    readonly runRevision: number;
-    readonly assignmentRevision: number;
+    readonly runRevision: string;
+    readonly assignmentRevision: string;
     readonly result: Readonly<Record<string, unknown>>;
   }) =>
     Effect.gen(function* () {

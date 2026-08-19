@@ -130,13 +130,13 @@ export const ProjectWorkSubmitInput = Schema.Struct({
   runId: Schema.String.annotate({
     description: "Identifier of the Work run to complete, as returned by project_work_list.",
   }),
-  runRevision: PositiveInt.annotate({
+  runRevision: Schema.String.annotate({
     description:
-      "The run's current revision from project_work_list; a stale value is rejected as a conflict.",
+      'The run\'s current revision token from project_work_list (e.g. "run:4"); pass it back verbatim — a stale value is rejected as a conflict.',
   }),
-  assignmentRevision: PositiveInt.annotate({
+  assignmentRevision: Schema.String.annotate({
     description:
-      "The position's current assignment revision from project_work_list; a stale value is rejected as a conflict.",
+      'The position\'s current assignment revision token from project_work_list (e.g. "position:2"); pass it back verbatim — a stale value is rejected as a conflict.',
   }),
   result: Schema.Record(Schema.String, Schema.Unknown).annotate({
     description: "The work result payload; its shape is defined by the position's work definition.",
@@ -155,8 +155,8 @@ export const ProjectOperationGetInput = Schema.Struct({
 const ProjectWorkListItem = Schema.Struct({
   runId: Schema.String,
   positionId: Schema.String,
-  runRevision: PositiveInt,
-  assignmentRevision: Schema.NullOr(PositiveInt),
+  runRevision: Schema.String,
+  assignmentRevision: Schema.NullOr(Schema.String),
   agentId: Schema.String,
   state: Schema.Literals(["open", "completed", "superseded", "cancelled"]),
   task: Schema.Record(Schema.String, Schema.Unknown),
@@ -166,7 +166,7 @@ const ProjectWorkListItem = Schema.Struct({
 const ProjectWorkPositionItem = Schema.Struct({
   positionId: Schema.String,
   displayName: Schema.String,
-  assignmentRevision: PositiveInt,
+  assignmentRevision: Schema.String,
 });
 
 export const ProjectWorkListResult = Schema.Struct({

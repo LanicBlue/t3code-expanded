@@ -126,7 +126,7 @@ const COMMITTED_OPERATION = {
 const RUN_VIEW = {
   runId: "run_9",
   positionId: "pos_1",
-  runRevision: 3,
+  runRevision: "run:3",
   state: "open",
   agentId: "ag_one",
   task: { prompt: "Summarize" },
@@ -136,15 +136,15 @@ const RUN_VIEW = {
 const POSITION_VIEW = {
   positionId: "pos_1",
   displayName: "Summarizer",
-  assignmentRevision: 5,
+  assignmentRevision: "position:5",
 } as const;
 
 interface CapturedSubmit {
   readonly projectId: string;
   readonly projectGeneration: number;
   readonly runId: string;
-  readonly expectedRunRevision: number;
-  readonly expectedAssignmentRevision: number;
+  readonly expectedRunRevision: string;
+  readonly expectedAssignmentRevision: string;
   readonly agentId: string;
   readonly result: Readonly<Record<string, unknown>>;
   readonly operationId: string;
@@ -241,8 +241,8 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
     return Effect.gen(function* () {
       const operation = yield* ProjectWorkToolkitHandlers.project_work_submit({
         runId: "run_9",
-        runRevision: 3,
-        assignmentRevision: 5,
+        runRevision: "run:3",
+        assignmentRevision: "position:5",
         result: { kind: "standalone", output: "done" },
       }).pipe(withHandlerLayers({ workClientLayer: layer }));
 
@@ -255,8 +255,8 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       assert.equal(call?.projectGeneration, 7);
       // Business data the AGENT supplied, verbatim.
       assert.equal(call?.runId, "run_9");
-      assert.equal(call?.expectedRunRevision, 3);
-      assert.equal(call?.expectedAssignmentRevision, 5);
+      assert.equal(call?.expectedRunRevision, "run:3");
+      assert.equal(call?.expectedAssignmentRevision, "position:5");
       assert.deepEqual(call?.result, { kind: "standalone", output: "done" });
       // The recovery handle is server-generated, not agent-visible input.
       assert.match(call?.operationId ?? "", /.+/);
@@ -268,7 +268,7 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
     const { layer } = makeWorkClientLayer({
       runs: [
         RUN_VIEW,
-        { ...RUN_VIEW, runId: "run_orphan", positionId: "pos_gone", runRevision: 2 },
+        { ...RUN_VIEW, runId: "run_orphan", positionId: "pos_gone", runRevision: "run:2" },
       ],
     });
 
@@ -283,8 +283,8 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       assert.deepEqual(result.runs[0], {
         runId: "run_9",
         positionId: "pos_1",
-        runRevision: 3,
-        assignmentRevision: 5,
+        runRevision: "run:3",
+        assignmentRevision: "position:5",
         agentId: "ag_one",
         state: "open",
         task: { prompt: "Summarize" },

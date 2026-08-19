@@ -95,8 +95,8 @@ it("strips identity keys an agent smuggles into business arguments", () => {
   const decode = Schema.decodeUnknownSync(ProjectWorkSubmitInput);
   const decoded = decode({
     runId: "run_1",
-    runRevision: 3,
-    assignmentRevision: 5,
+    runRevision: "run:3",
+    assignmentRevision: "position:5",
     result: { kind: "standalone", output: "done" },
     agentId: "ag_spoofed",
     projectId: "proj_spoofed",
@@ -104,8 +104,8 @@ it("strips identity keys an agent smuggles into business arguments", () => {
   });
   expect(decoded).toEqual({
     runId: "run_1",
-    runRevision: 3,
-    assignmentRevision: 5,
+    runRevision: "run:3",
+    assignmentRevision: "position:5",
     result: { kind: "standalone", output: "done" },
   });
 });
