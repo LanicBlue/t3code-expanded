@@ -27,6 +27,7 @@ import {
   type ConsumerRuntimeState,
   type ConsumerSocketLike,
   type RuntimeConsumerAdapter,
+  CONSUMER_CLIENT_LATEST,
 } from "@lanicblue/project-consumer";
 import {
   isLocalProjectServiceBaseUrl,
@@ -519,7 +520,10 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       const runtime = new ProjectConsumerRuntime({
         url: desired.url,
         consumerId: CONSUMER_ID,
-        client: { name: "t3-code", version: packageJson.version },
+        // The hello's client.version feeds the service's SDK compatibility
+        // ladder, which compares SDK versions — the t3 package version
+        // (0.0.33) semantically ranks below SDK 0.1.0 and shows "unsupported".
+        client: { name: "t3-code", version: CONSUMER_CLIENT_LATEST },
         adapter,
         serviceKey: desired.credential,
         runtime: process.version,

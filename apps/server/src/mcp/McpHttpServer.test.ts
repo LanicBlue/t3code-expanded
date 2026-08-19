@@ -1,5 +1,7 @@
-import { expect, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import { NodeHttpServer } from "@effect/platform-node";
+// @effect-diagnostics nodeBuiltinImport:off - the real-transport test drives Node HTTP.
+import * as NodeHttp from "node:http";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   EnvironmentId,
@@ -15,9 +17,17 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { McpProtocol, McpSchema, McpServer } from "effect/unstable/ai";
-import { HttpBody, HttpClient, HttpRouter, HttpServerResponse } from "effect/unstable/http";
+import {
+  HttpBody,
+  HttpClient,
+  HttpRouter,
+  HttpServer,
+  HttpServerResponse,
+} from "effect/unstable/http";
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as McpSessionRegistry from "./McpSessionRegistry.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -417,3 +427,148 @@ it.effect("registers annotated tools and preserves authenticated request context
     }),
   ).pipe(Effect.provide(TestLayer)),
 );
+
+// ── t3#7: tools/list over the REAL HTTP transport ────────────────
+// @effect-diagnostics globalFetch:off - a raw fetch client is the
+// point here: drive the MCP HTTP route exactly like a provider process does.
+// @effect-diagnostics preferSchemaOverJson:off - raw JSON-RPC frames.
+const postJsonRpc = (
+  base: string,
+  authorization: string,
+  body: unknown,
+  session: { id: string; protocolVersion: string } | undefined,
+): Promise<Response> =>
+  fetch(base, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      authorization,
+      ...(session === undefined
+        ? {}
+        : {
+            "mcp-session-id": session.id,
+            // 2025-06-18 requires the negotiated version on EVERY subsequent
+            // request; omitting it is a 400 before any handler runs.
+            "mcp-protocol-version": session.protocolVersion,
+          }),
+    },
+    body: JSON.stringify(body),
+  });
+
+const jsonRpcPayload = (text: string): Record<string, unknown> => {
+  // A streamable-HTTP response may be JSON or a single SSE data frame.
+  const trimmed = text.trim();
+  const raw = trimmed.startsWith("{")
+    ? trimmed
+    : (trimmed.split("\n").find((line) => line.startsWith("data:")) ?? "")
+        .slice("data:".length)
+        .trim();
+  if (raw.length === 0) throw new Error(`unexpected MCP response body: ${trimmed.slice(0, 120)}`);
+  return JSON.parse(raw) as Record<string, unknown>;
+};
+// McpServer.toolkit() bakes its own default McpServer.layer into the
+// registration, so under provideMerge the registrations attached to a PHANTOM
+// instance while layerHttp served its own — production listed ZERO tools with
+// every layer green. This drives the actual streamable-HTTP route end to end.
+describe("McpHttpServer tools/list over the real HTTP transport (t3#7)", () => {
+  const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
+    getEnvironmentId: Effect.succeed(environmentId),
+    getDescriptor: Effect.die("unused"),
+  });
+
+  const projectWorkDeps = ServerSettings.ServerSettingsService.layerTest({
+    projectServiceClient: { enabled: true, baseUrl: "http://127.0.0.1:7600" },
+    logicalAgents: {
+      [LogicalAgentId.make("ag_wiring")]: {
+        agentName: "Wiring Agent",
+        providerInstanceId: invocation.providerInstanceId,
+        project: { enabled: true },
+      },
+    },
+  }).pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        ServerSecretStore.layer.pipe(
+          Layer.provideMerge(
+            Layer.fresh(ServerConfig.layerTest(process.cwd(), { prefix: "t3code-mcp-e2e-" })),
+          ),
+        ),
+        Layer.succeed(
+          HttpClient.HttpClient,
+          HttpClient.make(() => Effect.die("no Project Service HTTP expected")),
+        ),
+        projectWorkSnapshotQueryLayer,
+      ),
+    ),
+  );
+
+  const httpToolsE2eLayer = HttpRouter.serve(McpHttpServer.layer, {
+    disableListenLog: true,
+    disableLogger: true,
+  }).pipe(
+    Layer.provideMerge(McpSessionRegistry.layer),
+    Layer.provideMerge(NodeHttpServer.layer(NodeHttp.createServer, { host: "127.0.0.1", port: 0 })),
+    Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
+    Layer.provideMerge(PreviewAutomationBroker.layer),
+    Layer.provideMerge(projectWorkDeps),
+    // projectWorkDeps is itself a consumer of platform services (secret store
+    // needs Crypto/FileSystem/Path); the LAST provideMerge in a chain gets its
+    // own requirements provided by nothing, so give it NodeServices too.
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+  it.effect("serves the registered toolkits' tools (project_work_list present) over HTTP", () =>
+    Effect.gen(function* () {
+      const registry = yield* McpSessionRegistry.McpSessionRegistry;
+      const server = yield* HttpServer.HttpServer;
+      const address = server.address;
+      if (typeof address === "string" || !("port" in address)) {
+        assert.fail(`expected TCP address, got ${String(address)}`);
+      }
+      const base = `http://127.0.0.1:${address.port}/mcp`;
+      const issued = yield* registry.issue({
+        threadId,
+        providerInstanceId: invocation.providerInstanceId,
+        capabilities: new Set(["project.work.read"] as const),
+      });
+      const authorization = issued.config.authorizationHeader;
+      const post = (body: unknown, session: { id: string; protocolVersion: string } | undefined) =>
+        Effect.promise(() => postJsonRpc(base, authorization, body, session));
+
+      const initResponse = yield* post(
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "t3-e2e", version: "1.0.0" },
+          },
+        },
+        undefined,
+      );
+      assert.equal(initResponse.status, 200, "initialize failed");
+      const session = {
+        id:
+          initResponse.headers.get("mcp-session-id") ??
+          assert.fail("initialize returned no session id"),
+        protocolVersion: initResponse.headers.get("mcp-protocol-version") ?? "2025-06-18",
+      };
+
+      yield* post({ jsonrpc: "2.0", method: "notifications/initialized" }, session);
+
+      const listResponse = yield* post({ jsonrpc: "2.0", id: 2, method: "tools/list" }, session);
+      assert.equal(listResponse.status, 200, "tools/list failed");
+      const listBody = jsonRpcPayload(yield* Effect.promise(() => listResponse.text())) as {
+        result?: { tools?: ReadonlyArray<{ name: string }> };
+      };
+      const names = (listBody.result?.tools ?? []).map((tool) => tool.name);
+      assert.include(names, "project_work_list", `tools over HTTP were: ${names.join(", ")}`);
+      // The preview toolkit rides the same transport.
+      assert.include(names, "preview_navigate");
+    }).pipe(Effect.provide(httpToolsE2eLayer), Effect.scoped),
+  );
+});

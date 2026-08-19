@@ -206,9 +206,13 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
   });
 });
 
-const PreviewStandardToolkitRegistrationLive = McpServer.toolkit(PreviewStandardToolkit).pipe(
-  Layer.provide(PreviewStandardToolkitHandlersLive),
-);
+// registerToolkit (NOT McpServer.toolkit): toolkit() bakes in its own default
+// McpServer.layer, which shadows the transport instance under provideMerge —
+// the registrations would attach to a phantom server and the live /mcp route
+// would list ZERO tools (t3#7: exactly what happened in production).
+const PreviewStandardToolkitRegistrationLive = Layer.effectDiscard(
+  McpServer.registerToolkit(PreviewStandardToolkit),
+).pipe(Layer.provide(PreviewStandardToolkitHandlersLive));
 
 const PreviewSnapshotRegistrationLive = Layer.effectDiscard(registerPreviewSnapshot()).pipe(
   Layer.provide(PreviewSnapshotToolkitHandlersLive),
@@ -224,7 +228,9 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
 // provided nowhere surfaces only at call time as a Die ("Service not found").
 // The Work client is therefore provided right here, next to the registration
 // it serves — the pair cannot drift apart unnoticed.
-export const ProjectWorkToolkitRegistrationLive = McpServer.toolkit(ProjectWorkToolkit).pipe(
+export const ProjectWorkToolkitRegistrationLive = Layer.effectDiscard(
+  McpServer.registerToolkit(ProjectWorkToolkit),
+).pipe(
   Layer.provide(ProjectWorkToolkitHandlersLive),
   Layer.provide(ProjectServiceWorkClient.layer),
 );
