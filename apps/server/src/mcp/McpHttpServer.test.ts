@@ -563,12 +563,24 @@ describe("McpHttpServer tools/list over the real HTTP transport (t3#7)", () => {
       const listResponse = yield* post({ jsonrpc: "2.0", id: 2, method: "tools/list" }, session);
       assert.equal(listResponse.status, 200, "tools/list failed");
       const listBody = jsonRpcPayload(yield* Effect.promise(() => listResponse.text())) as {
-        result?: { tools?: ReadonlyArray<{ name: string }> };
+        result?: { tools?: ReadonlyArray<{ name: string; inputSchema?: { type?: string } }> };
       };
-      const names = (listBody.result?.tools ?? []).map((tool) => tool.name);
+      const tools = listBody.result?.tools ?? [];
+      const names = tools.map((tool) => tool.name);
       assert.include(names, "project_work_list", `tools over HTTP were: ${names.join(", ")}`);
       // The preview toolkit rides the same transport.
       assert.include(names, "preview_navigate");
+      // MCP contract: every inputSchema must be an OBJECT schema. One
+      // violation makes strict clients (claude-code) drop the ENTIRE tool
+      // list — an empty Schema.Struct({}) serializes as anyOf[object, array]
+      // and did exactly that (issue #7 second half).
+      for (const tool of tools) {
+        assert.equal(
+          tool.inputSchema?.type,
+          "object",
+          `tool ${tool.name} inputSchema must declare type "object"`,
+        );
+      }
     }).pipe(Effect.provide(httpToolsE2eLayer), Effect.scoped),
   );
 });

@@ -116,9 +116,12 @@ export type ProjectWorkError = typeof ProjectWorkError.Type;
 
 // ── Input schemas (business data only — never identity) ──────────
 
-export const ProjectWorkListInput = Schema.Struct({}).annotate({
-  description: "No arguments: the server resolves the agent and project from the session.",
-});
+// NOT Schema.Struct({}): an empty struct serializes as anyOf[object, array],
+// which violates the MCP tools/list contract (inputSchema must be an object
+// schema). claude-code rejects the ENTIRE tool list over that one schema and
+// the agent sees zero Project tools (issue #7). Tool.EmptyParams is the
+// SDK's own no-argument schema and serializes as a plain object type.
+export const ProjectWorkListInput = Tool.EmptyParams;
 
 export const ProjectWorkGetInput = Schema.Struct({
   runId: Schema.String.annotate({
