@@ -33,14 +33,16 @@ import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEng
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
+import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as ProjectConsumerRuntime from "./ProjectConsumerRuntimeService.ts";
 import * as ProjectServiceWorkClient from "./ProjectServiceWorkClient.ts";
 
 const CREDENTIAL = "psk_key-1.s3cret";
 const AGENT_ID = "ag_one";
 const PS_PROJECT_ID = "ps_proj_1";
-const T3_PROJECT_ID = "t3_proj_9";
 const ISO = "2026-08-14T12:00:00.000Z";
+/** The notice's workspace directory — the one directory on the fake disk. */
+const WORKSPACE_DIR = "/tmp/registry";
 
 // ── Fake client socket + gateway (the SDK drives the client side) ──
 
@@ -70,7 +72,7 @@ class FakeSocket implements ConsumerSocketLike {
     this.onclose?.();
   }
 
-  receive(message: ConsumerGatewayMessage, version: 1 | 3 = 1): void {
+  receive(message: ConsumerGatewayMessage, version: 1 | 3 | 4 = 1): void {
     this.onmessage?.({ data: consumerWireAdapter(version).encode(message) });
   }
 
@@ -104,12 +106,13 @@ const makeGateway = () => {
       id: newMessageId(),
       sentAt: ISO,
       payload: {
-        serverVersion: "0.4.0",
-        protocol: { selected: 3, current: 3, minSupported: 1 },
+        serverVersion: "0.5.0",
+        // V4: the notice's project block may carry workspaceDir (issue #18).
+        protocol: { selected: 4, current: 4, minSupported: 1 },
         capabilities: [],
         client: {
-          latest: "0.4.0",
-          recommended: "0.4.0",
+          latest: "0.5.0",
+          recommended: "0.5.0",
           minSupported: "0.1.0",
           status: "current",
           deprecation: null,
@@ -162,7 +165,7 @@ const makeGateway = () => {
   return {
     factory,
     recording: { sockets, hellos, acks, failures } satisfies GatewayRecording,
-    /** Server → client structured work.available (V3 notice shape). */
+    /** Server → client structured work.available (V4 notice shape). */
     sendWorkAvailable: (
       socket: FakeSocket,
       input: { readonly runId: string; readonly occupancyRevision?: number },
@@ -178,7 +181,11 @@ const makeGateway = () => {
               input.runId,
               input.occupancyRevision ?? 1,
             ),
-            project: { projectId: PS_PROJECT_ID, projectName: "Registry" },
+            project: {
+              projectId: PS_PROJECT_ID,
+              projectName: "Registry",
+              workspaceDir: WORKSPACE_DIR,
+            },
             agent: { agentId: AGENT_ID, agentName: "Build agent" },
             positionId: "pos_1",
             runId: input.runId,
@@ -187,7 +194,14 @@ const makeGateway = () => {
             openedAt: ISO,
           } as never,
         },
-        3,
+        4,
+      );
+    },
+    /** Server → client gateway error (encoded on the negotiated V4 wire). */
+    sendServerError: (socket: FakeSocket, code: string, message: string) => {
+      socket.receive(
+        { type: "error", id: newMessageId(), sentAt: ISO, payload: { code, message } },
+        4,
       );
     },
     requestInventory: (socket: FakeSocket) => {
@@ -209,6 +223,15 @@ const flush = async (): Promise<void> => {
 };
 
 /**
+ * Flush plus a real-time hop: the routing seam's canonicalization does REAL
+ * filesystem work (realpath on the libuv threadpool), whose promises resolve
+ * on a macrotask horizon microtasks alone never reach — Effect.sleep under
+ * it.live crosses it, then the microtask drain settles the wake chain.
+ */
+const settleWake = (): Effect.Effect<void> =>
+  Effect.sleep(Duration.millis(10)).pipe(Effect.flatMap(() => Effect.promise(flush)));
+
+/**
  * Real-time wait for the SDK's own timers (hello/notice promise chains and
  * the 10ms reconnect backoff). These tests run under `it.live` because the
  * SDK rides real timers the Effect test clock cannot drive.
@@ -219,7 +242,7 @@ const waitForSdk = (ms: number): Effect.Effect<void> => Effect.sleep(Duration.mi
 
 const threadShellFor = (threadId: string): OrchestrationThreadShell => ({
   id: ThreadId.make(threadId),
-  projectId: ProjectId.make(T3_PROJECT_ID),
+  projectId: ProjectId.make("t3_proj_autocreated"),
   title: "Project Work — Registry",
   modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6-sol" },
   runtimeMode: "full-access",
@@ -256,15 +279,23 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     const threads = new Map<string, OrchestrationThreadShell>();
+    // The projection of auto-created projects, keyed by id and by root.
+    const projects = new Map<string, { readonly id: string; readonly workspaceRoot: string }>();
     const eventQueue = yield* Queue.unbounded<OrchestrationEvent>();
     let openRunCount = 2;
     let runsFailure: ProjectServiceWorkClient.ProjectServiceWorkClientError | null = null;
 
-    // Dispatched commands become visible thread state, mirroring the
+    // Dispatched commands become visible thread/project state, mirroring the
     // projection (a notification turn.start makes the session busy).
     const dispatch = (command: OrchestrationCommand) =>
       Effect.sync(() => {
         commands.push(command);
+        if (command.type === "project.create") {
+          projects.set(String(command.projectId), {
+            id: String(command.projectId),
+            workspaceRoot: command.workspaceRoot,
+          });
+        }
         if (command.type === "thread.create") {
           threads.set(command.threadId, threadShellFor(command.threadId));
         }
@@ -306,25 +337,78 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
     } as OrchestrationEngine.OrchestrationEngineService["Service"]);
 
     const snapshotQueryLayer = Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+      getSnapshot: () =>
+        Effect.succeed({
+          snapshotSequence: commands.length,
+          projects: [...projects.values()].map((project) => ({
+            id: ProjectId.make(project.id),
+            title: "Registry",
+            workspaceRoot: project.workspaceRoot,
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: ISO,
+            updatedAt: ISO,
+            deletedAt: null,
+          })),
+          threads: [],
+          updatedAt: ISO,
+        }),
       getThreadShellById: (threadId: ThreadId) =>
         Effect.succeed(
           threads.has(threadId)
             ? Option.some(threads.get(threadId) as OrchestrationThreadShell)
             : Option.none(),
         ),
-      getProjectShellById: () =>
+      getActiveProjectByWorkspaceRoot: (workspaceRoot: string) => {
+        const active = [...projects.values()].find(
+          (project) => project.workspaceRoot === workspaceRoot,
+        );
+        return Effect.succeed(
+          active === undefined
+            ? Option.none()
+            : Option.some({
+                id: ProjectId.make(active.id),
+                title: "Registry",
+                workspaceRoot: active.workspaceRoot,
+                defaultModelSelection: null,
+                scripts: [],
+                createdAt: ISO,
+                updatedAt: ISO,
+                deletedAt: null,
+              }),
+        );
+      },
+      getProjectShellById: (projectId: ProjectId) =>
         Effect.succeed(
-          Option.some({
-            id: ProjectId.make(T3_PROJECT_ID),
-            title: "Registry",
-            workspaceRoot: "/tmp/registry",
-            defaultModelSelection: null,
-            scripts: [],
-            createdAt: ISO,
-            updatedAt: ISO,
-          }),
+          projects.has(projectId)
+            ? Option.some({
+                id: projectId,
+                title: "Registry",
+                workspaceRoot: (
+                  projects.get(projectId as string) as { readonly workspaceRoot: string }
+                ).workspaceRoot,
+                defaultModelSelection: null,
+                scripts: [],
+                createdAt: ISO,
+                updatedAt: ISO,
+              })
+            : Option.none(),
         ),
     } as unknown as ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]);
+
+    // The fake disk: exactly one directory the Project Service may point at.
+    const workspacePathsLayer = Layer.succeed(WorkspacePaths.WorkspacePaths, {
+      normalizeWorkspaceRoot: (workspaceRoot: string) =>
+        workspaceRoot === WORKSPACE_DIR
+          ? Effect.succeed(WORKSPACE_DIR)
+          : Effect.fail(
+              new WorkspacePaths.WorkspaceRootNotExistsError({
+                workspaceRoot,
+                normalizedWorkspaceRoot: workspaceRoot,
+              }),
+            ),
+      resolveRelativePathWithinRoot: () => Effect.die("unused"),
+    } as WorkspacePaths.WorkspacePaths["Service"]);
 
     const codexInstance = {
       instanceId: ProviderInstanceId.make("codex"),
@@ -340,9 +424,10 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
       listUnavailable: Effect.succeed([]),
       streamChanges: Stream.empty,
       subscribeChanges: Effect.succeed({} as never),
-    } as ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]);
+    } as unknown as ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]);
 
     const workClientLayer = Layer.succeed(ProjectServiceWorkClient.ProjectServiceWorkClient, {
+      listProjects: () => Effect.succeed([]),
       getProjectGeneration: () => Effect.succeed(7),
       listPositions: () => Effect.succeed([]),
       listMy: () =>
@@ -372,9 +457,11 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
     const serviceLayer = ProjectConsumerRuntime.layerWithOptions({
       socketFactory: gateway.factory,
       backoff: () => 10,
+      revivalDelayMs: 20,
     }).pipe(
       Layer.provideMerge(engineLayer),
       Layer.provideMerge(snapshotQueryLayer),
+      Layer.provideMerge(workspacePathsLayer),
       Layer.provideMerge(registryLayer),
       Layer.provideMerge(workClientLayer),
       Layer.provideMerge(settingsLayer),
@@ -409,13 +496,6 @@ const configureIntegration = Effect.gen(function* () {
       agentName: "Build agent",
       providerInstanceId: ProviderInstanceId.make("codex"),
       project: { enabled: true },
-      projectBindings: [
-        {
-          projectId: PS_PROJECT_ID,
-          projectName: "Registry",
-          t3ProjectId: ProjectId.make(T3_PROJECT_ID),
-        },
-      ],
     },
   };
   yield* serverSettings.updateSettings({
@@ -427,6 +507,8 @@ const turnStartCommands = (commands: ReadonlyArray<OrchestrationCommand>) =>
   commands.filter((command) => command.type === "thread.turn.start");
 const threadCreateCommands = (commands: ReadonlyArray<OrchestrationCommand>) =>
   commands.filter((command) => command.type === "thread.create");
+const projectCreateCommands = (commands: ReadonlyArray<OrchestrationCommand>) =>
+  commands.filter((command) => command.type === "project.create");
 
 describe("ProjectConsumerRuntimeService", () => {
   it.live("disabled integration: no connection is made", () =>
@@ -491,7 +573,7 @@ describe("ProjectConsumerRuntimeService", () => {
       }),
   );
 
-  it.live("notice routes to a created session and ACKs routing, not completion", () =>
+  it.live("notice auto-creates the workspace project, routes a session, and ACKs routing", () =>
     Effect.gen(function* () {
       const gateway = makeGateway();
       const fakes = yield* makeFakes(gateway);
@@ -506,7 +588,23 @@ describe("ProjectConsumerRuntimeService", () => {
         yield* waitForSdk(40);
 
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
+
+        // Issue #6: the notice's workspace directory auto-created the T3
+        // project (notice name as the title) and the session lives under it.
+        const project = projectCreateCommands(fakes.commands)[0];
+        assert.isDefined(project);
+        assert.strictEqual(
+          project?.type === "project.create" && project.workspaceRoot,
+          WORKSPACE_DIR,
+        );
+        assert.strictEqual(project?.type === "project.create" && project.title, "Registry");
+        const t3ProjectId = project?.type === "project.create" ? String(project.projectId) : "";
+        assert.strictEqual(
+          threadCreateCommands(fakes.commands)[0]?.type === "thread.create" &&
+            String(threadCreateCommands(fakes.commands)[0]?.projectId),
+          t3ProjectId,
+        );
 
         const turn = turnStartCommands(fakes.commands)[0];
         assert.strictEqual(
@@ -521,6 +619,104 @@ describe("ProjectConsumerRuntimeService", () => {
         assert.isEmpty(gateway.recording.failures);
         const sessions = yield* service.router.snapshotSessions;
         assert.lengthOf(sessions, 1);
+      }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+    }),
+  );
+
+  it.live("a notice whose directory is missing on disk fails with a routing code", () =>
+    Effect.gen(function* () {
+      const gateway = makeGateway();
+      const fakes = yield* makeFakes(gateway);
+
+      yield* Effect.gen(function* () {
+        yield* configureIntegration;
+        yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService.pipe(
+          Effect.flatMap((service) => service.start()),
+        );
+        const socket = gateway.recording.sockets[0];
+        assert.isDefined(socket);
+        socket?.fireOpen();
+        yield* waitForSdk(40);
+
+        // The Project Service points at a directory this machine does not
+        // have: the wake fails AGENT_NOT_DISPATCHABLE with the directory in
+        // the detail; no project or session is created.
+        socket?.receive(
+          {
+            type: "work.available",
+            id: newMessageId(),
+            sentAt: ISO,
+            payload: {
+              noticeId: workAvailableNoticeId(PS_PROJECT_ID, "run_404", 1),
+              project: {
+                projectId: PS_PROJECT_ID,
+                projectName: "Nowhere",
+                workspaceDir: "/tmp/does-not-exist",
+              },
+              agent: { agentId: AGENT_ID, agentName: "Build agent" },
+              positionId: "pos_1",
+              runId: "run_404",
+              occupancyRevision: 1,
+              runRevision: 1,
+              openedAt: ISO,
+            } as never,
+          },
+          4,
+        );
+        yield* settleWake();
+
+        assert.isEmpty(projectCreateCommands(fakes.commands));
+        assert.isEmpty(threadCreateCommands(fakes.commands));
+        assert.deepEqual(gateway.recording.failures, [
+          {
+            noticeId: workAvailableNoticeId(PS_PROJECT_ID, "run_404", 1),
+            code: "AGENT_NOT_DISPATCHABLE",
+          },
+        ]);
+      }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+    }),
+  );
+
+  it.live("a pre-V4 notice without workspaceDir fails with the V4 requirement", () =>
+    Effect.gen(function* () {
+      const gateway = makeGateway();
+      const fakes = yield* makeFakes(gateway);
+
+      yield* Effect.gen(function* () {
+        yield* configureIntegration;
+        yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService.pipe(
+          Effect.flatMap((service) => service.start()),
+        );
+        const socket = gateway.recording.sockets[0];
+        assert.isDefined(socket);
+        socket?.fireOpen();
+        yield* waitForSdk(40);
+
+        // A V3-shaped notice (no workspaceDir field): routing must name the
+        // protocol requirement instead of guessing a project.
+        socket?.receive(
+          {
+            type: "work.available",
+            id: newMessageId(),
+            sentAt: ISO,
+            payload: {
+              noticeId: workAvailableNoticeId(PS_PROJECT_ID, "run_v3", 1),
+              project: { projectId: PS_PROJECT_ID, projectName: "Registry" },
+              agent: { agentId: AGENT_ID, agentName: "Build agent" },
+              positionId: "pos_1",
+              runId: "run_v3",
+              occupancyRevision: 1,
+              runRevision: 1,
+              openedAt: ISO,
+            } as never,
+          },
+          3,
+        );
+        yield* settleWake();
+
+        assert.isEmpty(projectCreateCommands(fakes.commands));
+        assert.lengthOf(gateway.recording.failures, 1);
+        assert.strictEqual(gateway.recording.failures[0]?.code, "AGENT_NOT_DISPATCHABLE");
       }).pipe(Effect.provide(fakes.layer), Effect.scoped);
     }),
   );
@@ -541,17 +737,18 @@ describe("ProjectConsumerRuntimeService", () => {
         yield* waitForSdk(40);
 
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
 
         // Same deterministic noticeId again on the SAME channel: the SDK
         // ACKs again without re-waking.
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
         // A different run is a NEW notice; its session is busy (the first
         // aggregate's turn is running), so it is only recorded.
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_2" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
 
+        assert.lengthOf(projectCreateCommands(fakes.commands), 1);
         assert.lengthOf(threadCreateCommands(fakes.commands), 1);
         assert.lengthOf(turnStartCommands(fakes.commands), 1);
         assert.isEmpty(gateway.recording.failures);
@@ -575,7 +772,7 @@ describe("ProjectConsumerRuntimeService", () => {
         yield* waitForSdk(40);
 
         gateway.sendWorkAvailable(first as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
         assert.lengthOf(turnStartCommands(fakes.commands), 1);
 
         // The channel drops; the SDK reconnects (10ms backoff) and Project
@@ -588,14 +785,117 @@ describe("ProjectConsumerRuntimeService", () => {
         yield* waitForSdk(40);
 
         gateway.sendWorkAvailable(second as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
 
         // Same runtime instance: the routed set deduplicated the replay —
-        // no second wake, no second aggregate.
+        // no second wake, no second aggregate, no re-created project.
         assert.lengthOf(turnStartCommands(fakes.commands), 1);
         assert.lengthOf(threadCreateCommands(fakes.commands), 1);
+        assert.lengthOf(projectCreateCommands(fakes.commands), 1);
       }).pipe(Effect.provide(fakes.layer), Effect.scoped);
     }),
+  );
+
+  it.live(
+    "a severed connection re-dials and re-hellos with the existing backoff — never terminal",
+    () =>
+      Effect.gen(function* () {
+        const gateway = makeGateway();
+        const fakes = yield* makeFakes(gateway);
+
+        yield* Effect.gen(function* () {
+          yield* configureIntegration;
+          const service = yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService;
+          yield* service.start();
+          const first = gateway.recording.sockets[0];
+          assert.isDefined(first);
+          first?.fireOpen();
+          yield* waitForSdk(40);
+          assert.lengthOf(gateway.recording.hellos, 1);
+          assert.strictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "connected",
+          );
+
+          // The Project Service dies: the server side of the live socket
+          // drops. A plain connection loss must re-dial on the runtime's own
+          // backoff (10ms here) — no terminal classification.
+          first?.fireClose();
+          yield* waitForSdk(60);
+
+          // The 10ms backoff has already re-dialed: a fresh socket exists and
+          // the runtime is mid-handshake, never stopped.
+          assert.strictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "connecting",
+          );
+          const second = gateway.recording.sockets[1];
+          assert.isDefined(second);
+
+          // The re-dial converges: fresh hello, fresh welcome, connected.
+          second?.fireOpen();
+          yield* waitForSdk(40);
+          assert.lengthOf(gateway.recording.hellos, 2);
+          assert.strictEqual(gateway.recording.hellos[1]?.credential, CREDENTIAL);
+          assert.strictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "connected",
+          );
+        }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+      }),
+  );
+
+  it.live(
+    "a runtime that stopped itself on a terminal classification is revived and re-hellos",
+    () =>
+      Effect.gen(function* () {
+        const gateway = makeGateway();
+        const fakes = yield* makeFakes(gateway);
+
+        yield* Effect.gen(function* () {
+          yield* configureIntegration;
+          const service = yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService;
+          yield* service.start();
+          const first = gateway.recording.sockets[0];
+          assert.isDefined(first);
+          first?.fireOpen();
+          yield* waitForSdk(40);
+          assert.lengthOf(gateway.recording.hellos, 1);
+
+          // The gateway answers a terminal incompatibility: the SDK closes
+          // ITSELF (state stopped) — the class of self-stop that used to
+          // strand the integration with ZERO connections until restart.
+          gateway.sendServerError(
+            first as FakeSocket,
+            "CONSUMER_PROTOCOL_INCOMPATIBLE",
+            "server cannot speak this protocol",
+          );
+          yield* waitForSdk(10);
+          assert.isTrue((first as FakeSocket).closed);
+          assert.strictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "stopped",
+          );
+          assert.strictEqual(
+            (yield* service.getStatus).lastServerError?.code,
+            "CONSUMER_PROTOCOL_INCOMPATIBLE",
+          );
+
+          // The host's revival re-sync force-rebuilds the runtime (here
+          // after the shortened 20ms delay): a fresh dial + hello converges
+          // once the relaunched server speaks again.
+          yield* waitForSdk(80);
+          const second = gateway.recording.sockets[1];
+          assert.isDefined(second);
+          second?.fireOpen();
+          yield* waitForSdk(40);
+          assert.lengthOf(gateway.recording.hellos, 2);
+          assert.strictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "connected",
+          );
+        }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+      }),
   );
 
   it.live("restart delivers one new aggregate for a still-pending replayed notice", () =>
@@ -614,13 +914,13 @@ describe("ProjectConsumerRuntimeService", () => {
         socket?.fireOpen();
         yield* waitForSdk(40);
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
         assert.lengthOf(turnStartCommands(fakes.commands), 1);
       }).pipe(Effect.provide(fakes.layer), Effect.scoped);
 
       // Instance B (fresh runtime AND fresh routing state) receives the
-      // replay of the still-pending notice: it creates the next current
-      // session exactly once and delivers exactly ONE aggregate — the
+      // replay of the still-pending notice: it reuses the persisted project
+      // (no second create) and delivers exactly ONE aggregate — the
       // pre-restart session is left untouched, nothing multiplies.
       yield* Effect.gen(function* () {
         yield* configureIntegration;
@@ -632,8 +932,9 @@ describe("ProjectConsumerRuntimeService", () => {
         socket?.fireOpen();
         yield* waitForSdk(40);
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
 
+        assert.lengthOf(projectCreateCommands(fakes.commands), 1);
         assert.lengthOf(threadCreateCommands(fakes.commands), 2);
         assert.lengthOf(turnStartCommands(fakes.commands), 2);
       }).pipe(Effect.provide(fakes.layer), Effect.scoped);
@@ -656,7 +957,7 @@ describe("ProjectConsumerRuntimeService", () => {
         yield* waitForSdk(40);
 
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
 
         const created = threadCreateCommands(fakes.commands)[0];
         const threadId = created?.type === "thread.create" ? (created.threadId as string) : null;
@@ -668,7 +969,7 @@ describe("ProjectConsumerRuntimeService", () => {
 
         // More work arrives while busy: recorded, no interrupt.
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_2" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
         assert.lengthOf(turnStartCommands(fakes.commands), 1);
 
         // The turn finishes: the engine event drives ONE coalesced aggregate,
@@ -706,7 +1007,7 @@ describe("ProjectConsumerRuntimeService", () => {
         yield* waitForSdk(40);
 
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
         const sessionsBefore = yield* service.router.snapshotSessions;
         assert.lengthOf(sessionsBefore, 1);
 
@@ -730,7 +1031,7 @@ describe("ProjectConsumerRuntimeService", () => {
         );
 
         gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_9" });
-        yield* Effect.promise(flush);
+        yield* settleWake();
 
         // Routing failed with a protocol failure code; the session survived.
         assert.lengthOf(gateway.recording.failures, 1);
@@ -825,19 +1126,11 @@ describe("ProjectConsumerRuntimeService", () => {
               agentName: "Build agent",
               providerInstanceId: ProviderInstanceId.make("codex"),
               project: { enabled: true },
-              projectBindings: [
-                {
-                  projectId: PS_PROJECT_ID,
-                  projectName: "Registry",
-                  t3ProjectId: ProjectId.make(T3_PROJECT_ID),
-                },
-              ],
             },
             [LogicalAgentId.make("ag_disabled")]: {
               agentName: "Off agent",
               providerInstanceId: ProviderInstanceId.make("codex"),
               project: { enabled: false },
-              projectBindings: [],
             },
           } as never,
         });

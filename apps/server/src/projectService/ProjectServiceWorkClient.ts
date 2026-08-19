@@ -113,6 +113,33 @@ export const ProjectWorkRunRecord = Schema.Struct({
 });
 export type ProjectWorkRunRecord = typeof ProjectWorkRunRecord.Type;
 
+/**
+ * A Project Service project record (the ordinary-client-legal project info
+ * read, GET /project/v1/). `workspaceDir` is the directory-keyed lookup the
+ * MCP tools use to map a local project onto its Project Service project.
+ */
+const ServiceProjectRecord = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  workspaceDir: Schema.String,
+});
+
+export const ProjectServiceProjectRecord = Schema.Struct({
+  projectId: Schema.String,
+  name: Schema.String,
+  workspaceDir: Schema.String,
+});
+export type ProjectServiceProjectRecord = typeof ProjectServiceProjectRecord.Type;
+
+/** Explicit projection: the service's `id` becomes the wire-stable `projectId`. */
+const projectServiceProjectRecord = (
+  record: Schema.Schema.Type<typeof ServiceProjectRecord>,
+): ProjectServiceProjectRecord => ({
+  projectId: record.id,
+  name: record.name,
+  workspaceDir: record.workspaceDir,
+});
+
 const ServiceErrorEnvelope = Schema.Struct({
   category: Schema.String,
   code: Schema.String,
@@ -223,6 +250,15 @@ interface WorkCallContext {
 export class ProjectServiceWorkClient extends Context.Service<
   ProjectServiceWorkClient,
   {
+    /**
+     * The Project Service project list (GET /project/v1/) — the
+     * ordinary-client-legal project info read the MCP tools use to map a
+     * local project's directory onto its Project Service project.
+     */
+    readonly listProjects: () => Effect.Effect<
+      readonly ProjectServiceProjectRecord[],
+      ProjectServiceWorkClientError
+    >;
     /** Current generation of the bound project; every Work read is fenced to it. */
     readonly getProjectGeneration: (
       projectId: string,
@@ -418,8 +454,48 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const decodeArrayOrIncompatible = <A>(schema: Schema.Schema<A>, value: unknown): readonly A[] =>
-    Array.isArray(value) ? value.map((item) => decodeOrIncompatible(schema, item)) : [];
+  // A non-array body is a shape violation like any undecodable record — never
+  // a silent [], which callers would read as "nothing registered" (issue #6
+  // review). The throw stays inside the callers' catch boundaries.
+  const decodeArrayOrIncompatible = <A>(schema: Schema.Schema<A>, value: unknown): readonly A[] => {
+    if (!Array.isArray(value)) {
+      throw new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" });
+    }
+    return value.map((item) => decodeOrIncompatible(schema, item));
+  };
+
+  // GET /project/v1/ answers a bare ProjectRecord[] (id/name/workspaceDir);
+  // extra fields drop at this trust boundary like on every other read. Unlike
+  // the SDK-backed reads this facet path has no withClient catch, so the
+  // decode runs inside Effect.try — a bad shape is a TYPED incompatibility
+  // failure, never a Die defect escaping the Effect.fn body (issue #6 review).
+  const listProjects = Effect.fn("ProjectServiceWorkClient.listProjects")(function* () {
+    const endpoint = yield* resolveEndpoint;
+    const { status, value } = yield* facetRequest(
+      "GET",
+      `${endpoint.baseUrl}/project/v1/`,
+      undefined,
+      endpoint.credential,
+    );
+    if (status < 200 || status >= 300) {
+      if (isFailureEnvelope(value)) {
+        return yield* new ProjectServiceWorkServiceRejectedError({
+          code: value.error.code,
+          status,
+          message: value.error.message,
+        });
+      }
+      return yield* new ProjectServiceWorkTransportError({});
+    }
+    const records = yield* Effect.try({
+      try: () => decodeArrayOrIncompatible(ServiceProjectRecord, value),
+      catch: (cause) =>
+        isApiIncompatible(cause)
+          ? cause
+          : new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" }),
+    });
+    return records.map(projectServiceProjectRecord);
+  });
 
   const getProjectGeneration = Effect.fn("ProjectServiceWorkClient.getProjectGeneration")(
     function* (projectId: string) {
@@ -502,6 +578,7 @@ export const make = Effect.gen(function* () {
     }) as unknown as Parameters<ProjectConsumerWorkClient["submitRun"]>[0];
 
   return ProjectServiceWorkClient.of({
+    listProjects,
     getProjectGeneration,
     listPositions: (input) =>
       withClient(

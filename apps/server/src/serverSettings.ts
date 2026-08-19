@@ -50,7 +50,6 @@ import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import {
   applyServerSettingsPatch,
-  findDuplicateProjectBindings,
   findLogicalAgentsWithUnresolvedProviderInstances,
   isModelSelectionProviderEnabled,
 } from "@t3tools/shared/serverSettings";
@@ -594,11 +593,17 @@ const make = Effect.gen(function* () {
       };
     });
 
-  // Write-time reference and binding validation. Reads stay lenient (see
+  // Write-time reference validation. Reads stay lenient (see
   // findLogicalAgentsWithUnresolvedProviderInstances) so removing a provider
   // instance can never brick settings loading; the checks themselves run only
   // on patches that carry the agent map, so a providerInstances-only write
   // still succeeds when a stored agent references a since-deleted instance.
+  // Agents carry no per-project configuration anymore (issue #6: Work notices
+  // route by workspace directory), so what remains to check are
+  // provider-instance references — and, since the per-agent project bindings
+  // that used to disambiguate are gone, that a provider instance carries at
+  // most ONE Project-enabled agent: sessions on that instance could not pick
+  // between two, and every project tool call would answer agent-ambiguous.
   const validateLogicalAgents = (
     next: ServerSettings,
   ): Effect.Effect<ServerSettings, ServerSettingsError> => {
@@ -614,15 +619,21 @@ const make = Effect.gen(function* () {
         ),
       });
     }
-    const duplicate = findDuplicateProjectBindings(next)[0];
-    if (duplicate !== undefined) {
-      return new ServerSettingsError({
-        settingsPath,
-        operation: "validate",
-        cause: new Error(
-          `Logical agent ${duplicate.agentId} binds T3 project ${duplicate.t3ProjectId} to Project Service project ${duplicate.projectId} more than once.`,
-        ),
-      });
+    const projectEnabledByInstance = new Map<string, string>();
+    for (const [agentId, agent] of Object.entries(next.logicalAgents)) {
+      if (!agent.project.enabled) continue;
+      const incumbent = projectEnabledByInstance.get(agent.providerInstanceId);
+      if (incumbent !== undefined) {
+        return new ServerSettingsError({
+          settingsPath,
+          operation: "validate",
+          providerInstanceId: agent.providerInstanceId,
+          cause: new Error(
+            `Provider instance ${agent.providerInstanceId} has multiple Project-enabled logical agents (${incumbent}, ${agentId}); enable Project work on at most one agent per provider instance — sessions on the instance cannot pick between two.`,
+          ),
+        });
+      }
+      projectEnabledByInstance.set(agent.providerInstanceId, agentId);
     }
     return Effect.succeed(next);
   };

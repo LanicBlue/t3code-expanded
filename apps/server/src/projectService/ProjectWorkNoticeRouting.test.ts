@@ -1,9 +1,12 @@
 import { assert, it } from "@effect/vitest";
 import {
+  DEFAULT_MODEL,
   DEFAULT_SERVER_SETTINGS,
   type LogicalAgentConfig,
   LogicalAgentId,
+  type ModelSelection,
   type OrchestrationCommand,
+  type OrchestrationProject,
   type OrchestrationProjectShell,
   type OrchestrationSession,
   type OrchestrationThreadShell,
@@ -24,14 +27,16 @@ import {
   resolveProjectWorkRouting,
   workSessionThreadTitle,
   type ProjectWorkSessionRouterDeps,
+  type ProjectWorkWakeInput,
 } from "./ProjectWorkNoticeRouting.ts";
 
 const AGENT_ID = "ag_primary";
 const OTHER_AGENT_ID = "ag_secondary";
 const PS_PROJECT_ID = "ps_proj_1";
-const T3_PROJECT_ID = "t3_proj_9";
 const PROVIDER_INSTANCE = "codex-main";
 const ISO = "2026-08-14T12:00:00.000Z";
+/** The notice's workspace directory — always an existing directory on disk. */
+const WORKSPACE_DIR = "/tmp/registry";
 
 const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) => {
   const agents: Record<string, LogicalAgentConfig> = {
@@ -39,19 +44,11 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
       agentName: "Primary Agent",
       providerInstanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
       project: { enabled: true },
-      projectBindings: [
-        {
-          projectId: PS_PROJECT_ID,
-          projectName: "Registry",
-          t3ProjectId: ProjectId.make(T3_PROJECT_ID),
-        },
-      ],
     },
     [LogicalAgentId.make(OTHER_AGENT_ID)]: {
       agentName: "Secondary Agent",
       providerInstanceId: ProviderInstanceId.make("other-instance"),
       project: { enabled: false },
-      projectBindings: [],
     },
   };
   const base: ServerSettings = {
@@ -69,11 +66,12 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
 
 const makeThreadShell = (
   threadId: string,
+  projectId: string,
   mutations?: (shell: OrchestrationThreadShell) => OrchestrationThreadShell,
 ): OrchestrationThreadShell => {
   const base: OrchestrationThreadShell = {
     id: ThreadId.make(threadId),
-    projectId: ProjectId.make(T3_PROJECT_ID),
+    projectId: ProjectId.make(projectId),
     title: "Project Work — Registry",
     modelSelection: {
       instanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
@@ -118,16 +116,6 @@ const stoppedSession = (threadId: string): OrchestrationSession => ({
   status: "stopped",
 });
 
-const makeProjectShell = (): OrchestrationProjectShell => ({
-  id: ProjectId.make(T3_PROJECT_ID),
-  title: "Registry",
-  workspaceRoot: "/tmp/registry",
-  defaultModelSelection: null,
-  scripts: [],
-  createdAt: ISO,
-  updatedAt: ISO,
-});
-
 interface Harness {
   readonly router: ProjectWorkSessionRouter;
   readonly commands: OrchestrationCommand[];
@@ -139,27 +127,68 @@ interface Harness {
   readonly countCalls: () => number;
   readonly failDispatch: (shouldFail: boolean) => void;
   readonly removeProvider: () => void;
+  /** Remove a directory from the (simulated) disk. */
+  readonly removeDir: (dir: string) => void;
+  /** Add a directory to the (simulated) disk. */
+  readonly addDir: (dir: string) => void;
+  /** Seed an active project at a workspace root, as the engine's projection would. */
+  readonly putProject: (id: string, workspaceRoot: string) => void;
+  /**
+   * Register a symlink spelling: canonicalizeWorkspaceRoot maps `stored` to
+   * `canonical` (issue #6 review — legacy roots may not be canonical).
+   */
+  readonly aliasRoot: (stored: string, canonical: string) => void;
+  /** Archive/delete a project, as the engine's projection would. */
+  readonly removeProject: (id: string) => void;
+  /**
+   * Arm the concurrent-create race: the next project.create dispatch first
+   * projects ANOTHER project at the same root (the concurrent winner) and
+   * then fails with the engine's active-workspaceRoot-taken invariant.
+   */
+  readonly armCreateRace: () => void;
   /** Simulated latency on the authoritative Work query (real ms, it.live). */
   readonly setWorkCountDelayMs: (ms: number) => void;
   /** Simulated latency on orchestration dispatch (real ms, it.live). */
   readonly setDispatchDelayMs: (ms: number) => void;
 }
 
+const CREATED_PROJECT_MODEL_SELECTION: ModelSelection = {
+  instanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
+  model: DEFAULT_MODEL,
+};
+
 const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     let currentSettings = settings;
     const threads = new Map<string, OrchestrationThreadShell>();
+    // The simulated filesystem: directories that exist for normalization.
+    const existingDirs = new Set<string>([WORKSPACE_DIR]);
+    // The projection of active projects, keyed twice: by id and by root.
+    const projectsById = new Map<string, OrchestrationProject>();
+    // Symlink spellings a stored root canonicalizes to (review fixture).
+    const canonicalAliases = new Map<string, string>();
     const providers = new Map<string, ProviderDriverKind>([
       [PROVIDER_INSTANCE, ProviderDriverKind.make("codex")],
     ]);
     let openWorkCount = 2;
     let workCountShouldFail = false;
     let dispatchShouldFail = false;
+    let createRaceArmed = false;
     let workCountDelayMs = 0;
     let dispatchDelayMs = 0;
     let countCalls = 0;
     let idCounter = 0;
+
+    const shellFor = (project: OrchestrationProject): OrchestrationProjectShell => ({
+      id: project.id,
+      title: project.title,
+      workspaceRoot: project.workspaceRoot,
+      defaultModelSelection: project.defaultModelSelection,
+      scripts: project.scripts,
+      createdAt: project.createdAt,
+      updatedAt: project.updatedAt,
+    });
 
     const deps: ProjectWorkSessionRouterDeps = {
       readSettings: Effect.sync(() => currentSettings),
@@ -169,39 +198,119 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
             ? Option.some(threads.get(threadId) as OrchestrationThreadShell)
             : Option.none(),
         ),
-      readProjectShell: () => Effect.succeed(Option.some(makeProjectShell())),
+      readProjectShell: (projectId) =>
+        Effect.succeed(
+          projectsById.has(projectId)
+            ? Option.some(shellFor(projectsById.get(projectId) as OrchestrationProject))
+            : Option.none(),
+        ),
       resolveProviderDriver: (instanceId) =>
         Effect.succeed(
           providers.has(instanceId)
             ? Option.some(providers.get(instanceId) as ProviderDriverKind)
             : Option.none(),
         ),
-      dispatchCommand: (command) =>
-        dispatchShouldFail
-          ? Effect.fail(
-              new ProjectWorkRoutingError({ code: "CONSUMER_INTERNAL", detail: "dispatch failed" }),
-            )
-          : dispatchDelayMs > 0
-            ? Effect.sleep(dispatchDelayMs).pipe(
-                Effect.flatMap(() =>
-                  Effect.sync(() => {
-                    commands.push(command);
-                    if (command.type === "thread.create") {
-                      // The engine projects inside the dispatch transaction:
-                      // by the time dispatch resolves, the thread is readable.
-                      threads.set(command.threadId, makeThreadShell(command.threadId));
-                    }
+      // WorkspacePaths with createIfMissing FALSE: the directory must exist.
+      normalizeWorkspaceDir: (workspaceDir) =>
+        Effect.succeed(workspaceDir).pipe(
+          Effect.flatMap((normalized) =>
+            existingDirs.has(normalized)
+              ? Effect.succeed(normalized)
+              : Effect.fail(
+                  new ProjectWorkRoutingError({
+                    code: "AGENT_NOT_DISPATCHABLE",
+                    detail: `the workspace directory the Project Service pointed at does not exist on this machine (${normalized})`,
                   }),
                 ),
-              )
-            : Effect.sync(() => {
-                commands.push(command);
-                if (command.type === "thread.create") {
-                  // The engine projects inside the dispatch transaction:
-                  // by the time dispatch resolves, the thread is readable.
-                  threads.set(command.threadId, makeThreadShell(command.threadId));
-                }
-              }),
+          ),
+        ),
+      getActiveProjectByWorkspaceRoot: (workspaceRoot) => {
+        const active = [...projectsById.values()].find(
+          (project) => project.workspaceRoot === workspaceRoot && project.deletedAt === null,
+        );
+        return Effect.succeed(active === undefined ? Option.none() : Option.some(active));
+      },
+      canonicalizeWorkspaceRoot: (workspaceRoot) =>
+        Effect.succeed(canonicalAliases.get(workspaceRoot) ?? workspaceRoot),
+      listActiveProjectRoots: () =>
+        Effect.succeed(
+          [...projectsById.values()]
+            .filter((project) => project.deletedAt === null)
+            .map((project) => ({ projectId: project.id, workspaceRoot: project.workspaceRoot })),
+        ),
+      createdProjectDefaultModelSelection: CREATED_PROJECT_MODEL_SELECTION,
+      dispatchCommand: (command) => {
+        if (dispatchShouldFail) {
+          return Effect.fail(
+            new ProjectWorkRoutingError({ code: "CONSUMER_INTERNAL", detail: "dispatch failed" }),
+          );
+        }
+        // The dispatch transaction: the engine's active-workspaceRoot-taken
+        // invariant (exactly one active project per root) is enforced AT
+        // COMMIT TIME, so a concurrent wake that queried before the winner
+        // committed loses its create here — after any simulated latency.
+        const attempt = (): Effect.Effect<void, ProjectWorkRoutingError> => {
+          if (command.type === "project.create") {
+            const conflicting = [...projectsById.values()].find(
+              (project) =>
+                project.workspaceRoot === command.workspaceRoot &&
+                project.deletedAt === null &&
+                project.id !== command.projectId,
+            );
+            if (conflicting !== undefined || createRaceArmed) {
+              if (createRaceArmed) {
+                // The armed race seeds a DIFFERENT winner, as a concurrent
+                // wake for another Project Service project on the same
+                // directory would.
+                createRaceArmed = false;
+                projectsById.set("t3_proj_raced", {
+                  id: ProjectId.make("t3_proj_raced"),
+                  title: "Raced Winner",
+                  workspaceRoot: command.workspaceRoot,
+                  defaultModelSelection: null,
+                  scripts: [],
+                  createdAt: ISO,
+                  updatedAt: ISO,
+                  deletedAt: null,
+                });
+              }
+              return Effect.fail(
+                new ProjectWorkRoutingError({
+                  code: "CONSUMER_INTERNAL",
+                  detail:
+                    "orchestration dispatch rejected the routing command (workspaceRoot taken)",
+                }),
+              );
+            }
+          }
+          return Effect.sync(() => {
+            commands.push(command);
+            // The engine projects inside the dispatch transaction: by the
+            // time dispatch resolves, the state is readable.
+            if (command.type === "project.create") {
+              projectsById.set(command.projectId as string, {
+                id: command.projectId,
+                title: command.title,
+                workspaceRoot: command.workspaceRoot,
+                defaultModelSelection: command.defaultModelSelection ?? null,
+                scripts: [],
+                createdAt: command.createdAt,
+                updatedAt: command.createdAt,
+                deletedAt: null,
+              });
+            }
+            if (command.type === "thread.create") {
+              threads.set(
+                command.threadId,
+                makeThreadShell(command.threadId, String(command.projectId)),
+              );
+            }
+          });
+        };
+        return dispatchDelayMs > 0
+          ? Effect.sleep(dispatchDelayMs).pipe(Effect.flatMap(attempt))
+          : attempt();
+      },
       countOpenAssignedWork: () => {
         countCalls += 1;
         const outcome = workCountShouldFail
@@ -250,6 +359,33 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
       removeProvider: () => {
         providers.delete(PROVIDER_INSTANCE);
       },
+      removeDir: (dir) => {
+        existingDirs.delete(dir);
+      },
+      addDir: (dir) => {
+        existingDirs.add(dir);
+      },
+      putProject: (id, workspaceRoot) => {
+        projectsById.set(id, {
+          id: ProjectId.make(id),
+          title: "Registry",
+          workspaceRoot,
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: ISO,
+          updatedAt: ISO,
+          deletedAt: null,
+        });
+      },
+      removeProject: (id) => {
+        projectsById.delete(id);
+      },
+      aliasRoot: (stored, canonical) => {
+        canonicalAliases.set(stored, canonical);
+      },
+      armCreateRace: () => {
+        createRaceArmed = true;
+      },
       setWorkCountDelayMs: (ms) => {
         workCountDelayMs = ms;
       },
@@ -263,23 +399,56 @@ const turnStarts = (commands: OrchestrationCommand[]) =>
   commands.filter((command) => command.type === "thread.turn.start");
 const threadCreates = (commands: OrchestrationCommand[]) =>
   commands.filter((command) => command.type === "thread.create");
+const projectCreates = (commands: OrchestrationCommand[]) =>
+  commands.filter((command) => command.type === "project.create");
 
-const wake = (router: ProjectWorkSessionRouter) =>
-  router.routeWake({ agentId: AGENT_ID, projectId: PS_PROJECT_ID });
+/**
+ * A wake's notice facts. Optional fields may be explicitly UNSET (a pre-V4
+ * notice carries no workspaceDir; some notices carry no name), so the
+ * mutation values include `undefined` and only present keys ride the input.
+ */
+const wakeInput = (mutations?: {
+  readonly agentId?: string;
+  readonly projectName?: string | undefined;
+  readonly workspaceDir?: string | undefined;
+}): ProjectWorkWakeInput => {
+  const projectName: string | undefined =
+    mutations !== undefined && "projectName" in mutations ? mutations.projectName : "Registry";
+  const workspaceDir: string | undefined =
+    mutations !== undefined && "workspaceDir" in mutations ? mutations.workspaceDir : WORKSPACE_DIR;
+  return {
+    agentId: mutations?.agentId ?? AGENT_ID,
+    projectId: PS_PROJECT_ID,
+    ...(projectName !== undefined ? { projectName } : {}),
+    ...(workspaceDir !== undefined ? { workspaceDir } : {}),
+  };
+};
+
+const wake = (router: ProjectWorkSessionRouter) => router.routeWake(wakeInput());
 
 it("routing resolution is id-based and structural", () => {
   {
     const settings = makeSettings();
 
-    const resolved = resolveProjectWorkRouting(settings, AGENT_ID, PS_PROJECT_ID);
+    const resolved = resolveProjectWorkRouting(settings, wakeInput());
     assert.isTrue(resolved.ok);
-    assert.strictEqual(resolved.ok && resolved.target.t3ProjectId, T3_PROJECT_ID);
+    assert.deepEqual(resolved.ok && resolved.routing, {
+      logicalAgentId: LogicalAgentId.make(AGENT_ID),
+      agentName: "Primary Agent",
+      providerInstanceId: PROVIDER_INSTANCE,
+      projectServiceProjectId: PS_PROJECT_ID,
+      projectName: "Registry",
+    });
+    // The notice's project facts ride through; a name-less notice stays blank.
+    const nameless = resolveProjectWorkRouting(settings, wakeInput({ projectName: undefined }));
+    assert.isTrue(nameless.ok);
+    if (nameless.ok) {
+      assert.strictEqual(nameless.routing.projectName, "");
+    }
 
-    assert.isFalse(resolveProjectWorkRouting(settings, "ag_missing", PS_PROJECT_ID).ok);
+    assert.isFalse(resolveProjectWorkRouting(settings, wakeInput({ agentId: "ag_missing" })).ok);
     // Project-disabled agents are not routable (nor advertised).
-    assert.isFalse(resolveProjectWorkRouting(settings, OTHER_AGENT_ID, PS_PROJECT_ID).ok);
-    // Unbound Project Service projects are not routable.
-    assert.isFalse(resolveProjectWorkRouting(settings, AGENT_ID, "ps_other").ok);
+    assert.isFalse(resolveProjectWorkRouting(settings, wakeInput({ agentId: OTHER_AGENT_ID })).ok);
     // Disabled integration fails routing for every agent.
     assert.isFalse(
       resolveProjectWorkRouting(
@@ -287,10 +456,17 @@ it("routing resolution is id-based and structural", () => {
           ...base,
           projectServiceClient: { ...base.projectServiceClient, enabled: false },
         })),
-        AGENT_ID,
-        PS_PROJECT_ID,
+        wakeInput(),
       ).ok,
     );
+    // A pre-V4 notice carries no workspace directory: an explicit failure
+    // naming the requirement, never a silent binding fallback.
+    const preV4 = resolveProjectWorkRouting(settings, wakeInput({ workspaceDir: undefined }));
+    assert.isFalse(preV4.ok);
+    assert.match(!preV4.ok && preV4.detail, /workspace directory.*protocol V4/);
+    assert.strictEqual(!preV4.ok && preV4.code, "AGENT_NOT_DISPATCHABLE");
+    // A blank directory is as good as none.
+    assert.isFalse(resolveProjectWorkRouting(settings, wakeInput({ workspaceDir: "  " })).ok);
   }
 });
 
@@ -311,49 +487,171 @@ it("notification message and session title formats", () => {
   );
 });
 
+it.effect("missing project: the wake creates it under the notice's directory", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(makeSettings());
+
+    yield* wake(harness.router);
+
+    // One auto-created project: caller-minted id, the notice's name as the
+    // title, the notice's directory as the root, the bootstrap model default.
+    assert.lengthOf(projectCreates(harness.commands), 1);
+    const created = projectCreates(harness.commands)[0];
+    assert.strictEqual(created?.type === "project.create" && created.workspaceRoot, WORKSPACE_DIR);
+    assert.strictEqual(created?.type === "project.create" && created.title, "Registry");
+    const createdModel =
+      created?.type === "project.create" && created.defaultModelSelection !== null
+        ? created.defaultModelSelection?.model
+        : undefined;
+    assert.strictEqual(createdModel, DEFAULT_MODEL);
+    const t3ProjectId = created?.type === "project.create" ? String(created.projectId) : "";
+
+    // The session and its aggregate live under the RESOLVED project.
+    assert.lengthOf(threadCreates(harness.commands), 1);
+    assert.strictEqual(
+      threadCreates(harness.commands)[0]?.type === "thread.create" &&
+        String(threadCreates(harness.commands)[0]?.projectId),
+      t3ProjectId,
+    );
+    assert.strictEqual(
+      threadCreates(harness.commands)[0]?.type === "thread.create" &&
+        threadCreates(harness.commands)[0]?.title,
+      "Project Work — Registry",
+    );
+    assert.lengthOf(turnStarts(harness.commands), 1);
+    assert.strictEqual(
+      turnStarts(harness.commands)[0]?.type === "thread.turn.start" &&
+        turnStarts(harness.commands)[0]?.message.text,
+      aggregateWorkNotificationMessage(2),
+    );
+
+    const sessions = yield* harness.router.snapshotSessions;
+    assert.lengthOf(sessions, 1);
+    assert.strictEqual(sessions[0]?.phase, "notifying");
+  }),
+);
+
+it.effect("second wake REUSES the created project — no second create", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(makeSettings());
+    yield* wake(harness.router);
+    const [created] = threadCreates(harness.commands);
+    const threadId = created?.type === "thread.create" ? created.threadId : undefined;
+    assert.isDefined(threadId);
+
+    // The aggregate's turn engaged, then finished: the session is idle again.
+    const engage = (status: "running" | "ready") =>
+      harness.putThread(
+        makeThreadShell(threadId as string, String(created?.projectId), (shell) => ({
+          ...shell,
+          session: { ...runningSession(threadId as string), status },
+        })),
+      );
+    engage("running");
+    yield* harness.router.onThreadEvent(threadId as never);
+    engage("ready");
+    yield* harness.router.onThreadEvent(threadId as never);
+
+    yield* wake(harness.router);
+
+    assert.lengthOf(projectCreates(harness.commands), 1);
+    assert.lengthOf(threadCreates(harness.commands), 1);
+    assert.lengthOf(turnStarts(harness.commands), 2);
+  }),
+);
+
+it.effect("existing active project at the root is REUSED across wakes", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(makeSettings());
+    harness.putProject("t3_existing", WORKSPACE_DIR);
+
+    yield* wake(harness.router);
+    yield* wake(harness.router);
+
+    assert.isEmpty(projectCreates(harness.commands));
+    assert.lengthOf(threadCreates(harness.commands), 1);
+    assert.strictEqual(
+      threadCreates(harness.commands)[0]?.type === "thread.create" &&
+        String(threadCreates(harness.commands)[0]?.projectId),
+      "t3_existing",
+    );
+  }),
+);
+
 it.effect(
-  "missing session: creates it with the configured binding and delivers the aggregate",
+  "issue #6 review: a symlink-spelled stored root is REUSED by canonical key, never duplicated",
   () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeSettings());
+      // The legacy project was created through the symlink spelling; the notice
+      // (Project Service V4) carries the realpath'd form. The exact-root query
+      // misses — without the canonical-key scan a SECOND project would fork.
+      harness.putProject("t3_legacy", "/tmp/sym-root");
+      harness.aliasRoot("/tmp/sym-root", "/private/tmp/sym-root");
+      harness.addDir("/private/tmp/sym-root");
 
-      yield* wake(harness.router);
+      const target = wakeInput({ workspaceDir: "/private/tmp/sym-root" });
+      yield* harness.router.routeWake(target);
+      yield* harness.router.routeWake(target);
 
+      assert.isEmpty(projectCreates(harness.commands));
       assert.lengthOf(threadCreates(harness.commands), 1);
-      const created = threadCreates(harness.commands)[0];
       assert.strictEqual(
-        created?.type === "thread.create" && String(created.projectId),
-        T3_PROJECT_ID,
-      );
-      assert.strictEqual(
-        created?.type === "thread.create" && created.title,
-        "Project Work — Registry",
-      );
-      assert.strictEqual(
-        created?.type === "thread.create" && String(created.modelSelection.instanceId),
-        PROVIDER_INSTANCE,
-      );
-      // Driver default model: the project has no instance-matching default.
-      assert.strictEqual(
-        created?.type === "thread.create" && created.modelSelection.model,
-        "gpt-5.6-sol",
-      );
-
-      assert.lengthOf(turnStarts(harness.commands), 1);
-      const turn = turnStarts(harness.commands)[0];
-      assert.strictEqual(
-        turn?.type === "thread.turn.start" && turn.message.text,
-        aggregateWorkNotificationMessage(2),
-      );
-
-      const sessions = yield* harness.router.snapshotSessions;
-      assert.lengthOf(sessions, 1);
-      assert.strictEqual(sessions[0]?.phase, "notifying");
-      assert.strictEqual(
-        sessions[0]?.threadId,
-        created?.type === "thread.create" && created.threadId,
+        threadCreates(harness.commands)[0]?.type === "thread.create" &&
+          String(threadCreates(harness.commands)[0]?.projectId),
+        "t3_legacy",
       );
     }),
+);
+
+it.effect("a name-less notice titles the project from the directory", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(makeSettings());
+
+    yield* harness.router.routeWake(wakeInput({ projectName: undefined }));
+
+    const created = projectCreates(harness.commands)[0];
+    assert.strictEqual(created?.type === "project.create" && created.title, "registry");
+    // The thread title falls back to the stable Project Service id.
+    assert.strictEqual(
+      threadCreates(harness.commands)[0]?.type === "thread.create" &&
+        threadCreates(harness.commands)[0]?.title,
+      `Project Work — ${PS_PROJECT_ID}`,
+    );
+  }),
+);
+
+it.effect("directory missing on disk fails the wake with a routing detail", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(makeSettings());
+    harness.removeDir(WORKSPACE_DIR);
+
+    const failure = yield* wake(harness.router).pipe(Effect.flip);
+    assert.strictEqual(failure.code, "AGENT_NOT_DISPATCHABLE");
+    assert.match(failure.detail, /does not exist on this machine/);
+    // Nothing was created or delivered.
+    assert.isEmpty(harness.commands);
+    assert.isEmpty(yield* harness.router.snapshotSessions);
+  }),
+);
+
+it.effect("concurrent-create invariant loss falls back to the winner", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(makeSettings());
+    harness.armCreateRace();
+
+    yield* wake(harness.router);
+
+    // The racing create failed, the winner is reused: the wake still routed.
+    assert.isEmpty(projectCreates(harness.commands));
+    assert.lengthOf(threadCreates(harness.commands), 1);
+    assert.strictEqual(
+      threadCreates(harness.commands)[0]?.type === "thread.create" &&
+        String(threadCreates(harness.commands)[0]?.projectId),
+      "t3_proj_raced",
+    );
+    assert.lengthOf(turnStarts(harness.commands), 1);
+  }),
 );
 
 it.effect("idle session: one more wake delivers exactly one more aggregate", () =>
@@ -362,12 +660,13 @@ it.effect("idle session: one more wake delivers exactly one more aggregate", () 
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : undefined;
+    const projectId = String(created?.projectId);
     assert.isDefined(threadId);
 
     // The aggregate's turn engaged, then finished.
     const engage = (status: "running" | "ready") =>
       harness.putThread(
-        makeThreadShell(threadId as string, (shell) => ({
+        makeThreadShell(threadId as string, projectId, (shell) => ({
           ...shell,
           session: { ...runningSession(threadId as string), status },
         })),
@@ -383,7 +682,7 @@ it.effect("idle session: one more wake delivers exactly one more aggregate", () 
 
     // An idle, already-notified session with no new work stays quiet.
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -399,12 +698,13 @@ it.effect("busy session: work is recorded, never interrupted, then coalesced aft
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
     assert.isNotNull(threadId);
     assert.lengthOf(turnStarts(harness.commands), 1);
 
     // The aggregate turn is running.
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: runningSession(threadId as string),
       })),
@@ -426,7 +726,7 @@ it.effect("busy session: work is recorded, never interrupted, then coalesced aft
     // authoritative count.
     const countBefore = harness.countCalls();
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -455,6 +755,7 @@ it.live("concurrent replay burst: one key, exactly one session and one aggregate
     yield* Effect.all([wake(harness.router), wake(harness.router)], {
       concurrency: "unbounded",
     });
+    assert.lengthOf(projectCreates(harness.commands), 1);
     assert.lengthOf(threadCreates(harness.commands), 1);
     assert.lengthOf(turnStarts(harness.commands), 1);
   }),
@@ -470,6 +771,7 @@ it.live("a wake arriving inside the flush window cannot double-dispatch", () =>
       [wake(harness.router), Effect.sleep(10).pipe(Effect.flatMap(() => wake(harness.router)))],
       { concurrency: "unbounded" },
     );
+    assert.lengthOf(projectCreates(harness.commands), 1);
     assert.lengthOf(threadCreates(harness.commands), 1);
     assert.lengthOf(turnStarts(harness.commands), 1);
   }),
@@ -481,11 +783,12 @@ it.effect("deferred delivery failure keeps pending work and redelivers on the ne
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
     assert.isNotNull(threadId);
 
     // Work arrives while the aggregate turn runs; the turn then engages.
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: runningSession(threadId as string),
       })),
@@ -498,7 +801,7 @@ it.effect("deferred delivery failure keeps pending work and redelivers on the ne
     // moment: the already-ACKed work must stay pending, never dropped.
     harness.failWorkCount(true);
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -521,9 +824,10 @@ it.effect("queued-turn window: a second notice waits until the first turn engage
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
 
     // The aggregate was dispatched but no provider session engaged yet.
-    harness.putThread(makeThreadShell(threadId as string));
+    harness.putThread(makeThreadShell(threadId as string, projectId));
     yield* wake(harness.router);
     assert.lengthOf(turnStarts(harness.commands), 1);
 
@@ -533,7 +837,7 @@ it.effect("queued-turn window: a second notice waits until the first turn engage
 
     // A ready-but-resting session is still not a finished turn.
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -543,14 +847,14 @@ it.effect("queued-turn window: a second notice waits until the first turn engage
 
     // The turn engages, then finishes: the recorded work delivers once.
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: runningSession(threadId as string),
       })),
     );
     yield* harness.router.onThreadEvent(threadId as never);
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -566,9 +870,10 @@ it.effect("archived session: no longer current, a new session is created", () =>
     yield* wake(harness.router);
     const [first] = threadCreates(harness.commands);
     const firstThreadId = first?.type === "thread.create" ? first.threadId : null;
+    const projectId = String(first?.projectId);
 
     harness.putThread(
-      makeThreadShell(firstThreadId as string, (shell) => ({
+      makeThreadShell(firstThreadId as string, projectId, (shell) => ({
         ...shell,
         archivedAt: ISO,
       })),
@@ -579,6 +884,8 @@ it.effect("archived session: no longer current, a new session is created", () =>
     const second = threadCreates(harness.commands)[1];
     const secondThreadId = second?.type === "thread.create" ? second.threadId : null;
     assert.notStrictEqual(secondThreadId, firstThreadId);
+    // The new session stays under the SAME resolved project.
+    assert.strictEqual(second?.type === "thread.create" && String(second.projectId), projectId);
     // The new session received its aggregate notification.
     assert.lengthOf(turnStarts(harness.commands), 2);
     assert.strictEqual(
@@ -601,7 +908,11 @@ it.effect("zero authoritative work: no session is created and nothing is deliver
 
     yield* wake(harness.router);
 
-    assert.isEmpty(harness.commands);
+    // Routing resolved the directory first, so the local project exists for
+    // the next real notice — but no session and no notification came of it.
+    assert.lengthOf(projectCreates(harness.commands), 1);
+    assert.isEmpty(threadCreates(harness.commands));
+    assert.isEmpty(turnStarts(harness.commands));
     assert.isEmpty(yield* harness.router.snapshotSessions);
   }),
 );
@@ -612,11 +923,12 @@ it.effect("authoritative count is re-queried at delivery time", () =>
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
 
     // Work resolved between notice and delivery: the deferred aggregate is
     // silent about zero items instead of waking the agent for nothing.
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: runningSession(threadId as string),
       })),
@@ -625,7 +937,7 @@ it.effect("authoritative count is re-queried at delivery time", () =>
     yield* harness.router.onThreadEvent(threadId as never); // engaged: running
     harness.setOpenWorkCount(0);
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -645,8 +957,9 @@ it.effect("renames are display-only: routing keys do not change", () =>
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
 
-    // Rename both sides: same ids must route to the same session.
+    // Rename the agent: same ids must route to the same session.
     harness.setSettings(
       makeSettings((base) => ({
         ...base,
@@ -655,26 +968,19 @@ it.effect("renames are display-only: routing keys do not change", () =>
           [LogicalAgentId.make(AGENT_ID)]: {
             ...base.logicalAgents[LogicalAgentId.make(AGENT_ID) as never],
             agentName: "Renamed Agent",
-            projectBindings: [
-              {
-                projectId: PS_PROJECT_ID,
-                projectName: "Renamed Registry",
-                t3ProjectId: ProjectId.make(T3_PROJECT_ID),
-              },
-            ],
           },
         } as ServerSettings["logicalAgents"],
       })),
     );
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: runningSession(threadId as string),
       })),
     );
     yield* harness.router.onThreadEvent(threadId as never);
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -699,9 +1005,16 @@ it.effect("routing failures map onto the wire failure codes", () =>
 
     // Unknown agent.
     const unknown = yield* harness.router
-      .routeWake({ agentId: "ag_missing", projectId: PS_PROJECT_ID })
+      .routeWake(wakeInput({ agentId: "ag_missing" }))
       .pipe(Effect.flip);
     assert.strictEqual(unknown.code, "AGENT_NOT_FOUND");
+
+    // Pre-V4 notice: agent cannot act without a workspace directory.
+    const preV4 = yield* harness.router
+      .routeWake(wakeInput({ workspaceDir: undefined }))
+      .pipe(Effect.flip);
+    assert.strictEqual(preV4.code, "AGENT_NOT_DISPATCHABLE");
+    assert.match(preV4.detail, /protocol V4/);
 
     // Agent not dispatchable: provider instance is gone.
     harness.removeProvider();
@@ -717,12 +1030,15 @@ it.effect("authoritative query failure fails the wake so the service can redeliv
 
     const failure = yield* wake(harness.router).pipe(Effect.flip);
     assert.strictEqual(failure.code, "CONSUMER_INTERNAL");
-    // Nothing was created or delivered.
-    assert.isEmpty(harness.commands);
+    // The workspace project resolved, but nothing routable came of the wake.
+    assert.lengthOf(projectCreates(harness.commands), 1);
+    assert.isEmpty(threadCreates(harness.commands));
+    assert.isEmpty(turnStarts(harness.commands));
 
     // A failed wake stays recoverable: the redelivered notice routes.
     harness.failWorkCount(false);
     yield* wake(harness.router);
+    assert.lengthOf(projectCreates(harness.commands), 1);
     assert.lengthOf(threadCreates(harness.commands), 1);
   }),
 );
@@ -733,15 +1049,16 @@ it.effect("dispatch failure fails the wake and leaves the created session recove
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: runningSession(threadId as string),
       })),
     );
     yield* harness.router.onThreadEvent(threadId as never);
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(threadId as string),
       })),
@@ -767,14 +1084,16 @@ it.effect("restart: a fresh router delivers exactly one new aggregate for a repl
     yield* wake(first.router);
     const [created] = threadCreates(first.commands);
     const oldThreadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
     assert.lengthOf(turnStarts(first.commands), 1);
 
     // Process B (fresh in-memory state) receives the still-pending replay.
     // The pre-restart thread stays idle and untouched; the replay creates
     // the next current session exactly once and delivers ONE aggregate.
     const second = yield* makeHarness(makeSettings());
+    second.putProject(projectId, WORKSPACE_DIR);
     second.putThread(
-      makeThreadShell(oldThreadId as string, (shell) => ({
+      makeThreadShell(oldThreadId as string, projectId, (shell) => ({
         ...shell,
         session: readySession(oldThreadId as string),
       })),
@@ -793,11 +1112,12 @@ it.effect("dying session without a turn: a queued notification is released", () 
     yield* wake(harness.router);
     const [created] = threadCreates(harness.commands);
     const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
 
     // The aggregate dispatched, the session died before engaging, and more
     // work arrived: the lapsed notification must not block forever.
     harness.putThread(
-      makeThreadShell(threadId as string, (shell) => ({
+      makeThreadShell(threadId as string, projectId, (shell) => ({
         ...shell,
         session: stoppedSession(threadId as string),
       })),
@@ -805,5 +1125,44 @@ it.effect("dying session without a turn: a queued notification is released", () 
     yield* wake(harness.router);
     yield* harness.router.onThreadEvent(threadId as never);
     assert.lengthOf(turnStarts(harness.commands), 2);
+  }),
+);
+
+it.effect("a deferred event after the resolved project vanished never re-creates it", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(makeSettings());
+    yield* wake(harness.router);
+    const [created] = threadCreates(harness.commands);
+    const threadId = created?.type === "thread.create" ? created.threadId : null;
+    const projectId = String(created?.projectId);
+
+    // More work arrives while busy, and the aggregate's turn engages.
+    harness.putThread(
+      makeThreadShell(threadId as string, projectId, (shell) => ({
+        ...shell,
+        session: runningSession(threadId as string),
+      })),
+    );
+    yield* wake(harness.router);
+    yield* harness.router.onThreadEvent(threadId as never);
+
+    // The resolved project is then deleted out from under the session
+    // before the deferred flush after the turn finishes.
+    harness.removeProject(projectId);
+    harness.putThread(
+      makeThreadShell(threadId as string, projectId, (shell) => ({
+        ...shell,
+        session: readySession(threadId as string),
+      })),
+    );
+    yield* harness.router.onThreadEvent(threadId as never);
+
+    // The deferred path is reuse-only: no project.create, no aggregate, and
+    // the session simply stops being driven.
+    assert.lengthOf(projectCreates(harness.commands), 1);
+    assert.lengthOf(turnStarts(harness.commands), 1);
+    const sessions = yield* harness.router.snapshotSessions;
+    assert.strictEqual(sessions[0]?.phase, "idle");
+    assert.isTrue(sessions[0]?.pendingWork);
   }),
 );

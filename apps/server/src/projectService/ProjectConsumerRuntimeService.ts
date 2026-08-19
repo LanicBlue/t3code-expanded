@@ -40,6 +40,8 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -54,7 +56,10 @@ import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEng
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
 import { forkParked } from "../serverActivation.ts";
+import { getAutoBootstrapDefaultModelSelection } from "../serverRuntimeStartup.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+import { canonicalWorkspaceDirectory } from "./ProjectDirectoryKey.ts";
 import * as ProjectServiceWorkClient from "./ProjectServiceWorkClient.ts";
 import {
   makeProjectWorkSessionRouter,
@@ -142,6 +147,8 @@ export interface ProjectConsumerRuntimeOverrides {
   readonly socketFactory?: (url: string) => ConsumerSocketLike;
   readonly now?: () => number;
   readonly backoff?: (attempt: number) => number;
+  /** Delay before a self-stopped runtime is revived (tests shorten it). */
+  readonly revivalDelayMs?: number;
 }
 
 /** listAgents cannot answer; the SDK cycles the channel and retries. */
@@ -163,6 +170,22 @@ const dispatchFailure = (error: OrchestrationDispatchError): ProjectWorkRoutingE
 const workCountFailure = (
   error: ProjectServiceWorkClient.ProjectServiceWorkClientError,
 ): ProjectWorkRoutingError => internal(`authoritative Work query failed (${error._tag})`);
+
+/**
+ * A notice workspace directory that cannot be normalized is a routing
+ * failure (the agent cannot act without a local project), not an internal
+ * one: the detail names what the Project Service pointed at.
+ */
+const workspaceDirFailure = (error: WorkspacePaths.WorkspacePathsError): ProjectWorkRoutingError =>
+  new ProjectWorkRoutingError({
+    code: "AGENT_NOT_DISPATCHABLE",
+    detail:
+      error._tag === "WorkspaceRootNotExistsError"
+        ? `the workspace directory the Project Service pointed at does not exist on this machine (${error.normalizedWorkspaceRoot})`
+        : error._tag === "WorkspaceRootNotDirectoryError"
+          ? `the workspace directory the Project Service pointed at is not a directory (${error.normalizedWorkspaceRoot})`
+          : `the workspace directory the Project Service pointed at could not be inspected (${error._tag})`,
+  });
 
 /**
  * Credential-class Work rejections. The gateway handshake and the Work facet
@@ -197,10 +220,20 @@ const listProjectConsumerAgents = Effect.fn("ProjectConsumerRuntime.listAgents")
 
 const routeProjectConsumerWake = Effect.fn("ProjectConsumerRuntime.wakeAgent")(function* (
   router: ProjectWorkSessionRouter,
-  input: { readonly agentId: string; readonly projectId: string },
+  input: {
+    readonly agentId: string;
+    readonly projectId: string;
+    readonly projectName?: string;
+    readonly workspaceDir?: string;
+  },
 ) {
   yield* router
-    .routeWake({ agentId: input.agentId, projectId: input.projectId })
+    .routeWake({
+      agentId: input.agentId,
+      projectId: input.projectId,
+      ...(input.projectName !== undefined ? { projectName: input.projectName } : {}),
+      ...(input.workspaceDir !== undefined ? { workspaceDir: input.workspaceDir } : {}),
+    })
     .pipe(Effect.mapError((error) => new RuntimeConsumerWakeError(error.code, error.detail)));
 });
 
@@ -214,20 +247,43 @@ const consumerAdapter = (
 
 // ── Runtime status callbacks (module-level: Effect.runSync stays outside Effect code) ──
 
-const runtimeStatusCallbacks = (statusRef: Ref.Ref<ProjectConsumerRuntimeStatus>) => ({
+/**
+ * Fire-and-forget a revival from the SDK's synchronous `stopped` callback.
+ * Module-level so the Effect boundary stays outside Effect code.
+ */
+const scheduleRevivalFromCallback = (revival: Effect.Effect<void>): void => {
+  void Effect.runPromise(revival);
+};
+
+const runtimeStatusCallbacks = (
+  statusRef: Ref.Ref<ProjectConsumerRuntimeStatus>,
+  hooks?: {
+    /**
+     * The runtime reached `stopped` WITHOUT the service closing it — the SDK's
+     * own terminal classifications. The host schedules a revival so the
+     * integration converges after e.g. a Project Service relaunch window.
+     */
+    readonly onSelfStopped: () => void;
+  },
+) => ({
   onStateChange: (state: ConsumerRuntimeState) => {
-    // Status only; the runtime owns its own reconnect loop.
+    // Status only; the runtime owns its own reconnect loop: after a socket
+    // drop it re-dials on its backoff, and a plain connection loss is never
+    // classified terminal.
     Effect.runSync(
       Ref.update(statusRef, (current) => {
         const { state: _state, detail: _detail, ...rest } = current;
         return { ...rest, state };
       }),
     );
+    if (state === "stopped") {
+      hooks?.onSelfStopped();
+    }
   },
   onServerError: (payload: { readonly code: string; readonly message: string }) => {
     // Surface protocol/credential rejections as integration status; sessions
     // and routing state are never touched. A terminal incompatibility stops
-    // the runtime itself (SDK behavior).
+    // the runtime itself (SDK behavior) — the revival hook then heals it.
     Effect.runSync(
       Ref.update(statusRef, (current) => ({
         ...current,
@@ -254,6 +310,16 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
     const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
     const instanceRegistry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
     const workClient = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+    const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+    // R-free canonicalizer for the router deps seams: the shared helper's
+    // FileSystem/Path requirements are satisfied once, here (issue #6 review).
+    const fileSystem = yield* FileSystem.FileSystem;
+    const pathService = yield* Path.Path;
+    const canonicalWorkspaceDir = (directory: string) =>
+      canonicalWorkspaceDirectory(directory).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, pathService),
+      );
     const crypto = yield* Crypto.Crypto;
 
     const statusRef = yield* Ref.make<ProjectConsumerRuntimeStatus>({
@@ -302,6 +368,34 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         ),
       dispatchCommand: (command: OrchestrationCommand) =>
         engine.dispatch(command).pipe(Effect.asVoid, Effect.mapError(dispatchFailure)),
+      // createIfMissing stays FALSE: a directory the Project Service points
+      // at must already exist locally; routing never materializes it. The
+      // canonicalization step (realpath + Windows case-fold) mirrors the
+      // Project Service's canonical-root key so the notice spelling and the
+      // stored workspaceRoots compare as one identity (issue #6 review).
+      normalizeWorkspaceDir: (workspaceDir) =>
+        workspacePaths.normalizeWorkspaceRoot(workspaceDir).pipe(
+          Effect.flatMap((normalized) => canonicalWorkspaceDir(normalized)),
+          Effect.mapError(workspaceDirFailure),
+        ),
+      getActiveProjectByWorkspaceRoot: (workspaceRoot) =>
+        snapshotQuery
+          .getActiveProjectByWorkspaceRoot(workspaceRoot)
+          .pipe(Effect.mapError(() => internal("project projection could not be read"))),
+      canonicalizeWorkspaceRoot: (workspaceRoot) => canonicalWorkspaceDir(workspaceRoot),
+      listActiveProjectRoots: () =>
+        snapshotQuery.getSnapshot().pipe(
+          Effect.map((snapshot) =>
+            snapshot.projects
+              .filter((project) => project.deletedAt === null)
+              .map((project) => ({
+                projectId: project.id,
+                workspaceRoot: project.workspaceRoot,
+              })),
+          ),
+          Effect.mapError(() => internal("project projection could not be read")),
+        ),
+      createdProjectDefaultModelSelection: getAutoBootstrapDefaultModelSelection(),
       countOpenAssignedWork: (input) =>
         Effect.gen(function* () {
           const projectGeneration = yield* workClient.getProjectGeneration(input.projectId);
@@ -321,7 +415,23 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
     const runtimeRef = yield* Ref.make<ProjectConsumerRuntime | null>(null);
     const runtimeSignatureRef = yield* Ref.make<string | null>(null);
     const adapter = consumerAdapter(serverSettings, router);
-    const statusCallbacks = runtimeStatusCallbacks(statusRef);
+
+    // Set while the SERVICE closes a runtime itself (replace, disable,
+    // finalizer) so the runtime's synchronous `stopped` callback can tell an
+    // intentional close from a self-stop. Plain synchronous state: the close
+    // and its callback run on one thread, inside the close() call.
+    let selfClosing = false;
+    const closeRuntime = (runtime: ProjectConsumerRuntime | null): void => {
+      if (runtime === null) {
+        return;
+      }
+      selfClosing = true;
+      try {
+        runtime.close();
+      } finally {
+        selfClosing = false;
+      }
+    };
 
     const resolveDesired: Effect.Effect<DesiredConnection> = Effect.gen(function* () {
       const settings = yield* serverSettings.getSettings.pipe(Effect.orElseSucceed(() => null));
@@ -390,7 +500,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       if (desired.kind === "disabled") {
         const previous = yield* Ref.getAndSet(runtimeRef, null);
         yield* Ref.set(runtimeSignatureRef, null);
-        previous?.close();
+        closeRuntime(previous);
         yield* Ref.set(statusRef, { state: "disabled", detail: desired.detail });
         if (desired.transient) {
           yield* scheduleRetrySync;
@@ -405,7 +515,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       // Exactly one runtime per client: replace the old instance before the
       // new one opens its socket.
       const previous = yield* Ref.getAndSet(runtimeRef, null);
-      previous?.close();
+      closeRuntime(previous);
       const runtime = new ProjectConsumerRuntime({
         url: desired.url,
         consumerId: CONSUMER_ID,
@@ -431,13 +541,51 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       ),
     );
 
+    // A runtime that stopped ITSELF (the SDK's terminal protocol
+    // classifications — e.g. a Project Service relaunch window that briefly
+    // spoke an incompatible protocol) must not strand the integration
+    // offline: a plain connection drop never reaches this path (the SDK
+    // re-dials on its own backoff), but a self-stop would leave ZERO
+    // connections until a settings change or restart. While the desired
+    // connection is active, exactly one delayed re-sync force-rebuilds the
+    // runtime; a still-incompatible server simply stops again and the cycle
+    // repeats at the same gentle cadence as the transient closures above.
+    const layerScope = yield* Effect.scope;
+    const revivalPendingRef = yield* Ref.make(false);
+    const revivalDelay =
+      overrides?.revivalDelayMs !== undefined
+        ? Duration.millis(overrides.revivalDelayMs)
+        : RETRY_SYNC_DELAY;
+    const scheduleRuntimeRevival: Effect.Effect<void> = Effect.gen(function* () {
+      if (yield* Ref.getAndSet(revivalPendingRef, true)) {
+        return;
+      }
+      yield* forkParked(
+        Effect.sleep(revivalDelay).pipe(
+          Effect.flatMap(() => Ref.set(revivalPendingRef, false)),
+          // Clear the signature so the re-sync rebuilds even though the
+          // desired connection (URL + credential) is unchanged.
+          Effect.flatMap(() => Ref.set(runtimeSignatureRef, null)),
+          Effect.flatMap(() => syncRuntime),
+        ),
+      );
+    }).pipe(Effect.provideService(Scope.Scope, layerScope));
+
+    const statusCallbacks = runtimeStatusCallbacks(statusRef, {
+      onSelfStopped: () => {
+        if (!selfClosing) {
+          scheduleRevivalFromCallback(scheduleRuntimeRevival);
+        }
+      },
+    });
+
     const start: ProjectConsumerRuntimeServiceShape["start"] = () =>
       Effect.gen(function* () {
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             const runtime = yield* Ref.getAndSet(runtimeRef, null);
             yield* Ref.set(runtimeSignatureRef, null);
-            runtime?.close();
+            closeRuntime(runtime);
           }),
         );
         yield* syncRuntime;

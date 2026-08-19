@@ -90,7 +90,22 @@ const projectWorkSnapshotQueryLayer = Layer.succeed(
     getSnapshotSequence: () => Effect.die("unused"),
     getCounts: () => Effect.die("unused"),
     getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
-    getProjectShellById: () => Effect.die("unused"),
+    // Context resolution reads the thread's project for its workspace root
+    // before the (uncredentialed) project list fails the call.
+    getProjectShellById: (id) =>
+      Effect.succeed(
+        id === projectWorkThreadProject
+          ? Option.some({
+              id: projectWorkThreadProject,
+              title: "Wiring",
+              workspaceRoot: "/w/wiring",
+              defaultModelSelection: null,
+              scripts: [],
+              createdAt: "2026-08-01T00:00:00.000Z",
+              updatedAt: "2026-08-01T00:00:00.000Z",
+            })
+          : Option.none(),
+      ),
     getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
     getThreadCheckpointContext: () => Effect.die("unused"),
     getFullThreadDiffContext: () => Effect.die("unused"),
@@ -113,13 +128,6 @@ const ProjectWorkWiringLayer = McpHttpServer.ProjectWorkToolkitRegistrationLive.
             agentName: "Wiring Agent",
             providerInstanceId: invocation.providerInstanceId,
             project: { enabled: true },
-            projectBindings: [
-              {
-                projectId: "proj_wiring",
-                projectName: "Wiring Project",
-                t3ProjectId: projectWorkThreadProject,
-              },
-            ],
           },
         },
       }),

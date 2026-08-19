@@ -2,7 +2,6 @@ import {
   LogicalAgentId,
   type LogicalAgentConfig,
   type ProjectServiceConnectionTestResult,
-  type ProjectServiceProjectBinding,
 } from "@t3tools/contracts";
 
 /**
@@ -23,7 +22,6 @@ export function makeEmptyLogicalAgentConfig(
     agentName: "New agent",
     providerInstanceId,
     project: { enabled: false },
-    projectBindings: [],
   };
 }
 
@@ -45,34 +43,6 @@ export function nextAgentMapWithoutAgent(
 ): Record<string, LogicalAgentConfig> {
   const { [agentId]: _removed, ...rest } = current;
   return rest;
-}
-
-/** Bindings are keyed by the t3ProjectId+projectId pair. */
-export function isSameBinding(
-  a: ProjectServiceProjectBinding,
-  b: ProjectServiceProjectBinding,
-): boolean {
-  return a.t3ProjectId === b.t3ProjectId && a.projectId === b.projectId;
-}
-
-/**
- * Add (or refresh) one project binding: re-adding an existing
- * t3ProjectId+projectId pair updates it in place instead of duplicating it.
- */
-export function nextAgentConfigWithBinding(
-  agent: LogicalAgentConfig,
-  binding: ProjectServiceProjectBinding,
-): LogicalAgentConfig {
-  const index = agent.projectBindings.findIndex((candidate) => isSameBinding(candidate, binding));
-  return {
-    ...agent,
-    projectBindings:
-      index === -1
-        ? [...agent.projectBindings, binding]
-        : agent.projectBindings.map((candidate, candidateIndex) =>
-            candidateIndex === index ? binding : candidate,
-          ),
-  };
 }
 
 export const CONNECTION_TEST_STATUS_LABELS: Readonly<

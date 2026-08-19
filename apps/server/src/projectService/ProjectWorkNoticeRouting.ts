@@ -1,18 +1,21 @@
 /**
- * Session routing for Project Service Work notices (issue #4).
+ * Session routing for Project Service Work notices (issues #4 and #6).
  *
- * Pure routing policy plus an in-memory per-(agentId, projectId) session
- * state machine. A notice is a TRIGGER, never a verbatim payload: every
- * delivered message is derived from an authoritative Work query at delivery
- * time (see `aggregateWorkNotificationMessage`). The local pending set is
- * debounce/dedup state only — Work lifecycle is never mirrored into T3.
+ * Routing policy plus an in-memory per-(agentId, projectId) session state
+ * machine. A notice is a TRIGGER, never a verbatim payload: every delivered
+ * message is derived from an authoritative Work query at delivery time (see
+ * `aggregateWorkNotificationMessage`). The local pending set is debounce/dedup
+ * state only — Work lifecycle is never mirrored into T3.
  *
  * The routing key is `logicalAgentId + Project Service projectId`; names in
  * either direction are display metadata and never participate in the mapping.
- * The vendored SDK runtime deduplicates noticeIds (same-notice replays never
- * re-wake), so this module coalesces at the routing-key level only: many
- * distinct notices for one key collapse into at most one aggregate
- * notification per busy period.
+ * The T3 project is resolved from the notice's WORKSPACE DIRECTORY: the
+ * active local project keyed by that directory is reused, and a missing one
+ * is created on the spot (issue #6's auto-reuse/auto-create rule), so no
+ * per-agent project configuration exists. The vendored SDK runtime
+ * deduplicates noticeIds (same-notice replays never re-wake), so this module
+ * coalesces at the routing-key level only: many distinct notices for one key
+ * collapse into at most one aggregate notification per busy period.
  *
  * @module ProjectWorkNoticeRouting
  */
@@ -24,9 +27,10 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationCommand,
+  type OrchestrationProject,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
-  type ProjectId,
+  ProjectId,
   type ProviderDriverKind,
   type ServerSettings,
   ThreadId,
@@ -61,57 +65,79 @@ export interface ProjectWorkRoutingTarget {
   readonly logicalAgentId: LogicalAgentId;
   readonly agentName: string;
   readonly providerInstanceId: string;
-  /** The binding whose Project Service projectId matched the notice. */
+  /** The Project Service project the notice named. */
   readonly projectServiceProjectId: string;
+  /** Display name from the NOTICE (never a local binding); may be blank. */
   readonly projectName: string;
+  /** The local project resolved for the notice's workspace directory. */
   readonly t3ProjectId: ProjectId;
 }
 
+/** Agent-level routing facts before the workspace directory is resolved. */
+export interface ProjectWorkAgentRouting {
+  readonly logicalAgentId: LogicalAgentId;
+  readonly agentName: string;
+  readonly providerInstanceId: string;
+  readonly projectServiceProjectId: string;
+  readonly projectName: string;
+}
+
 export type ProjectWorkRoutingResolution =
-  | { readonly ok: true; readonly target: ProjectWorkRoutingTarget }
-  | { readonly ok: false; readonly detail: string };
+  | { readonly ok: true; readonly routing: ProjectWorkAgentRouting }
+  | { readonly ok: false; readonly code: ProjectWorkRoutingError["code"]; readonly detail: string };
 
 /**
- * Map `agentId + projectId` onto the configured agent and T3 project.
- * Reads stay structural (duplicates and unknowns resolve to failures, never
- * crashes) because settings.json can be hand-edited between validations.
+ * Map `agentId` onto the configured agent and carry the notice's project
+ * facts. Reads stay structural (duplicates and unknowns resolve to failures,
+ * never crashes) because settings.json can be hand-edited between
+ * validations. The notice's `workspaceDir` presence is checked here too: a
+ * pre-V4 server never sends one, and without it no local project can be
+ * resolved.
  */
 export const resolveProjectWorkRouting = (
   settings: ServerSettings,
-  agentId: string,
-  projectId: string,
+  input: ProjectWorkWakeInput,
 ): ProjectWorkRoutingResolution => {
   if (!settings.projectServiceClient.enabled) {
-    return { ok: false, detail: "the Project Service integration is disabled" };
+    return {
+      ok: false,
+      code: "AGENT_NOT_FOUND",
+      detail: "the Project Service integration is disabled",
+    };
   }
-  const agent = Object.entries(settings.logicalAgents).find(([id]) => id === agentId);
+  const agent = Object.entries(settings.logicalAgents).find(([id]) => id === input.agentId);
   if (agent === undefined) {
-    return { ok: false, detail: `agent ${agentId} is not configured` };
+    return {
+      ok: false,
+      code: "AGENT_NOT_FOUND",
+      detail: `agent ${input.agentId} is not configured`,
+    };
   }
   const [logicalAgentId, agentConfig] = agent;
   if (!agentConfig.project.enabled) {
-    return { ok: false, detail: `project work is disabled for agent ${agentId}` };
-  }
-  const matches = agentConfig.projectBindings.filter((binding) => binding.projectId === projectId);
-  const binding = matches.at(0);
-  if (binding === undefined || matches.length > 1) {
     return {
       ok: false,
+      code: "AGENT_NOT_FOUND",
+      detail: `project work is disabled for agent ${input.agentId}`,
+    };
+  }
+  if (input.workspaceDir === undefined || input.workspaceDir.trim().length === 0) {
+    return {
+      ok: false,
+      code: "AGENT_NOT_DISPATCHABLE",
       detail:
-        matches.length === 0
-          ? `agent ${agentId} does not bind Project Service project ${projectId}`
-          : `agent ${agentId} binds Project Service project ${projectId} more than once`,
+        `the Project Service notice for project ${input.projectId} carried no workspace directory; ` +
+        "routing by workspace directory requires Project Service protocol V4 (consumer SDK 0.5.0)",
     };
   }
   return {
     ok: true,
-    target: {
+    routing: {
       logicalAgentId: logicalAgentId as LogicalAgentId,
       agentName: agentConfig.agentName,
       providerInstanceId: agentConfig.providerInstanceId,
-      projectServiceProjectId: binding.projectId,
-      projectName: binding.projectName,
-      t3ProjectId: binding.t3ProjectId,
+      projectServiceProjectId: input.projectId,
+      projectName: input.projectName ?? "",
     },
   };
 };
@@ -158,6 +184,14 @@ export const workSessionThreadTitle = (
 export interface ProjectWorkWakeInput {
   readonly agentId: string;
   readonly projectId: string;
+  /** Display name from the notice; absent when the authority had none. */
+  readonly projectName?: string;
+  /**
+   * The notice's workspace directory — the lookup key for the local project
+   * (issue #6). Absent on a pre-V4 server; routing then fails with a detail
+   * naming the requirement.
+   */
+  readonly workspaceDir?: string;
 }
 
 /** Seams the router needs from its host; failures carry the wire failure code. */
@@ -176,6 +210,36 @@ export interface ProjectWorkSessionRouterDeps {
   readonly dispatchCommand: (
     command: OrchestrationCommand,
   ) => Effect.Effect<void, ProjectWorkRoutingError>;
+  /**
+   * Normalize AND canonicalize a notice workspace directory WITHOUT creating
+   * it: a directory the Project Service points at must already exist on this
+   * machine, and the returned value is the canonical lookup key (realpath +
+   * Windows case-fold, mirroring the Project Service's canonical-root key) —
+   * also the workspaceRoot auto-created projects persist.
+   */
+  readonly normalizeWorkspaceDir: (
+    workspaceDir: string,
+  ) => Effect.Effect<string, ProjectWorkRoutingError>;
+  /** The active local project keyed by a normalized workspace root. */
+  readonly getActiveProjectByWorkspaceRoot: (
+    workspaceRoot: string,
+  ) => Effect.Effect<Option.Option<OrchestrationProject>, ProjectWorkRoutingError>;
+  /**
+   * Canonicalize a STORED workspace root for key comparison (issue #6 review):
+   * legacy roots may carry symlink spellings the exact-root query cannot see.
+   * Best-effort; never fails.
+   */
+  readonly canonicalizeWorkspaceRoot: (workspaceRoot: string) => Effect.Effect<string>;
+  /**
+   * Active local projects (id + stored root) for the canonical-key reuse scan
+   * that backs the exact-root query.
+   */
+  readonly listActiveProjectRoots: () => Effect.Effect<
+    ReadonlyArray<{ readonly projectId: ProjectId; readonly workspaceRoot: string }>,
+    ProjectWorkRoutingError
+  >;
+  /** Default model selection for auto-created projects (bootstrap precedent). */
+  readonly createdProjectDefaultModelSelection: ModelSelection;
   /** Authoritative assigned/open Work count for the agent+project, queried now. */
   readonly countOpenAssignedWork: (
     input: ProjectWorkWakeInput,
@@ -216,6 +280,8 @@ export interface ProjectWorkSessionRouter {
  */
 interface RoutedSession {
   readonly threadId: ThreadId;
+  /** The wake facts this session was routed under (re-resolution input). */
+  readonly input: ProjectWorkWakeInput;
   phase: "idle" | "notifying";
   pendingWork: boolean;
   /**
@@ -236,6 +302,12 @@ const routingKeyParts = (key: string): { readonly agentId: string; readonly proj
     agentId: separator === -1 ? key : key.slice(0, separator),
     projectId: separator === -1 ? "" : key.slice(separator + 2),
   };
+};
+
+/** Last path segment of a normalized workspace root (bootstrap-precedent style). */
+const workspaceRootBasename = (workspaceRoot: string): string => {
+  const segments = workspaceRoot.split(/[/\\]/).filter(Boolean);
+  return segments.at(-1) ?? "";
 };
 
 export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRouter")(function* (
@@ -321,19 +393,131 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     },
   );
 
-  const resolveRoutingOr = Effect.fn("ProjectWorkSessionRouter.resolveRouting")(function* (
-    input: ProjectWorkWakeInput,
-  ): Effect.fn.Return<ProjectWorkRoutingTarget, ProjectWorkRoutingError> {
-    const settings = yield* deps.readSettings;
-    const resolution = resolveProjectWorkRouting(settings, input.agentId, input.projectId);
-    if (!resolution.ok) {
-      return yield* new ProjectWorkRoutingError({
-        code: "AGENT_NOT_FOUND",
-        detail: resolution.detail,
-      });
+  /**
+   * Canonical-key reuse scan (issue #6 review): a STORED workspace root may
+   * carry a symlink spelling (/tmp vs /private/tmp) the exact-root query
+   * cannot see, which would fork a second project for the same physical
+   * directory. `workspaceRoot` arrives already canonical (normalizeWorkspaceDir),
+   * so canonicalizing each stored root and comparing keys finds those too.
+   */
+  const findProjectByCanonicalRoot = Effect.fn(
+    "ProjectWorkSessionRouter.findProjectByCanonicalRoot",
+  )(function* (
+    workspaceRoot: string,
+  ): Effect.fn.Return<Option.Option<ProjectId>, ProjectWorkRoutingError> {
+    const actives = yield* deps.listActiveProjectRoots();
+    for (const active of actives) {
+      const key = yield* deps.canonicalizeWorkspaceRoot(active.workspaceRoot);
+      if (key === workspaceRoot) {
+        return Option.some(active.projectId);
+      }
     }
-    return resolution.target;
+    return Option.none();
   });
+
+  /**
+   * Resolve the T3 project for a normalized workspace root: REUSE the active
+   * project keyed by the directory, or CREATE one when none exists. A
+   * concurrent wake for a different Project Service project on the same
+   * directory can win the create; the engine's active-workspaceRoot-taken
+   * invariant then fails this dispatch and the winner is reused instead of
+   * failing the wake. `create: false` (deferred event paths) resolves
+   * reuse-only so no project is ever created outside a wake.
+   */
+  const resolveProjectForRoot = Effect.fn("ProjectWorkSessionRouter.resolveProjectForRoot")(
+    function* (
+      agentRouting: ProjectWorkAgentRouting,
+      workspaceRoot: string,
+      create: boolean,
+    ): Effect.fn.Return<ProjectId, ProjectWorkRoutingError> {
+      const existing = yield* deps.getActiveProjectByWorkspaceRoot(workspaceRoot);
+      if (Option.isSome(existing)) {
+        return existing.value.id;
+      }
+      // Symlink-spelled stored roots reuse here too — before any create.
+      const canonicalExisting = yield* findProjectByCanonicalRoot(workspaceRoot);
+      if (Option.isSome(canonicalExisting)) {
+        return canonicalExisting.value;
+      }
+      if (!create) {
+        return yield* new ProjectWorkRoutingError({
+          code: "AGENT_NOT_DISPATCHABLE",
+          detail: `no T3 project exists for workspace root ${workspaceRoot} of Project Service project ${agentRouting.projectServiceProjectId}`,
+        });
+      }
+      const t3ProjectId = ProjectId.make(yield* deps.newId);
+      const noticeName = agentRouting.projectName.trim();
+      const title =
+        (noticeName.length > 0 ? noticeName : workspaceRootBasename(workspaceRoot)) || "project";
+      const created = yield* deps
+        .dispatchCommand({
+          type: "project.create",
+          commandId: CommandId.make(yield* deps.newId),
+          projectId: t3ProjectId,
+          title,
+          workspaceRoot,
+          defaultModelSelection: deps.createdProjectDefaultModelSelection,
+          createdAt: yield* deps.nowIso,
+        })
+        .pipe(Effect.result);
+      if (created._tag === "Failure") {
+        // The directory was taken between the query and the create (the
+        // active-workspaceRoot-taken invariant): reuse whatever won. Any other
+        // failure with no project at the root propagates to the wake ACK.
+        const raced = yield* deps.getActiveProjectByWorkspaceRoot(workspaceRoot);
+        if (Option.isSome(raced)) {
+          return raced.value.id;
+        }
+        const racedCanonical = yield* findProjectByCanonicalRoot(workspaceRoot);
+        if (Option.isSome(racedCanonical)) {
+          return racedCanonical.value;
+        }
+        return yield* created.failure;
+      }
+      // The dispatch transaction projects the project; read it back to prove
+      // the persisted state before a session is created under it.
+      const shell = yield* deps.readProjectShell(t3ProjectId);
+      if (Option.isNone(shell)) {
+        return yield* new ProjectWorkRoutingError({
+          code: "CONSUMER_INTERNAL",
+          detail: `T3 project created for workspace root ${workspaceRoot} could not be read back`,
+        });
+      }
+      return t3ProjectId;
+    },
+  );
+
+  // Agent eligibility (settings) plus the workspace-directory project
+  // resolution, lifted onto the routing target.
+  const resolveRoutingTarget = Effect.fn("ProjectWorkSessionRouter.resolveRoutingTarget")(
+    function* (
+      input: ProjectWorkWakeInput,
+      options?: { readonly create: boolean },
+    ): Effect.fn.Return<ProjectWorkRoutingTarget, ProjectWorkRoutingError> {
+      const settings = yield* deps.readSettings;
+      const resolution = resolveProjectWorkRouting(settings, input);
+      if (!resolution.ok) {
+        return yield* new ProjectWorkRoutingError({
+          code: resolution.code,
+          detail: resolution.detail,
+        });
+      }
+      const workspaceRoot = yield* deps.normalizeWorkspaceDir(input.workspaceDir as string);
+      const t3ProjectId = yield* resolveProjectForRoot(
+        resolution.routing,
+        workspaceRoot,
+        options?.create ?? true,
+      );
+      return {
+        logicalAgentId: resolution.routing.logicalAgentId,
+        agentName: resolution.routing.agentName,
+        providerInstanceId: resolution.routing.providerInstanceId,
+        projectServiceProjectId: resolution.routing.projectServiceProjectId,
+        projectName: resolution.routing.projectName,
+        t3ProjectId,
+      };
+    },
+  );
 
   // Deliver the aggregate. The open-work count always comes from the
   // authoritative query at delivery time; a synchronous create path may
@@ -378,13 +562,14 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
   const createCurrentSession = Effect.fn("ProjectWorkSessionRouter.createCurrentSession")(
     function* (
       key: string,
+      input: ProjectWorkWakeInput,
       target: ProjectWorkRoutingTarget,
     ): Effect.fn.Return<void, ProjectWorkRoutingError> {
       const project = yield* deps.readProjectShell(target.t3ProjectId);
       if (Option.isNone(project)) {
         return yield* new ProjectWorkRoutingError({
           code: "AGENT_NOT_DISPATCHABLE",
-          detail: `T3 project ${target.t3ProjectId} bound to Project Service project ${target.projectServiceProjectId} does not exist`,
+          detail: `T3 project ${target.t3ProjectId} resolved for Project Service project ${target.projectServiceProjectId} does not exist`,
         });
       }
       const count = yield* deps.countOpenAssignedWork({
@@ -416,6 +601,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       // notice resumes on this session instead of creating another.
       yield* putSession(key, {
         threadId,
+        input,
         phase: "idle",
         pendingWork: false,
         seenBusy: false,
@@ -482,7 +668,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
   const routeWake = Effect.fn("ProjectWorkSessionRouter.routeWake")(function* (
     input: ProjectWorkWakeInput,
   ): Effect.fn.Return<void, ProjectWorkRoutingError> {
-    const target = yield* resolveRoutingOr(input);
+    const target = yield* resolveRoutingTarget(input);
     const key = routingKeyOf(input.agentId, input.projectId);
     return yield* withKeySerialization(
       key,
@@ -490,14 +676,14 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         const session = yield* getSession(key);
 
         if (session === undefined) {
-          return yield* createCurrentSession(key, target);
+          return yield* createCurrentSession(key, input, target);
         }
 
         const shell = yield* deps.readThreadShell(session.threadId);
         if (Option.isNone(shell) || !isWorkThreadCurrent(shell.value)) {
           // Archived or gone: no longer current; a new session takes over.
           yield* dropSession(key);
-          return yield* createCurrentSession(key, target);
+          return yield* createCurrentSession(key, input, target);
         }
         // Busy sessions (a turn running, or our aggregate still in flight) get
         // the work recorded — never an interrupt.
@@ -548,11 +734,14 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       // running the turn (stopped/error/interrupted) counts as lapsed.
       return;
     }
-    const { agentId, projectId } = routingKeyParts(key);
-    const target = yield* resolveRoutingOr({ agentId, projectId }).pipe(Effect.result);
+    // Re-resolution uses the wake facts the session was routed under, in
+    // reuse-only mode: a deferred event must never create a project.
+    const target = yield* resolveRoutingTarget(session.input, { create: false }).pipe(
+      Effect.result,
+    );
     if (target._tag === "Failure") {
-      // Routing went away (agent unbound, integration disabled): the
-      // session simply stops being driven; nothing is deleted.
+      // Routing went away (agent unbound, integration disabled, project
+      // deleted): the session simply stops being driven; nothing is deleted.
       yield* mutateSession(key, (current) => ({ ...current, phase: "idle" }));
       return;
     }

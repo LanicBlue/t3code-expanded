@@ -1,5 +1,7 @@
 import { PositiveInt } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 
@@ -14,6 +16,8 @@ const dependencies = [
   ProjectServiceWorkClient.ProjectServiceWorkClient,
   ServerSettings.ServerSettingsService,
   ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+  FileSystem.FileSystem,
+  Path.Path,
   Crypto.Crypto,
 ];
 
@@ -175,7 +179,7 @@ export const ProjectWorkListResult = Schema.Struct({
 
 export const ProjectWorkListTool = Tool.make("project_work_list", {
   description:
-    "List this agent's assigned Work runs in the session's bound Project Service project, together with the project's positions and each position's current assignment revision. The revision pair on every item is what project_work_submit expects; no identity is required or accepted.",
+    "List this agent's assigned Work runs in the session project's Project Service project (matched by the project's workspace directory), together with the project's positions and each position's current assignment revision. The revision pair on every item is what project_work_submit expects; no identity is required or accepted.",
   parameters: ProjectWorkListInput,
   success: ProjectWorkListResult,
   failure: ProjectWorkError,

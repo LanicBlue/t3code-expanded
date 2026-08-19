@@ -11,10 +11,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   type LogicalAgentConfig,
-  type OrchestrationProjectShell,
-  ProjectId,
   type ProjectServiceConnectionTestResult,
-  type ProjectServiceProjectBinding,
   ProviderInstanceId,
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
@@ -22,7 +19,6 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { Atom } from "effect/unstable/reactivity";
 import { PlugZapIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import { useState } from "react";
 
@@ -35,7 +31,6 @@ import {
   sortProviderInstanceEntries,
 } from "../../providerInstances";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { environmentProjects } from "../../state/projects";
 import { primaryServerProvidersAtom, serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
@@ -50,14 +45,9 @@ import {
   isValidCredentialPaste,
   makeEmptyLogicalAgentConfig,
   makeLogicalAgentId,
-  nextAgentConfigWithBinding,
   nextAgentMapWithAgent,
   nextAgentMapWithoutAgent,
 } from "./ServicesSettings.logic";
-
-const EMPTY_PROJECTS_ATOM = Atom.make<ReadonlyArray<OrchestrationProjectShell>>([]).pipe(
-  Atom.withLabel("services-settings-no-environment-projects"),
-);
 
 function ProjectServiceClientSection() {
   const client = usePrimarySettings((settings) => settings.projectServiceClient);
@@ -196,88 +186,11 @@ function ProjectServiceClientSection() {
   );
 }
 
-function BindingEditor({
-  binding,
-  projectOptions,
-  onRemove,
-  onChange,
-}: {
-  readonly binding: ProjectServiceProjectBinding;
-  readonly projectOptions: ReadonlyArray<{ readonly id: string; readonly title: string }>;
-  readonly onRemove: () => void;
-  readonly onChange: (next: ProjectServiceProjectBinding) => void;
-}) {
-  const projectIdInput = useCommitOnBlur(binding.projectId, (projectId) => {
-    if (projectId.trim().length > 0) {
-      onChange({ ...binding, projectId: projectId.trim() });
-    }
-  });
-  const projectNameInput = useCommitOnBlur(binding.projectName, (projectName) =>
-    onChange({ ...binding, projectName }),
-  );
-
-  return (
-    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-      <Select
-        value={binding.t3ProjectId}
-        onValueChange={(t3ProjectId) => {
-          if (t3ProjectId !== null) {
-            onChange({ ...binding, t3ProjectId: ProjectId.make(t3ProjectId) });
-          }
-        }}
-      >
-        <SelectTrigger size="sm" className="w-56" aria-label="Bound T3 project">
-          <SelectValue>
-            {projectOptions.find((project) => project.id === binding.t3ProjectId)?.title ??
-              binding.t3ProjectId}
-          </SelectValue>
-        </SelectTrigger>
-        <SelectPopup align="start">
-          {projectOptions.map((project) => (
-            <SelectItem key={project.id} value={project.id}>
-              {project.title}
-            </SelectItem>
-          ))}
-        </SelectPopup>
-      </Select>
-      <Input
-        {...projectIdInput}
-        placeholder="Project id"
-        aria-label="Project Service project id"
-        className="w-40"
-      />
-      <Input
-        {...projectNameInput}
-        placeholder="Project name (display only)"
-        aria-label="Project Service project name"
-        className="w-52"
-      />
-      <Button variant="ghost-muted" size="icon-sm" aria-label="Remove binding" onClick={onRemove}>
-        <Trash2Icon className="size-3.5" />
-      </Button>
-    </div>
-  );
-}
-
-function replaceBinding(
-  agent: LogicalAgentConfig,
-  index: number,
-  next: ProjectServiceProjectBinding,
-): LogicalAgentConfig {
-  return {
-    ...agent,
-    projectBindings: agent.projectBindings.map((candidate, candidateIndex) =>
-      candidateIndex === index ? next : candidate,
-    ),
-  };
-}
-
 function AgentRow({
   agentId,
   agent,
   agentMap,
   instanceOptions,
-  projectOptions,
   updateSettings,
 }: {
   readonly agentId: string;
@@ -287,7 +200,6 @@ function AgentRow({
     readonly id: ProviderInstanceId;
     readonly label: string;
   }>;
-  readonly projectOptions: ReadonlyArray<{ readonly id: string; readonly title: string }>;
   readonly updateSettings: (patch: ServerSettingsPatch) => void;
 }) {
   const nameInput = useCommitOnBlur(agent.agentName, (agentName) => {
@@ -356,59 +268,6 @@ function AgentRow({
             Project work enabled
           </label>
         </div>
-        {agent.projectBindings.map((binding, index) => (
-          <BindingEditor
-            key={`${binding.t3ProjectId}:${binding.projectId}`}
-            binding={binding}
-            projectOptions={projectOptions}
-            onRemove={() =>
-              updateSettings({
-                logicalAgents: nextAgentMapWithAgent(agentMap, agentId, {
-                  ...agent,
-                  projectBindings: agent.projectBindings.filter(
-                    (_, candidateIndex) => candidateIndex !== index,
-                  ),
-                }),
-              })
-            }
-            onChange={(next) =>
-              updateSettings({
-                logicalAgents: nextAgentMapWithAgent(
-                  agentMap,
-                  agentId,
-                  replaceBinding(agent, index, next),
-                ),
-              })
-            }
-          />
-        ))}
-        <Button
-          variant="ghost-muted"
-          size="sm"
-          disabled={projectOptions.length === 0}
-          onClick={() => {
-            const project = projectOptions[0];
-            if (project === undefined) return;
-            // Seed both service-side fields from the T3 project so the write
-            // is valid immediately; the ids stay editable in the row above.
-            // An existing t3ProjectId+projectId pair refreshes in place —
-            // duplicates would be rejected by the write path.
-            updateSettings({
-              logicalAgents: nextAgentMapWithAgent(
-                agentMap,
-                agentId,
-                nextAgentConfigWithBinding(agent, {
-                  t3ProjectId: ProjectId.make(project.id),
-                  projectId: project.id,
-                  projectName: project.title,
-                }),
-              ),
-            });
-          }}
-        >
-          <PlusIcon className="size-3.5" />
-          Add project binding
-        </Button>
       </div>
     </SettingsRow>
   );
@@ -419,27 +278,17 @@ function LogicalAgentsSection() {
   const agentMap = settings.logicalAgents;
   const updateSettings = useUpdatePrimarySettings();
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const projects = useAtomValue(
-    primaryEnvironmentId === null
-      ? EMPTY_PROJECTS_ATOM
-      : environmentProjects.environmentProjectsAtom(primaryEnvironmentId),
-  );
 
   const instanceOptions = sortProviderInstanceEntries(
     applyProviderInstanceSettings(deriveProviderInstanceEntries(serverProviders), settings),
   ).map((entry) => ({ id: entry.instanceId, label: entry.displayName }));
-  const projectOptions = projects.map((project) => ({
-    id: project.id as string,
-    title: project.title,
-  }));
   const defaultInstance = instanceOptions[0]?.id ?? null;
 
   return (
     <SettingsSection title="Logical Agents">
       <SettingsRow
         title="Agents"
-        description="Each agent is a stable identity (the ag_ id never changes) routed through one provider instance. Provider credentials stay on the provider instance — agents only reference it."
+        description="Each agent is a stable identity (the ag_ id never changes) routed through one provider instance. Work notices route by workspace directory — no per-project configuration is needed here."
       >
         {Object.keys(agentMap).length === 0 ? (
           <p className="px-3 pb-3 text-xs text-muted-foreground sm:px-4">No agents yet.</p>
@@ -451,7 +300,6 @@ function LogicalAgentsSection() {
               agent={agent}
               agentMap={agentMap}
               instanceOptions={instanceOptions}
-              projectOptions={projectOptions}
               updateSettings={updateSettings}
             />
           ))

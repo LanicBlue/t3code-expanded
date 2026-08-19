@@ -10,14 +10,15 @@
  *
  * Logical agents are the T3-side identities that act through a provider
  * instance. `LogicalAgentId` is generated once and immutable; everything else
- * on an agent is mutable. Project bindings pair a Project Service project
- * (authoritative ids) with a T3 project; names are display-only.
+ * on an agent is mutable. Agents carry no per-project configuration: Work
+ * notices route by the notice's workspace directory, and T3 reuses or creates
+ * the matching local project on the fly.
  *
  * @module projectService
  */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { ProjectId, TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
+import { TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 // ── Client credential ────────────────────────────────────────────
@@ -148,16 +149,6 @@ export const LogicalAgentId = TrimmedNonEmptyString.check(
 ).pipe(Schema.brand("LogicalAgentId"));
 export type LogicalAgentId = typeof LogicalAgentId.Type;
 
-/** A Project Service project bound to a T3 project. Ids authoritative. */
-export const ProjectServiceProjectBinding = Schema.Struct({
-  /** Project Service side id — the value API calls send. */
-  projectId: TrimmedNonEmptyString,
-  /** Display-only; T3 never relies on it for lookup. */
-  projectName: TrimmedString,
-  t3ProjectId: ProjectId,
-});
-export type ProjectServiceProjectBinding = typeof ProjectServiceProjectBinding.Type;
-
 export const LogicalAgentConfig = Schema.Struct({
   /** Mutable display name; changing it changes nothing else. */
   agentName: TrimmedNonEmptyString,
@@ -166,9 +157,6 @@ export const LogicalAgentConfig = Schema.Struct({
   project: Schema.Struct({
     enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
-  projectBindings: Schema.Array(ProjectServiceProjectBinding).pipe(
-    Schema.withDecodingDefault(Effect.succeed([])),
-  ),
 });
 export type LogicalAgentConfig = typeof LogicalAgentConfig.Type;
 

@@ -10,6 +10,8 @@ import {
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
@@ -25,6 +27,8 @@ const plainError = (error: object): Record<string, unknown> =>
 
 const threadId = ThreadId.make("thread-1");
 const t3ProjectId = ProjectId.make("t3-project-1");
+/** The thread project's workspace root; the PS list registers the same directory. */
+const WORKSPACE_ROOT = "/w/registry";
 
 const invocationFor = (
   capabilities: ReadonlySet<McpInvocationContext.McpCapability> = new Set(["preview"]),
@@ -71,7 +75,20 @@ const snapshotQueryLayer = Layer.succeed(ProjectionSnapshotQuery.ProjectionSnaps
   getSnapshotSequence: () => Effect.die("unused"),
   getCounts: () => Effect.die("unused"),
   getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
-  getProjectShellById: () => Effect.die("unused"),
+  getProjectShellById: (id) =>
+    Effect.succeed(
+      id === t3ProjectId
+        ? Option.some({
+            id: t3ProjectId,
+            title: "Registry",
+            workspaceRoot: WORKSPACE_ROOT,
+            defaultModelSelection: null,
+            scripts: [],
+            createdAt: "2026-08-01T00:00:00.000Z",
+            updatedAt: "2026-08-01T00:00:00.000Z",
+          })
+        : Option.none(),
+    ),
   getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
   getThreadCheckpointContext: () => Effect.die("unused"),
   getFullThreadDiffContext: () => Effect.die("unused"),
@@ -89,7 +106,6 @@ const agentSettings = (projectEnabled: boolean) => ({
       agentName: "Agent One",
       providerInstanceId: ProviderInstanceId.make("codex"),
       project: { enabled: projectEnabled },
-      projectBindings: [{ projectId: "proj_ps_1", projectName: "PS Project", t3ProjectId }],
     },
   },
 });
@@ -139,9 +155,18 @@ const makeWorkClientLayer = (overrides?: {
   readonly runs?: readonly ProjectServiceWorkClient.ProjectWorkRunRecord[];
   readonly positions?: readonly ProjectServiceWorkClient.ProjectWorkPositionRecord[];
   readonly run?: ProjectServiceWorkClient.ProjectWorkRunRecord | null;
+  readonly serviceProjects?: readonly ProjectServiceWorkClient.ProjectServiceProjectRecord[];
 }) => {
   const submitted: CapturedSubmit[] = [];
   const service = ProjectServiceWorkClient.ProjectServiceWorkClient.of({
+    // The directory-keyed mapping: one service project registered at the
+    // thread project's workspace root.
+    listProjects: () =>
+      Effect.succeed(
+        overrides?.serviceProjects ?? [
+          { projectId: "proj_ps_1", name: "PS Project", workspaceDir: WORKSPACE_ROOT },
+        ],
+      ),
     getProjectGeneration: (projectId) => Effect.succeed(projectId === "proj_ps_1" ? 7 : 0),
     listMy: (input) =>
       Effect.succeed(
@@ -190,6 +215,8 @@ const withHandlerLayers =
       | ServerSettings.ServerSettingsService
       | ProjectionSnapshotQuery.ProjectionSnapshotQuery
       | McpInvocationContext.McpInvocationContext
+      | FileSystem.FileSystem
+      | Path.Path
       | Crypto.Crypto
     >,
   ) =>
@@ -302,6 +329,31 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         assert.deepEqual(plainError(failure), {
           _tag: "ProjectWorkUnavailableError",
           reason: "agent-project-disabled",
+        });
+      });
+    },
+  );
+
+  it.effect(
+    "project tools answer a structured unavailability when the project directory is not registered",
+    () => {
+      // The service list knows a DIFFERENT directory: the session's project
+      // has no Project Service counterpart, so the identity cannot be derived.
+      const { layer } = makeWorkClientLayer({
+        serviceProjects: [
+          { projectId: "proj_elsewhere", name: "Elsewhere", workspaceDir: "/w/elsewhere" },
+        ],
+      });
+
+      return Effect.gen(function* () {
+        const failure = yield* ProjectWorkToolkitHandlers.project_work_list().pipe(
+          withHandlerLayers({ workClientLayer: layer }),
+          Effect.flip,
+        );
+
+        assert.deepEqual(plainError(failure), {
+          _tag: "ProjectWorkUnavailableError",
+          reason: "project-not-registered",
         });
       });
     },

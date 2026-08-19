@@ -82,39 +82,6 @@ export function findLogicalAgentsWithUnresolvedProviderInstances(
   return unresolved;
 }
 
-/**
- * Agent project bindings that repeat a t3ProjectId+projectId pair. Bindings
- * are keyed by that pair, so duplicates are rejected at write time (same
- * gate as the provider-instance check: only when the patch carries the
- * agent map).
- */
-export function findDuplicateProjectBindings(settings: ServerSettings): ReadonlyArray<{
-  readonly agentId: string;
-  readonly t3ProjectId: string;
-  readonly projectId: string;
-}> {
-  const duplicates: Array<{
-    readonly agentId: string;
-    readonly t3ProjectId: string;
-    readonly projectId: string;
-  }> = [];
-  for (const [agentId, agent] of Object.entries(settings.logicalAgents)) {
-    const seen = new Set<string>();
-    for (const binding of agent.projectBindings) {
-      const key = JSON.stringify([binding.t3ProjectId, binding.projectId]);
-      if (seen.has(key)) {
-        duplicates.push({
-          agentId,
-          t3ProjectId: binding.t3ProjectId,
-          projectId: binding.projectId,
-        });
-      }
-      seen.add(key);
-    }
-  }
-  return duplicates;
-}
-
 export function resolveSourceControlWriterModelSelection(
   settings: ServerSettings,
   providers?: ReadonlyArray<ServerProvider>,

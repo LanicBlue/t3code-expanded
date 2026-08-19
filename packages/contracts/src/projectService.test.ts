@@ -89,24 +89,21 @@ describe("ServerSettings project service surfaces", () => {
     expect(DEFAULT_SERVER_SETTINGS.logicalAgents).toEqual({});
   });
 
-  it("round-trips agents and bindings through encode", () => {
+  it("round-trips agents through encode", () => {
     const decoded = decodeServerSettings({
       logicalAgents: {
         ag_main: {
           agentName: "Build agent",
           providerInstanceId: "codex",
           project: { enabled: true },
-          projectBindings: [
-            { projectId: "proj_9", projectName: "Wiki migration", t3ProjectId: "proj-local-1" },
-          ],
         },
       },
     });
     const agent = Object.values(decoded.logicalAgents)[0];
-    expect(agent?.projectBindings[0]).toEqual({
-      projectId: "proj_9",
-      projectName: "Wiki migration",
-      t3ProjectId: "proj-local-1",
+    expect(agent).toEqual({
+      agentName: "Build agent",
+      providerInstanceId: "codex",
+      project: { enabled: true },
     });
     expect(encodeServerSettings(decoded).logicalAgents).toEqual(decoded.logicalAgents);
   });
@@ -121,8 +118,32 @@ describe("ServerSettings project service surfaces", () => {
       agentName: "A",
       providerInstanceId: "codex",
       project: { enabled: false },
-      projectBindings: [],
     });
+  });
+
+  it("strips a stale projectBindings key from a hand-edited settings.json silently", () => {
+    // Issue #6 deleted the bindings surface; a live settings.json written by
+    // an older build still carries the key. Decode must parse the rest of the
+    // agent and drop the unknown key rather than reject the whole file.
+    const decoded = decodeServerSettings({
+      logicalAgents: {
+        ag_main: {
+          agentName: "Build agent",
+          providerInstanceId: "codex",
+          project: { enabled: true },
+          projectBindings: [
+            { projectId: "proj_9", projectName: "Wiki migration", t3ProjectId: "proj-local-1" },
+          ],
+        },
+      },
+    });
+    const agent = decoded.logicalAgents[LogicalAgentId.make("ag_main")];
+    expect(agent).toEqual({
+      agentName: "Build agent",
+      providerInstanceId: "codex",
+      project: { enabled: true },
+    });
+    expect(JSON.stringify(decoded)).not.toContain("projectBindings");
   });
 });
 
@@ -146,17 +167,23 @@ describe("ServerSettingsPatch project service surfaces", () => {
     expect(Object.keys(patch.logicalAgents ?? {})).toEqual(["ag_one"]);
   });
 
-  it("rejects agent entries with an empty Project Service project id", () => {
-    expect(() =>
-      decodeServerSettingsPatch({
-        logicalAgents: {
-          ag_one: {
-            agentName: "One",
-            providerInstanceId: "codex",
-            projectBindings: [{ projectId: "", projectName: "x", t3ProjectId: "p" }],
-          },
+  it("strips a stale projectBindings key from an agent patch", () => {
+    // A client built before issue #6 may still echo the deleted key back in
+    // a whole-map agent replacement; the patch must apply with the key
+    // dropped, not be rejected.
+    const patch = decodeServerSettingsPatch({
+      logicalAgents: {
+        ag_one: {
+          agentName: "One",
+          providerInstanceId: "codex",
+          projectBindings: [{ projectId: "", projectName: "x", t3ProjectId: "p" }],
         },
-      }),
-    ).toThrow();
+      },
+    });
+    expect(patch.logicalAgents?.[LogicalAgentId.make("ag_one")]).toEqual({
+      agentName: "One",
+      providerInstanceId: "codex",
+      project: { enabled: false },
+    });
   });
 });

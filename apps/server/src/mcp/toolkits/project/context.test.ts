@@ -12,13 +12,12 @@ import { resolveProjectToolContext } from "./context.ts";
 const providerInstanceId = ProviderInstanceId.make("codex");
 const otherInstance = ProviderInstanceId.make("claude-agent");
 const t3ProjectId = ProjectId.make("t3-project-1");
-const otherT3ProjectId = ProjectId.make("t3-project-2");
+const WORKSPACE_ROOT = "/srv/registry";
 
 const agent = (overrides?: Partial<ServerSettings["logicalAgents"][LogicalAgentId]>) => ({
   agentName: "Agent One",
   providerInstanceId,
   project: { enabled: true },
-  projectBindings: [{ projectId: "proj_ps_1", projectName: "PS Project", t3ProjectId }],
   ...overrides,
 });
 
@@ -32,12 +31,35 @@ const settingsWith = (
   logicalAgents: logicalAgents as ServerSettings["logicalAgents"],
 });
 
+const serviceProjects = (dirs: ReadonlyArray<string>) =>
+  dirs.map((workspaceDir, index) => ({
+    projectId: `proj_ps_${index + 1}`,
+    workspaceDir,
+  }));
+
+const resolve = (input: {
+  readonly logicalAgents: Record<string, ReturnType<typeof agent>>;
+  /** `undefined` simulates a project shell whose root could not be read. */
+  readonly workspaceRoot?: string | undefined;
+  readonly serviceProjects: ReadonlyArray<{
+    readonly projectId: string;
+    readonly workspaceDir: string;
+  }>;
+  readonly enabled?: boolean;
+}) =>
+  resolveProjectToolContext({
+    settings: settingsWith(input.logicalAgents, input.enabled ?? true),
+    providerInstanceId,
+    t3ProjectId,
+    workspaceRoot: "workspaceRoot" in input ? input.workspaceRoot : WORKSPACE_ROOT,
+    serviceProjects: input.serviceProjects,
+  });
+
 describe("resolveProjectToolContext", () => {
-  it("resolves the logical agent, T3 project, bound service project, and live capabilities", () => {
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({ ag_one: agent() }),
-      providerInstanceId,
-      t3ProjectId,
+  it("resolves the logical agent, T3 project, directory-registered service project, and live capabilities", () => {
+    const resolution = resolve({
+      logicalAgents: { ag_one: agent() },
+      serviceProjects: serviceProjects(["/srv/unrelated", "/srv/registry"]),
     });
 
     expect(resolution).toEqual({
@@ -45,7 +67,7 @@ describe("resolveProjectToolContext", () => {
       context: {
         logicalAgentId: "ag_one",
         t3ProjectId,
-        projectServiceProjectId: "proj_ps_1",
+        projectServiceProjectId: "proj_ps_2",
         capabilities: new Set(["preview", "project.work.read", "project.work.write"]),
       },
     });
@@ -56,6 +78,8 @@ describe("resolveProjectToolContext", () => {
       settings: { ...settingsWith({ ag_one: agent() }), enableAgentBrowserAccess: false },
       providerInstanceId,
       t3ProjectId,
+      workspaceRoot: WORKSPACE_ROOT,
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
     });
 
     expect(resolution.ok).toBe(true);
@@ -68,10 +92,10 @@ describe("resolveProjectToolContext", () => {
   });
 
   it("answers integration-disabled when the client is off, regardless of agents", () => {
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({ ag_one: agent() }, false),
-      providerInstanceId,
-      t3ProjectId,
+    const resolution = resolve({
+      logicalAgents: { ag_one: agent() },
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
+      enabled: false,
     });
 
     expect(resolution).toEqual({ ok: false, reason: "integration-disabled" });
@@ -82,96 +106,85 @@ describe("resolveProjectToolContext", () => {
       settings: settingsWith({ ag_one: agent() }),
       providerInstanceId,
       t3ProjectId: undefined,
+      workspaceRoot: undefined,
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
     });
 
     expect(resolution).toEqual({ ok: false, reason: "thread-unavailable" });
   });
 
-  it("answers agent-unbound when no logical agent is routed to this provider instance", () => {
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({ ag_one: { ...agent(), providerInstanceId: otherInstance } }),
-      providerInstanceId,
-      t3ProjectId,
+  it("answers project-unavailable when the thread's project shell cannot be read", () => {
+    const resolution = resolve({
+      logicalAgents: { ag_one: agent() },
+      workspaceRoot: undefined,
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
     });
 
-    expect(resolution).toEqual({ ok: false, reason: "agent-unbound" });
+    expect(resolution).toEqual({ ok: false, reason: "project-unavailable" });
   });
 
-  it("answers agent-project-disabled when the routed agent has project work off", () => {
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({ ag_one: { ...agent(), project: { enabled: false } } }),
-      providerInstanceId,
-      t3ProjectId,
+  it("answers agent-project-disabled when no agent on this instance has project work enabled", () => {
+    const resolution = resolve({
+      logicalAgents: {
+        ag_one: { ...agent(), providerInstanceId: otherInstance },
+        ag_far: { ...agent(), project: { enabled: false } },
+      },
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
     });
 
     expect(resolution).toEqual({ ok: false, reason: "agent-project-disabled" });
   });
 
-  it("answers no-binding when the session's T3 project is not bound for the agent", () => {
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({ ag_one: agent() }),
-      providerInstanceId,
-      t3ProjectId: otherT3ProjectId,
-    });
-
-    expect(resolution).toEqual({ ok: false, reason: "no-binding" });
-  });
-
-  it("prefers the routed agent bound to this T3 project when several share an instance", () => {
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({
-        ag_one: agent(),
-        ag_two: {
-          ...agent(),
-          projectBindings: [
-            { projectId: "proj_ps_2", projectName: "Other", t3ProjectId: otherT3ProjectId },
-          ],
-        },
-      }),
-      providerInstanceId,
-      t3ProjectId,
-    });
-
-    expect(resolution.ok).toBe(true);
-    if (resolution.ok) {
-      expect(resolution.context.logicalAgentId).toBe("ag_one");
-      expect(resolution.context.projectServiceProjectId).toBe("proj_ps_1");
-    }
-  });
-
-  it("answers agent-ambiguous when two routed agents bind the same T3 project", () => {
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({
-        ag_one: agent(),
-        ag_two: {
-          ...agent(),
-          projectBindings: [{ projectId: "proj_ps_2", projectName: "Also Bound", t3ProjectId }],
-        },
-      }),
-      providerInstanceId,
-      t3ProjectId,
+  it("answers agent-ambiguous when several agents on this instance have project work enabled", () => {
+    const resolution = resolve({
+      logicalAgents: { ag_one: agent(), ag_two: agent() },
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
     });
 
     expect(resolution).toEqual({ ok: false, reason: "agent-ambiguous" });
   });
 
-  it("answers binding-ambiguous when one agent binds the same T3 project twice", () => {
-    // Settings writes reject this, but settings.json can be hand-edited;
-    // resolution must not silently pick the first entry.
-    const resolution = resolveProjectToolContext({
-      settings: settingsWith({
-        ag_one: {
-          ...agent(),
-          projectBindings: [
-            { projectId: "proj_ps_1", projectName: "PS Project", t3ProjectId },
-            { projectId: "proj_ps_2", projectName: "Other Project", t3ProjectId },
-          ],
-        },
-      }),
-      providerInstanceId,
-      t3ProjectId,
+  it("answers project-not-registered when no Project Service project shares the directory", () => {
+    const resolution = resolve({
+      logicalAgents: { ag_one: agent() },
+      serviceProjects: serviceProjects(["/srv/other", "/srv/third"]),
     });
 
-    expect(resolution).toEqual({ ok: false, reason: "binding-ambiguous" });
+    expect(resolution).toEqual({ ok: false, reason: "project-not-registered" });
+  });
+
+  it("answers project-ambiguous when several Project Service projects share the directory", () => {
+    const resolution = resolve({
+      logicalAgents: { ag_one: agent() },
+      serviceProjects: serviceProjects([WORKSPACE_ROOT, "/srv/other", `${WORKSPACE_ROOT}/`]),
+    });
+
+    expect(resolution).toEqual({ ok: false, reason: "project-ambiguous" });
+  });
+
+  it("matches the directory lexically — trailing slashes fold, different paths and cases do not", () => {
+    const same = resolve({
+      logicalAgents: { ag_one: agent() },
+      serviceProjects: [{ projectId: "proj_slash", workspaceDir: `${WORKSPACE_ROOT}/` }],
+    });
+    expect(same.ok).toBe(true);
+    if (same.ok) {
+      expect(same.context.projectServiceProjectId).toBe("proj_slash");
+    }
+
+    // A different absolute path — even a Windows-style spelling of a similar
+    // tree — is not the session's directory.
+    const foreign = resolve({
+      logicalAgents: { ag_one: agent() },
+      serviceProjects: [{ projectId: "proj_win", workspaceDir: "C:\\srv\\registry\\" }],
+    });
+    expect(foreign).toEqual({ ok: false, reason: "project-not-registered" });
+
+    // Case is significant: both sides are server-normalized absolute paths.
+    const cased = resolve({
+      logicalAgents: { ag_one: agent() },
+      serviceProjects: [{ projectId: "proj_case", workspaceDir: "/Srv/Registry" }],
+    });
+    expect(cased).toEqual({ ok: false, reason: "project-not-registered" });
   });
 });

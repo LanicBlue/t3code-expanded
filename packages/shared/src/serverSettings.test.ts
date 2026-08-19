@@ -2,7 +2,6 @@ import {
   DEFAULT_SERVER_SETTINGS,
   type LogicalAgentConfig,
   LogicalAgentId,
-  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -14,7 +13,6 @@ import { createModelSelection } from "./model.ts";
 import {
   applyServerSettingsPatch,
   extractPersistedServerObservabilitySettings,
-  findDuplicateProjectBindings,
   findLogicalAgentsWithUnresolvedProviderInstances,
   isModelSelectionProviderEnabled,
   normalizePersistedServerSettingString,
@@ -530,7 +528,6 @@ describe("project service + logical agents patching", () => {
     agentName: overrides.agentName ?? "Build agent",
     providerInstanceId: overrides.providerInstanceId ?? ProviderInstanceId.make("codex"),
     project: { enabled: false },
-    projectBindings: [],
   });
 
   it("replaces the agent map wholesale", () => {
@@ -557,9 +554,6 @@ describe("project service + logical agents patching", () => {
         [agentId("ag_one")]: {
           ...agent(),
           project: { enabled: true },
-          projectBindings: [
-            { projectId: "proj_9", projectName: "Wiki", t3ProjectId: ProjectId.make("local-1") },
-          ],
         },
       },
     };
@@ -633,33 +627,6 @@ describe("project service + logical agents patching", () => {
 
     expect(findLogicalAgentsWithUnresolvedProviderInstances(settings)).toEqual([
       { agentId: "ag_missing", providerInstanceId: ProviderInstanceId.make("codex_gone") },
-    ]);
-  });
-
-  it("flags only repeated t3ProjectId+projectId binding pairs", () => {
-    const binding = (projectId: string, t3ProjectId: string, projectName = "n") => ({
-      projectId,
-      projectName,
-      t3ProjectId: ProjectId.make(t3ProjectId),
-    });
-    const settings = {
-      ...DEFAULT_SERVER_SETTINGS,
-      logicalAgents: {
-        [agentId("ag_clean")]: agent(),
-        [agentId("ag_dup")]: {
-          ...agent(),
-          projectBindings: [
-            binding("proj_1", "local-1"),
-            binding("proj_2", "local-1"),
-            binding("proj_1", "local-1", "renamed"),
-            binding("proj_1", "local-2"),
-          ],
-        },
-      },
-    };
-
-    expect(findDuplicateProjectBindings(settings)).toEqual([
-      { agentId: "ag_dup", t3ProjectId: "local-1", projectId: "proj_1" },
     ]);
   });
 });

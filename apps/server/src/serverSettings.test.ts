@@ -2,7 +2,6 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   DEFAULT_SERVER_SETTINGS,
   LogicalAgentId,
-  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerSettings,
@@ -806,7 +805,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
               agentName: "Ghost rider",
               providerInstanceId: ProviderInstanceId.make("ghost_instance"),
               project: { enabled: false },
-              projectBindings: [],
             },
           },
         }),
@@ -824,11 +822,65 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             agentName: "Build agent",
             providerInstanceId: ProviderInstanceId.make("codex"),
             project: { enabled: false },
-            projectBindings: [],
           },
         },
       });
       assert.equal(next.logicalAgents[LogicalAgentId.make("ag_one")]?.providerInstanceId, "codex");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("issue #6 review: at most ONE Project-enabled agent per provider instance", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const error = yield* Effect.flip(
+        serverSettings.updateSettings({
+          logicalAgents: {
+            [LogicalAgentId.make("ag_build")]: {
+              agentName: "Build agent",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              project: { enabled: true },
+            },
+            [LogicalAgentId.make("ag_review")]: {
+              agentName: "Review agent",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              project: { enabled: true },
+            },
+          },
+        }),
+      );
+      assert.deepInclude(error, {
+        _tag: "ServerSettingsError",
+        operation: "validate",
+        providerInstanceId: "codex",
+      });
+      assert.match(
+        error.cause instanceof Error ? error.cause.message : "",
+        /multiple Project-enabled logical agents \(ag_build, ag_review\)/,
+      );
+
+      // Different instances stay legal; so does a second agent with Project
+      // work disabled on the SAME instance.
+      const next = yield* serverSettings.updateSettings({
+        logicalAgents: {
+          [LogicalAgentId.make("ag_build")]: {
+            agentName: "Build agent",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            project: { enabled: true },
+          },
+          [LogicalAgentId.make("ag_review")]: {
+            agentName: "Review agent",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            project: { enabled: false },
+          },
+          [LogicalAgentId.make("ag_other")]: {
+            agentName: "Other agent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            project: { enabled: true },
+          },
+        },
+      });
+      assert.equal(Object.keys(next.logicalAgents).length, 3);
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -842,13 +894,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             agentName: "Build agent",
             providerInstanceId: ProviderInstanceId.make("codex"),
             project: { enabled: true },
-            projectBindings: [
-              {
-                projectId: "proj_9",
-                projectName: "Wiki migration",
-                t3ProjectId: ProjectId.make("local-1"),
-              },
-            ],
           },
         },
       });
@@ -884,7 +929,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             agentName: "Build agent",
             providerInstanceId: ProviderInstanceId.make("codex_personal"),
             project: { enabled: false },
-            projectBindings: [],
           },
         },
       });
@@ -923,30 +967,30 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
-  it.effect("rejects a logical agent with duplicate project bindings", () =>
+  it.effect("accepts a logical agent patch that still carries a stale projectBindings key", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-      const binding = (projectId: string, t3ProjectId: string) => ({
-        projectId,
-        projectName: "Wiki",
-        t3ProjectId: ProjectId.make(t3ProjectId),
+
+      // Issue #6 deleted the bindings surface; a client built before it may
+      // echo the key back. The patch decodes with the unknown key stripped
+      // (pinned in @t3tools/contracts) and the write applies.
+      const agents = {
+        [LogicalAgentId.make("ag_one")]: {
+          agentName: "Build agent",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          project: { enabled: true },
+          projectBindings: [{ projectId: "proj_9", projectName: "Wiki", t3ProjectId: "local-1" }],
+        },
+      };
+      const next = yield* serverSettings.updateSettings({
+        logicalAgents: agents as never,
       });
 
-      const error = yield* Effect.flip(
-        serverSettings.updateSettings({
-          logicalAgents: {
-            [LogicalAgentId.make("ag_one")]: {
-              agentName: "Build agent",
-              providerInstanceId: ProviderInstanceId.make("codex"),
-              project: { enabled: false },
-              projectBindings: [binding("proj_1", "local-1"), binding("proj_1", "local-1")],
-            },
-          },
-        }),
-      );
-
-      assert.deepInclude(error, { _tag: "ServerSettingsError", operation: "validate" });
-      assert.match(error.cause instanceof Error ? error.cause.message : "", /more than once/);
+      assert.deepEqual(next.logicalAgents[LogicalAgentId.make("ag_one")], {
+        agentName: "Build agent",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        project: { enabled: true },
+      });
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 

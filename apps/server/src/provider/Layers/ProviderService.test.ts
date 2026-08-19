@@ -2075,7 +2075,6 @@ describe("agent browser access", () => {
             agentName: "Codex Agent",
             providerInstanceId: codexInstanceId,
             project: { enabled: true },
-            projectBindings: [],
           },
         } as ServerSettingsValues["logicalAgents"],
       });

@@ -1,9 +1,12 @@
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 
 import * as ProjectionSnapshotQuery from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectServiceWorkClient from "../../../projectService/ProjectServiceWorkClient.ts";
+import { canonicalWorkspaceDirectory } from "../../../projectService/ProjectDirectoryKey.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as Tools from "./tools.ts";
@@ -17,6 +20,8 @@ type CallRequirements =
   | ProjectServiceWorkClient.ProjectServiceWorkClient
   | ServerSettings.ServerSettingsService
   | ProjectionSnapshotQuery.ProjectionSnapshotQuery
+  | FileSystem.FileSystem
+  | Path.Path
   | Crypto.Crypto;
 
 /** Status codes the service uses for credential/executor-identity rejections. */
@@ -97,8 +102,9 @@ export const mapProjectServiceError = (
 /**
  * Resolve the trusted execution context for this call from the session plus
  * live settings: logical agent (provider-instance routing), T3 project (the
- * thread's project), the bound Project Service project, and the live
- * capability scopes. Tool arguments contribute nothing here.
+ * thread's project and its workspace directory), the Project Service project
+ * registered for that directory, and the live capability scopes. Tool
+ * arguments contribute nothing here.
  */
 const resolveContext = Effect.fn("ProjectWorkToolkit.resolveContext")(function* (
   requiredCapability: "project.work.read" | "project.work.write",
@@ -106,6 +112,7 @@ const resolveContext = Effect.fn("ProjectWorkToolkit.resolveContext")(function* 
   const invocation = yield* McpInvocationContext.McpInvocationContext;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const workClient = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
   // Local failures degrade to structured unavailability, never a raw error.
   const settings = yield* settingsService.getSettings.pipe(
     Effect.mapError(
@@ -119,10 +126,34 @@ const resolveContext = Effect.fn("ProjectWorkToolkit.resolveContext")(function* 
         () => new Tools.ProjectWorkUnavailableError({ reason: "thread-unavailable" }),
       ),
     );
+  const t3ProjectId = Option.isSome(shell) ? shell.value.projectId : undefined;
+  const project =
+    t3ProjectId === undefined
+      ? Option.none()
+      : yield* snapshotQuery
+          .getProjectShellById(t3ProjectId)
+          .pipe(
+            Effect.mapError(
+              () => new Tools.ProjectWorkUnavailableError({ reason: "project-unavailable" }),
+            ),
+          );
+  const serviceProjects = yield* workClient
+    .listProjects()
+    .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+  // Canonicalize the STORED root before directory matching (issue #6 review):
+  // the Project Service dir arrives canonical (realpath + Windows case-fold),
+  // and a stored root may carry a legacy symlink spelling — one key function
+  // on both sides, or matching forks. Best-effort and never failing: a root
+  // that cannot be canonicalized still compares by its resolved spelling.
+  const workspaceRootOption = Option.isSome(project)
+    ? yield* canonicalWorkspaceDirectory(project.value.workspaceRoot).pipe(Effect.option)
+    : Option.none();
   const resolution = resolveProjectToolContext({
     settings,
     providerInstanceId: invocation.providerInstanceId,
-    t3ProjectId: Option.isSome(shell) ? shell.value.projectId : undefined,
+    t3ProjectId,
+    workspaceRoot: Option.getOrUndefined(workspaceRootOption),
+    serviceProjects,
   });
   if (!resolution.ok) {
     return yield* new Tools.ProjectWorkUnavailableError({ reason: resolution.reason });

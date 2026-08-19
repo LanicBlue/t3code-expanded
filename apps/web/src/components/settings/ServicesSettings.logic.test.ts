@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ProjectId, ProviderInstanceId } from "@t3tools/contracts";
+import { ProviderInstanceId } from "@t3tools/contracts";
 import {
   CONNECTION_TEST_STATUS_LABELS,
   connectionTestStatus,
@@ -7,7 +7,6 @@ import {
   isValidCredentialPaste,
   makeEmptyLogicalAgentConfig,
   makeLogicalAgentId,
-  nextAgentConfigWithBinding,
   nextAgentMapWithAgent,
   nextAgentMapWithoutAgent,
 } from "./ServicesSettings.logic";
@@ -19,12 +18,11 @@ describe("makeLogicalAgentId", () => {
 });
 
 describe("makeEmptyLogicalAgentConfig", () => {
-  it("seeds a disabled agent with no bindings", () => {
+  it("seeds a disabled agent with no per-project configuration", () => {
     expect(makeEmptyLogicalAgentConfig(ProviderInstanceId.make("codex"))).toEqual({
       agentName: "New agent",
       providerInstanceId: "codex",
       project: { enabled: false },
-      projectBindings: [],
     });
   });
 });
@@ -109,55 +107,5 @@ describe("credential + connection presentation", () => {
     expect(connectionTestStatus({ ...rejected, credentialSet: false })).toBe("unconfigured");
     expect(CONNECTION_TEST_STATUS_LABELS.authFailed).toBe("Authentication failed");
     expect(CONNECTION_TEST_STATUS_LABELS.unconfigured).toBe("Not configured");
-  });
-});
-
-describe("project binding updates", () => {
-  const binding = (projectId: string, t3ProjectId: string, projectName = "n") => ({
-    projectId,
-    projectName,
-    t3ProjectId: ProjectId.make(t3ProjectId),
-  });
-
-  it("appends a new binding", () => {
-    const agent = {
-      ...makeEmptyLogicalAgentConfig(ProviderInstanceId.make("codex")),
-      projectBindings: [binding("proj_1", "local-1")],
-    };
-
-    const next = nextAgentConfigWithBinding(agent, binding("proj_2", "local-2", "Other"));
-
-    expect(next.projectBindings).toEqual([
-      binding("proj_1", "local-1"),
-      binding("proj_2", "local-2", "Other"),
-    ]);
-  });
-
-  it("refreshes an existing t3ProjectId+projectId pair in place instead of duplicating it", () => {
-    const agent = {
-      ...makeEmptyLogicalAgentConfig(ProviderInstanceId.make("codex")),
-      projectBindings: [binding("proj_1", "local-1"), binding("proj_2", "local-2")],
-    };
-
-    const next = nextAgentConfigWithBinding(agent, binding("proj_1", "local-1", "Renamed"));
-
-    expect(next.projectBindings).toEqual([
-      binding("proj_1", "local-1", "Renamed"),
-      binding("proj_2", "local-2"),
-    ]);
-  });
-
-  it("does not treat the same project under a different T3 project as a duplicate", () => {
-    const agent = {
-      ...makeEmptyLogicalAgentConfig(ProviderInstanceId.make("codex")),
-      projectBindings: [binding("proj_1", "local-1")],
-    };
-
-    const next = nextAgentConfigWithBinding(agent, binding("proj_1", "local-2"));
-
-    expect(next.projectBindings).toEqual([
-      binding("proj_1", "local-1"),
-      binding("proj_1", "local-2"),
-    ]);
   });
 });

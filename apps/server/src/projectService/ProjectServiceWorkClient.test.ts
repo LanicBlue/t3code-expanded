@@ -353,6 +353,73 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
     }).pipe(Effect.provide(makeLayer(client)));
   });
 
+  it.effect(
+    "issue #6 review: listProjects decodes the project list and projects id onto projectId",
+    () => {
+      // GET /project/v1/ answers the BARE ProjectRecord[] (registry.listProjects),
+      // not an ok/result envelope like the SDK-backed reads.
+      const { client } = makeHttpClient(
+        serviceByPath(() =>
+          Response.json([
+            { id: "proj_ps_1", name: "Zero Core", workspaceDir: "/workspaces/zero-core" },
+          ]),
+        ),
+      );
+
+      return Effect.gen(function* () {
+        yield* enableClient;
+        const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+        const projects = yield* work.listProjects();
+
+        assert.deepEqual(projects, [
+          { projectId: "proj_ps_1", name: "Zero Core", workspaceDir: "/workspaces/zero-core" },
+        ]);
+      }).pipe(Effect.provide(makeLayer(client)));
+    },
+  );
+
+  it.effect(
+    "issue #6 review: a non-array project list is a TYPED incompatibility, never a silent []",
+    () => {
+      const { client } = makeHttpClient(serviceByPath(() => okBody({ projects: [] })));
+
+      return Effect.gen(function* () {
+        yield* enableClient;
+        const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+        const failure = yield* work.listProjects().pipe(Effect.flip);
+
+        assert.deepEqual(plainError(failure), {
+          _tag: "ProjectServiceWorkApiIncompatibleError",
+          code: "PROJECT_WORK_RESPONSE_SHAPE",
+        });
+      }).pipe(Effect.provide(makeLayer(client)));
+    },
+  );
+
+  it.effect(
+    "issue #6 review: an undecodable project record fails as a typed incompatibility, not a Die defect",
+    () => {
+      // workspaceDir missing — an older/other-shaped server answering 2xx.
+      const { client } = makeHttpClient(
+        serviceByPath(() => okBody([{ id: "proj_ps_1", name: "Zero Core" }])),
+      );
+
+      return Effect.gen(function* () {
+        yield* enableClient;
+        const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+        const failure = yield* work.listProjects().pipe(Effect.flip);
+
+        assert.deepEqual(plainError(failure), {
+          _tag: "ProjectServiceWorkApiIncompatibleError",
+          code: "PROJECT_WORK_RESPONSE_SHAPE",
+        });
+      }).pipe(Effect.provide(makeLayer(client)));
+    },
+  );
+
   it.effect("maps a missing bound project to the typed PROJECT_NOT_FOUND rejection", () => {
     const { client } = makeHttpClient(
       serviceByPath(() => Response.json({ message: "Project not found" }, { status: 404 })),
