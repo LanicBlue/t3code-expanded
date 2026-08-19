@@ -600,10 +600,14 @@ const make = Effect.gen(function* () {
   // still succeeds when a stored agent references a since-deleted instance.
   // Agents carry no per-project configuration anymore (issue #6: Work notices
   // route by workspace directory), so what remains to check are
-  // provider-instance references — and, since the per-agent project bindings
-  // that used to disambiguate are gone, that a provider instance carries at
-  // most ONE Project-enabled agent: sessions on that instance could not pick
-  // between two, and every project tool call would answer agent-ambiguous.
+  // provider-instance references. Several Project-enabled agents MAY share
+  // one provider instance: wake threads stamp their logical agent on the
+  // thread (thread.create → logicalAgentId) and MCP credentials carry it, so
+  // tool calls resolve identity from the session binding. Only unbound
+  // sessions (human-created threads) fall back to instance-level resolution,
+  // which the tool layer grants only while exactly one Project-enabled agent
+  // rides the instance — more than one answers agent-ambiguous instead of
+  // impersonating whichever sorted first.
   const validateLogicalAgents = (
     next: ServerSettings,
   ): Effect.Effect<ServerSettings, ServerSettingsError> => {
@@ -618,22 +622,6 @@ const make = Effect.gen(function* () {
           `Logical agent ${first.agentId} references provider instance ${first.providerInstanceId}, which is not configured.`,
         ),
       });
-    }
-    const projectEnabledByInstance = new Map<string, string>();
-    for (const [agentId, agent] of Object.entries(next.logicalAgents)) {
-      if (!agent.project.enabled) continue;
-      const incumbent = projectEnabledByInstance.get(agent.providerInstanceId);
-      if (incumbent !== undefined) {
-        return new ServerSettingsError({
-          settingsPath,
-          operation: "validate",
-          providerInstanceId: agent.providerInstanceId,
-          cause: new Error(
-            `Provider instance ${agent.providerInstanceId} has multiple Project-enabled logical agents (${incumbent}, ${agentId}); enable Project work on at most one agent per provider instance — sessions on the instance cannot pick between two.`,
-          ),
-        });
-      }
-      projectEnabledByInstance.set(agent.providerInstanceId, agentId);
     }
     return Effect.succeed(next);
   };

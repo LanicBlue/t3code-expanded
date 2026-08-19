@@ -1,5 +1,6 @@
 import {
   type EnvironmentId,
+  type LogicalAgentId,
   PreviewAutomationUnavailableError,
   type ProviderInstanceId,
   type ThreadId,
@@ -26,6 +27,14 @@ export interface McpInvocationScope {
   readonly threadId: ThreadId;
   readonly providerSessionId: string;
   readonly providerInstanceId: ProviderInstanceId;
+  /**
+   * The logical agent this session serves, from the thread's wake binding.
+   * Project tools resolve identity from it when present; sessions on
+   * human-created threads carry none and fall back to per-instance
+   * resolution (only unambiguous when exactly one Project-enabled agent
+   * rides the instance).
+   */
+  readonly logicalAgentId?: LogicalAgentId | undefined;
   readonly capabilities: ReadonlySet<McpCapability>;
   readonly issuedAt: number;
 }

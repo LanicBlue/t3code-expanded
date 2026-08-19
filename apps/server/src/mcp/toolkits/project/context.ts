@@ -46,7 +46,10 @@ export const projectWorkUnavailabilityMessage = (
     case "agent-ambiguous":
       return "Multiple logical agents for this session's provider instance have Project work enabled; the session cannot pick one.";
     case "agent-project-disabled":
-      return "No logical agent for this session's provider instance has Project work enabled.";
+      // Reaches operators in two shapes that need different fixes: a bound
+      // session whose agent lost its Project work flag, and an instance with
+      // no Project-enabled agent at all. Name both.
+      return "This session's logical agent does not have Project work enabled (bound sessions: the wake-bound agent's Project flag is off; unbound sessions: no Project-enabled agent rides this provider instance).";
     case "project-not-registered":
       return "This session's project directory is not registered with the Project Service.";
     case "project-ambiguous":
@@ -109,6 +112,8 @@ const normalizeDirectoryKey = (directory: string): string =>
 export const resolveProjectToolContext = (input: {
   readonly settings: ServerSettings;
   readonly providerInstanceId: ProviderInstanceId;
+  /** The session's bound logical agent; undefined on human-created threads. */
+  readonly logicalAgentId?: LogicalAgentId | undefined;
   readonly t3ProjectId: ProjectId | undefined;
   /** The thread's T3 project workspace root; undefined when unreadable. */
   readonly workspaceRoot: string | undefined;
@@ -125,24 +130,29 @@ export const resolveProjectToolContext = (input: {
   if (input.workspaceRoot === undefined) {
     return { ok: false, reason: "project-unavailable" };
   }
-  // Same eligibility rule as McpCapabilities.projectWorkEnabled: the agents
-  // routed to this provider instance with Project work enabled. None means
-  // the session has no Project identity; more than one is a genuine
-  // ambiguity the server must not silently break.
+  // Identity resolution, in priority order:
+  //  1. the session's BOUND logical agent (wake threads carry the agent the
+  //     routing woke; several Project agents may share one instance);
+  //  2. the legacy instance-wide answer for UNBOUND sessions (human-created
+  //     threads) — only while exactly one Project-enabled agent rides the
+  //     instance. More than one stays a genuine ambiguity the server must
+  //     not silently break by impersonating whichever sorted first.
   const eligible = Object.entries(input.settings.logicalAgents).filter(
     ([, agent]) => agent.providerInstanceId === input.providerInstanceId && agent.project.enabled,
   );
+  if (input.logicalAgentId !== undefined) {
+    const bound = eligible.find(([id]) => id === input.logicalAgentId);
+    if (bound === undefined) {
+      return { ok: false, reason: "agent-project-disabled" };
+    }
+  }
   if (eligible.length === 0) {
     return { ok: false, reason: "agent-project-disabled" };
   }
-  if (eligible.length > 1) {
+  if (input.logicalAgentId === undefined && eligible.length > 1) {
     return { ok: false, reason: "agent-ambiguous" };
   }
-  const selected = eligible[0];
-  if (selected === undefined) {
-    return { ok: false, reason: "agent-project-disabled" };
-  }
-  const [agentId] = selected;
+  const agentId = input.logicalAgentId ?? eligible[0]![0];
   const directoryKey = normalizeDirectoryKey(input.workspaceRoot);
   const matches = input.serviceProjects.filter(
     (project) => normalizeDirectoryKey(project.workspaceDir) === directoryKey,
@@ -163,7 +173,11 @@ export const resolveProjectToolContext = (input: {
       logicalAgentId: agentId as LogicalAgentId,
       t3ProjectId,
       projectServiceProjectId: registered.projectId,
-      capabilities: McpCapabilities.deriveMcpCapabilities(input.settings, input.providerInstanceId),
+      capabilities: McpCapabilities.deriveMcpCapabilities(
+        input.settings,
+        input.providerInstanceId,
+        agentId as LogicalAgentId,
+      ),
     },
   };
 };

@@ -22,6 +22,7 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { LogicalAgentId } from "./providerInstance.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -379,6 +380,10 @@ export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  // The logical agent this thread serves (Project Service work routing
+  // stamps it at wake). Optional: human-created threads and pre-binding
+  // events decode without it, and null unbinds on later rewrites.
+  logicalAgentId: Schema.optional(Schema.NullOr(LogicalAgentId)),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -449,6 +454,10 @@ export const OrchestrationThreadShell = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  // The logical agent this thread serves (Project Service work routing
+  // stamps it at wake). Optional: human-created threads and pre-binding
+  // events decode without it, and null unbinds on later rewrites.
+  logicalAgentId: Schema.optional(Schema.NullOr(LogicalAgentId)),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -670,6 +679,10 @@ const ThreadCreateCommand = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  // The logical agent this thread serves (Project Service work routing
+  // stamps it at wake). Optional: human-created threads and pre-binding
+  // events decode without it, and null unbinds on later rewrites.
+  logicalAgentId: Schema.optional(Schema.NullOr(LogicalAgentId)),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -1126,6 +1139,10 @@ export const ThreadCreatedPayload = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  // The logical agent this thread serves (Project Service work routing
+  // stamps it at wake). Optional: human-created threads and pre-binding
+  // events decode without it, and null unbinds on later rewrites.
+  logicalAgentId: Schema.optional(Schema.NullOr(LogicalAgentId)),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   interactionMode: ProviderInteractionMode.pipe(

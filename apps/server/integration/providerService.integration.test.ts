@@ -19,6 +19,10 @@ import {
   ProviderEventLoggers,
 } from "../src/provider/Layers/ProviderEventLoggers.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "../src/orchestration/Layers/ProjectionSnapshotQuery.ts";
+import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
+import * as ThreadBackgroundLiveness from "../src/orchestration/ThreadBackgroundLiveness.ts";
+import * as ThreadPlanProgress from "../src/orchestration/ThreadPlanProgress.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -98,7 +102,14 @@ const makeIntegrationFixture = (options?: { readonly analytics?: Layer.Layer<Ana
       ServerSettingsService.layerTest(DEFAULT_SERVER_SETTINGS),
       options?.analytics ?? AnalyticsService.layerTest,
       Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers),
-    ).pipe(Layer.provide(SqlitePersistenceMemory));
+      OrchestrationProjectionSnapshotQueryLive,
+    ).pipe(
+      Layer.provide(SqlitePersistenceMemory),
+      Layer.provideMerge(RepositoryIdentityResolver.layer),
+      Layer.provideMerge(ThreadBackgroundLiveness.layer),
+      Layer.provideMerge(ThreadPlanProgress.layer),
+      Layer.provideMerge(NodeServices.layer),
+    );
 
     const layer = makeProviderServiceLive().pipe(Layer.provide(shared));
 

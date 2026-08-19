@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { describe, assert, it } from "@effect/vitest";
 import {
   DEFAULT_MODEL,
   DEFAULT_SERVER_SETTINGS,
@@ -21,6 +21,7 @@ import * as Option from "effect/Option";
 
 import {
   aggregateWorkNotificationMessage,
+  composeWorkWakeMessage,
   makeProjectWorkSessionRouter,
   type ProjectWorkSessionRouter,
   ProjectWorkRoutingError,
@@ -43,11 +44,15 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
     [LogicalAgentId.make(AGENT_ID)]: {
       agentName: "Primary Agent",
       providerInstanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
+      persona: "",
+      modelOverride: null,
       project: { enabled: true },
     },
     [LogicalAgentId.make(OTHER_AGENT_ID)]: {
       agentName: "Secondary Agent",
       providerInstanceId: ProviderInstanceId.make("other-instance"),
+      persona: "",
+      modelOverride: null,
       project: { enabled: false },
     },
   };
@@ -436,6 +441,8 @@ it("routing resolution is id-based and structural", () => {
       logicalAgentId: LogicalAgentId.make(AGENT_ID),
       agentName: "Primary Agent",
       providerInstanceId: PROVIDER_INSTANCE,
+      persona: "",
+      modelOverride: null,
       projectServiceProjectId: PS_PROJECT_ID,
       projectName: "Registry",
     });
@@ -487,6 +494,66 @@ it("notification message and session title formats", () => {
   );
 });
 
+describe("composeWorkWakeMessage", () => {
+  it("returns the bare aggregate when the agent has no persona", () => {
+    assert.equal(composeWorkWakeMessage("", 2), aggregateWorkNotificationMessage(2));
+    assert.equal(composeWorkWakeMessage("   ", 1), aggregateWorkNotificationMessage(1));
+  });
+
+  it("prepends the persona as agent directives", () => {
+    const message = composeWorkWakeMessage("You are the reviewer.", 3);
+    assert.isTrue(
+      message.startsWith("<agent_directives>\nYou are the reviewer.\n</agent_directives>\n\n"),
+    );
+    assert.isTrue(message.endsWith(aggregateWorkNotificationMessage(3)));
+  });
+
+  it("persona rides the delivered aggregate turn", () =>
+    Effect.gen(function* () {
+      const settings = makeSettings((base) => ({
+        ...base,
+        logicalAgents: {
+          ...base.logicalAgents,
+          [LogicalAgentId.make(AGENT_ID)]: {
+            ...base.logicalAgents[LogicalAgentId.make(AGENT_ID)]!,
+            persona: "You are the primary agent; be terse.",
+          },
+        },
+      }));
+      const harness = yield* makeHarness(settings);
+      yield* wake(harness.router);
+      assert.strictEqual(
+        turnStarts(harness.commands)[0]?.type === "thread.turn.start" &&
+          turnStarts(harness.commands)[0]?.message.text,
+        composeWorkWakeMessage("You are the primary agent; be terse.", 2),
+      );
+    }));
+
+  it("agent modelOverride targeting the agent's instance wins over the project default", () =>
+    Effect.gen(function* () {
+      const settings = makeSettings((base) => ({
+        ...base,
+        logicalAgents: {
+          ...base.logicalAgents,
+          [LogicalAgentId.make(AGENT_ID)]: {
+            ...base.logicalAgents[LogicalAgentId.make(AGENT_ID)]!,
+            modelOverride: {
+              instanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
+              model: "override-model",
+            },
+          },
+        },
+      }));
+      const harness = yield* makeHarness(settings);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      assert.strictEqual(
+        created?.type === "thread.create" && created.modelSelection.model,
+        "override-model",
+      );
+    }));
+});
+
 it.effect("missing project: the wake creates it under the notice's directory", () =>
   Effect.gen(function* () {
     const harness = yield* makeHarness(makeSettings());
@@ -517,6 +584,13 @@ it.effect("missing project: the wake creates it under the notice's directory", (
       threadCreates(harness.commands)[0]?.type === "thread.create" &&
         threadCreates(harness.commands)[0]?.title,
       "Project Work — Registry",
+    );
+    // The thread is stamped with the logical agent the wake routed to, so
+    // MCP tool calls resolve identity from the session, not the instance.
+    assert.strictEqual(
+      threadCreates(harness.commands)[0]?.type === "thread.create" &&
+        String(threadCreates(harness.commands)[0]?.logicalAgentId),
+      AGENT_ID,
     );
     assert.lengthOf(turnStarts(harness.commands), 1);
     assert.strictEqual(

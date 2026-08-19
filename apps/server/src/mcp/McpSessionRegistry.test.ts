@@ -1,6 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, LogicalAgentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { HttpServer } from "effect/unstable/http";
 
@@ -51,6 +51,27 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
     expect(yield* registry.resolve(token)).toBeUndefined();
 
     timestamp += 2_000;
+  }),
+);
+
+it.effect("carries the thread's bound logical agent in the resolved scope", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const bound = yield* registry.issue({
+      threadId: ThreadId.make("thread-bound"),
+      providerInstanceId: ProviderInstanceId.make("claude"),
+      logicalAgentId: LogicalAgentId.make("ag_coder"),
+    });
+    const boundToken = bound.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect((yield* registry.resolve(boundToken))?.logicalAgentId).toBe("ag_coder");
+
+    // Unbound sessions simply omit the field.
+    const unbound = yield* registry.issue({
+      threadId: ThreadId.make("thread-unbound"),
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const unboundToken = unbound.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect((yield* registry.resolve(unboundToken))?.logicalAgentId).toBeUndefined();
   }),
 );
 

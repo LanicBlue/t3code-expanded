@@ -151,6 +151,7 @@ const resolveContext = Effect.fn("ProjectWorkToolkit.resolveContext")(function* 
   const resolution = resolveProjectToolContext({
     settings,
     providerInstanceId: invocation.providerInstanceId,
+    logicalAgentId: invocation.logicalAgentId,
     t3ProjectId,
     workspaceRoot: Option.getOrUndefined(workspaceRootOption),
     serviceProjects,

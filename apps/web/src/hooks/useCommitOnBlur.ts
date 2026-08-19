@@ -15,12 +15,14 @@ import { type ChangeEvent, type KeyboardEvent, useState } from "react";
  *   const bag = useCommitOnBlur(instance.displayName ?? "", (next) => {...});
  *   <Input {...bag} placeholder="e.g. Work" />
  */
-export function useCommitOnBlur(value: string, onCommit: (next: string) => void) {
+export function useCommitOnBlur<
+  const T extends HTMLInputElement | HTMLTextAreaElement = HTMLInputElement,
+>(value: string, onCommit: (next: string) => void) {
   const [draft, setDraft] = useState<string | null>(null);
 
   return {
     value: draft ?? value,
-    onChange: (event: ChangeEvent<HTMLInputElement>) => {
+    onChange: (event: ChangeEvent<T>) => {
       setDraft(event.target.value);
     },
     onFocus: () => {
@@ -33,10 +35,10 @@ export function useCommitOnBlur(value: string, onCommit: (next: string) => void)
         onCommit(next);
       }
     },
-    onKeyDown: (event: KeyboardEvent<HTMLInputElement>) => {
+    onKeyDown: (event: KeyboardEvent<T>) => {
       if (event.key === "Enter") {
         event.preventDefault();
-        (event.target as HTMLInputElement).blur();
+        (event.target as T).blur();
       }
     },
   };

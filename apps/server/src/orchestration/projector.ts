@@ -292,6 +292,9 @@ export function projectEvent(
             id: payload.threadId,
             projectId: payload.projectId,
             title: payload.title,
+            ...(payload.logicalAgentId === undefined
+              ? {}
+              : { logicalAgentId: payload.logicalAgentId }),
             modelSelection: payload.modelSelection,
             runtimeMode: payload.runtimeMode,
             interactionMode: payload.interactionMode,

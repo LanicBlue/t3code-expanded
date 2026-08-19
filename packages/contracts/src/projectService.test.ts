@@ -103,6 +103,8 @@ describe("ServerSettings project service surfaces", () => {
     expect(agent).toEqual({
       agentName: "Build agent",
       providerInstanceId: "codex",
+      persona: "",
+      modelOverride: null,
       project: { enabled: true },
     });
     expect(encodeServerSettings(decoded).logicalAgents).toEqual(decoded.logicalAgents);
@@ -117,6 +119,8 @@ describe("ServerSettings project service surfaces", () => {
     ).toEqual({
       agentName: "A",
       providerInstanceId: "codex",
+      persona: "",
+      modelOverride: null,
       project: { enabled: false },
     });
   });
@@ -141,6 +145,8 @@ describe("ServerSettings project service surfaces", () => {
     expect(agent).toEqual({
       agentName: "Build agent",
       providerInstanceId: "codex",
+      persona: "",
+      modelOverride: null,
       project: { enabled: true },
     });
     expect(JSON.stringify(decoded)).not.toContain("projectBindings");
@@ -183,6 +189,8 @@ describe("ServerSettingsPatch project service surfaces", () => {
     expect(patch.logicalAgents?.[LogicalAgentId.make("ag_one")]).toEqual({
       agentName: "One",
       providerInstanceId: "codex",
+      persona: "",
+      modelOverride: null,
       project: { enabled: false },
     });
   });

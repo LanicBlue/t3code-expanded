@@ -527,6 +527,8 @@ describe("project service + logical agents patching", () => {
   ): LogicalAgentConfig => ({
     agentName: overrides.agentName ?? "Build agent",
     providerInstanceId: overrides.providerInstanceId ?? ProviderInstanceId.make("codex"),
+    persona: "",
+    modelOverride: null,
     project: { enabled: false },
   });
 

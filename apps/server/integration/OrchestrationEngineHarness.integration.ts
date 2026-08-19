@@ -291,6 +291,7 @@ export const makeOrchestrationIntegrationHarness = (
           Layer.provide(providerSessionDirectoryLayer),
           Layer.provide(realCodexRegistry),
           Layer.provide(AnalyticsService.layerTest),
+          Layer.provide(OrchestrationProjectionSnapshotQueryLive),
           Layer.provide(providerEventLoggersLayer),
         )
       : makeProviderServiceLive().pipe(
@@ -298,6 +299,7 @@ export const makeOrchestrationIntegrationHarness = (
           Layer.provide(fakeRegistry!),
           Layer.provide(AnalyticsService.layerTest),
           Layer.provide(providerEventLoggersLayer),
+          Layer.provide(OrchestrationProjectionSnapshotQueryLive),
         );
     const providerRegistryLayer = makeProviderRegistryLayer();
 

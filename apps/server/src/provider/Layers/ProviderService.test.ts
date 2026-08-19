@@ -14,6 +14,7 @@ import {
   ApprovalRequestId,
   EnvironmentId,
   EventId,
+  LogicalAgentId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerSettings as ServerSettingsValues,
@@ -49,6 +50,7 @@ import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "./ProviderService.ts";
+import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -63,6 +65,26 @@ import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
+// The provider service reads a thread's wake binding (logicalAgentId) when it
+// prepares an MCP session. Unit tests have no persisted threads, so every
+// lookup answers "unbound" — the pre-binding behavior.
+const fakeSnapshotQueryLayer = Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+  getCommandReadModel: () => Effect.die("unused"),
+  getSnapshot: () => Effect.die("unused"),
+  getShellSnapshot: () => Effect.die("unused"),
+  getArchivedShellSnapshot: () => Effect.die("unused"),
+  getSnapshotSequence: () => Effect.die("unused"),
+  getCounts: () => Effect.die("unused"),
+  getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+  getProjectShellById: () => Effect.die("unused"),
+  getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+  getThreadCheckpointContext: () => Effect.die("unused"),
+  getFullThreadDiffContext: () => Effect.die("unused"),
+  getThreadShellById: () => Effect.succeed(Option.none()),
+  getThreadDetailById: () => Effect.die("unused"),
+  getThreadDetailSnapshot: () => Effect.die("unused"),
+  searchThreads: () => Effect.die("unused"),
+});
 const serverConfigTestLayer = ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
   Layer.provide(NodeServices.layer),
 );
@@ -295,6 +317,7 @@ function makeProviderServiceLayer() {
   const layer = it.layer(
     Layer.mergeAll(
       makeProviderServiceLive().pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -347,7 +370,9 @@ it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = Layer.mergeAll(
       makeProviderServiceLive().pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(providerAdapterLayer),
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
         Layer.provide(serverConfigTestLayer),
@@ -407,6 +432,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled providers", () 
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(fakeSnapshotQueryLayer),
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -492,7 +518,9 @@ it.effect(
         Layer.provide(runtimeRepositoryLayer),
       );
       const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(providerAdapterLayer),
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(directoryLayer),
         Layer.provide(serverSettingsLayer),
         Layer.provide(serverConfigTestLayer),
@@ -563,6 +591,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(fakeSnapshotQueryLayer),
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -620,6 +649,7 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
       },
     }).pipe(
       Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(fakeSnapshotQueryLayer),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
       Layer.provide(serverConfigTestLayer),
@@ -680,6 +710,7 @@ it.effect("ProviderServiceLive keeps persisted resumable sessions on startup", (
     }).pipe(Effect.provide(directoryLayer));
 
     const providerLayer = makeProviderServiceLive().pipe(
+      Layer.provide(fakeSnapshotQueryLayer),
       Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -745,6 +776,7 @@ it.effect(
         Layer.provide(runtimeRepositoryLayer),
       );
       const firstProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
         ),
@@ -805,6 +837,7 @@ it.effect(
         Layer.provide(runtimeRepositoryLayer),
       );
       const secondProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
         ),
@@ -1365,6 +1398,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         Layer.provide(runtimeRepositoryLayer),
       );
       const firstProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
         ),
@@ -1404,6 +1438,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         Layer.provide(runtimeRepositoryLayer),
       );
       const secondProviderLayer = makeProviderServiceLive().pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
         ),
@@ -1473,6 +1508,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           Layer.provide(runtimeRepositoryLayer),
         );
         const firstProviderLayer = makeProviderServiceLive().pipe(
+          Layer.provide(fakeSnapshotQueryLayer),
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
           ),
@@ -1507,6 +1543,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
           Layer.provide(runtimeRepositoryLayer),
         );
         const secondProviderLayer = makeProviderServiceLive().pipe(
+          Layer.provide(fakeSnapshotQueryLayer),
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
           ),
@@ -1969,6 +2006,7 @@ describe("agent browser access", () => {
     settingsOverrides?: Partial<
       Parameters<typeof ServerSettings.ServerSettingsService.layerTest>[0]
     >,
+    boundLogicalAgent?: LogicalAgentId,
   ) =>
     Effect.gen(function* () {
       const issued: Array<ThreadId> = [];
@@ -1992,7 +2030,16 @@ describe("agent browser access", () => {
             return undefined;
           }),
         revokeMcpCredential: (revoked) => Effect.sync(() => void revokedThreads.push(revoked)),
+        ...(boundLogicalAgent === undefined
+          ? {}
+          : {
+              resolveThreadLogicalAgent: () =>
+                Effect.succeed(Option.some(boundLogicalAgent)) as Effect.Effect<
+                  Option.Option<LogicalAgentId>
+                >,
+            }),
       }).pipe(
+        Layer.provide(fakeSnapshotQueryLayer),
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(
@@ -2082,6 +2129,49 @@ describe("agent browser access", () => {
       assert.deepEqual(issued, [threadId]);
       assert.deepEqual(issuedCapabilities, [new Set(["project.work.read", "project.work.write"])]);
       assert.deepEqual(revokedThreads, []);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  // Two project-enabled agents on one instance is the post-refactor norm: the
+  // thread's wake binding picks whose scopes apply. Unbound sessions on such
+  // an instance are agent-ambiguous and get no project tools.
+  it.effect("scopes a project credential to the thread's bound agent", () =>
+    Effect.gen(function* () {
+      const twoProjectAgents = {
+        enableAgentBrowserAccess: false,
+        projectServiceClient: { enabled: true },
+        logicalAgents: {
+          ag_codex: {
+            agentName: "Codex Agent",
+            providerInstanceId: codexInstanceId,
+            project: { enabled: true },
+          },
+          ag_second: {
+            agentName: "Second Agent",
+            providerInstanceId: codexInstanceId,
+            project: { enabled: true },
+          },
+        } as ServerSettingsValues["logicalAgents"],
+      };
+
+      const bound = yield* startSessionWith(
+        false,
+        asThreadId("thread-bound-agent"),
+        twoProjectAgents,
+        LogicalAgentId.make("ag_codex"),
+      );
+      assert.deepEqual(bound.issuedCapabilities, [
+        new Set(["project.work.read", "project.work.write"]),
+      ]);
+
+      // Same settings, no binding recorded on the thread → ambiguous → no
+      // project credential at all.
+      const unbound = yield* startSessionWith(
+        false,
+        asThreadId("thread-ambiguous"),
+        twoProjectAgents,
+      );
+      assert.deepEqual(unbound.issued, []);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

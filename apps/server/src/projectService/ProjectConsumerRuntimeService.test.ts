@@ -495,6 +495,8 @@ const configureIntegration = Effect.gen(function* () {
     [LogicalAgentId.make(AGENT_ID)]: {
       agentName: "Build agent",
       providerInstanceId: ProviderInstanceId.make("codex"),
+      persona: "",
+      modelOverride: null,
       project: { enabled: true },
     },
   };

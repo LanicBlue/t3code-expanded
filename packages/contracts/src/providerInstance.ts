@@ -82,6 +82,24 @@ export const isProviderDriverKind = (value: unknown): value is ProviderDriverKin
 export const ProviderInstanceId = slugSchema.pipe(Schema.brand("ProviderInstanceId"));
 export type ProviderInstanceId = typeof ProviderInstanceId.Type;
 
+// ── Logical agents ───────────────────────────────────────────────
+
+const LOGICAL_AGENT_ID_MAX_CHARS = 64;
+const LOGICAL_AGENT_ID_PATTERN = /^ag_[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
+
+/**
+ * Stable agent identity. Generated once (e.g. `ag_` + a UUID), immutable
+ * thereafter: threads and integrations reference it, so a rename only ever
+ * touches `agentName`. Lives beside the provider identity primitives (not in
+ * projectService) so orchestration payloads can reference it without an
+ * import cycle; projectService re-exports it for compatibility.
+ */
+export const LogicalAgentId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(LOGICAL_AGENT_ID_MAX_CHARS),
+  Schema.isPattern(LOGICAL_AGENT_ID_PATTERN),
+).pipe(Schema.brand("LogicalAgentId"));
+export type LogicalAgentId = typeof LogicalAgentId.Type;
+
 /**
  * Lightweight reference identifying which driver implements an instance.
  * Carried alongside `ProviderInstanceId` on wire shapes so consumers can

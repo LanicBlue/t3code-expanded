@@ -21,6 +21,8 @@ export function makeEmptyLogicalAgentConfig(
   return {
     agentName: "New agent",
     providerInstanceId,
+    persona: "",
+    modelOverride: null,
     project: { enabled: false },
   };
 }

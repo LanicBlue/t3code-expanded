@@ -1,4 +1,4 @@
-import type { ProviderInstanceId, ServerSettings } from "@t3tools/contracts";
+import type { LogicalAgentId, ProviderInstanceId, ServerSettings } from "@t3tools/contracts";
 
 import type * as McpInvocationContext from "./McpInvocationContext.ts";
 
@@ -16,24 +16,41 @@ import type * as McpInvocationContext from "./McpInvocationContext.ts";
 export const deriveMcpCapabilities = (
   settings: ServerSettings,
   providerInstanceId: ProviderInstanceId,
+  logicalAgentId?: LogicalAgentId | undefined,
 ): ReadonlySet<McpInvocationContext.McpCapability> => {
   const capabilities = new Set<McpInvocationContext.McpCapability>();
   if (settings.enableAgentBrowserAccess) {
     capabilities.add("preview");
   }
-  if (projectWorkEnabled(settings, providerInstanceId)) {
+  if (projectWorkEnabled(settings, providerInstanceId, logicalAgentId)) {
     capabilities.add("project.work.read");
     capabilities.add("project.work.write");
   }
   return capabilities;
 };
 
-/** True when the Project Service client is on and some logical agent routed to this provider instance has Project work enabled. */
+/**
+ * True when this session may use Project work tools.
+ *
+ * A BOUND session (wake threads carry their logical agent) answers for THAT
+ * agent: several Project-enabled agents may now ride one provider instance,
+ * each under its own binding. An UNBOUND session (human-created thread)
+ * keeps the legacy instance-wide answer, granted only while it stays
+ * unambiguous — exactly one Project-enabled agent on the instance. With two
+ * or more, an unbound session gets nothing rather than silently impersonating
+ * whichever agent happened to sort first.
+ */
 export const projectWorkEnabled = (
   settings: ServerSettings,
   providerInstanceId: ProviderInstanceId,
-): boolean =>
-  settings.projectServiceClient.enabled &&
-  Object.values(settings.logicalAgents).some(
-    (agent) => agent.providerInstanceId === providerInstanceId && agent.project.enabled,
+  logicalAgentId?: LogicalAgentId | undefined,
+): boolean => {
+  if (!settings.projectServiceClient.enabled) return false;
+  const eligible = Object.entries(settings.logicalAgents).filter(
+    ([, agent]) => agent.providerInstanceId === providerInstanceId && agent.project.enabled,
   );
+  if (logicalAgentId === undefined) {
+    return eligible.length === 1;
+  }
+  return eligible.some(([id]) => id === logicalAgentId);
+};

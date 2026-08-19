@@ -17,6 +17,8 @@ const WORKSPACE_ROOT = "/srv/registry";
 const agent = (overrides?: Partial<ServerSettings["logicalAgents"][LogicalAgentId]>) => ({
   agentName: "Agent One",
   providerInstanceId,
+  persona: "",
+  modelOverride: null,
   project: { enabled: true },
   ...overrides,
 });
@@ -39,6 +41,8 @@ const serviceProjects = (dirs: ReadonlyArray<string>) =>
 
 const resolve = (input: {
   readonly logicalAgents: Record<string, ReturnType<typeof agent>>;
+  /** The session's bound logical agent; omitted for unbound sessions. */
+  readonly logicalAgentId?: string | undefined;
   /** `undefined` simulates a project shell whose root could not be read. */
   readonly workspaceRoot?: string | undefined;
   readonly serviceProjects: ReadonlyArray<{
@@ -50,6 +54,9 @@ const resolve = (input: {
   resolveProjectToolContext({
     settings: settingsWith(input.logicalAgents, input.enabled ?? true),
     providerInstanceId,
+    ...(input.logicalAgentId === undefined
+      ? {}
+      : { logicalAgentId: input.logicalAgentId as LogicalAgentId }),
     t3ProjectId,
     workspaceRoot: "workspaceRoot" in input ? input.workspaceRoot : WORKSPACE_ROOT,
     serviceProjects: input.serviceProjects,
@@ -135,13 +142,49 @@ describe("resolveProjectToolContext", () => {
     expect(resolution).toEqual({ ok: false, reason: "agent-project-disabled" });
   });
 
-  it("answers agent-ambiguous when several agents on this instance have project work enabled", () => {
+  it("answers agent-ambiguous for UNBOUND sessions when several agents on this instance have project work enabled", () => {
     const resolution = resolve({
       logicalAgents: { ag_one: agent(), ag_two: agent() },
       serviceProjects: serviceProjects([WORKSPACE_ROOT]),
     });
 
     expect(resolution).toEqual({ ok: false, reason: "agent-ambiguous" });
+  });
+
+  it("a BOUND session resolves its own agent when several share the instance", () => {
+    const first = resolve({
+      logicalAgents: { ag_one: agent(), ag_two: agent() },
+      logicalAgentId: "ag_one",
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
+    });
+    const second = resolve({
+      logicalAgents: { ag_one: agent(), ag_two: agent() },
+      logicalAgentId: "ag_two",
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
+    });
+    expect(first).toMatchObject({ ok: true, context: { logicalAgentId: "ag_one" } });
+    expect(second).toMatchObject({ ok: true, context: { logicalAgentId: "ag_two" } });
+  });
+
+  it("a bound session whose agent lacks Project work answers agent-project-disabled", () => {
+    const resolution = resolve({
+      logicalAgents: {
+        ag_one: agent(),
+        ag_off: { ...agent(), project: { enabled: false } },
+      },
+      logicalAgentId: "ag_off",
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
+    });
+    expect(resolution).toEqual({ ok: false, reason: "agent-project-disabled" });
+  });
+
+  it("a bound session whose agent rides another instance answers agent-project-disabled", () => {
+    const resolution = resolve({
+      logicalAgents: { ag_one: agent(), ag_far: { ...agent(), providerInstanceId: otherInstance } },
+      logicalAgentId: "ag_far",
+      serviceProjects: serviceProjects([WORKSPACE_ROOT]),
+    });
+    expect(resolution).toEqual({ ok: false, reason: "agent-project-disabled" });
   });
 
   it("answers project-not-registered when no Project Service project shares the directory", () => {

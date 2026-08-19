@@ -372,6 +372,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           threadId: command.threadId,
           projectId: command.projectId,
           title: command.title,
+          ...(command.logicalAgentId === undefined
+            ? {}
+            : { logicalAgentId: command.logicalAgentId }),
           modelSelection: command.modelSelection,
           runtimeMode: command.runtimeMode,
           interactionMode: command.interactionMode,

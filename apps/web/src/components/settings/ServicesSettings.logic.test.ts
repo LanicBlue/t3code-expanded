@@ -22,6 +22,8 @@ describe("makeEmptyLogicalAgentConfig", () => {
     expect(makeEmptyLogicalAgentConfig(ProviderInstanceId.make("codex"))).toEqual({
       agentName: "New agent",
       providerInstanceId: "codex",
+      persona: "",
+      modelOverride: null,
       project: { enabled: false },
     });
   });

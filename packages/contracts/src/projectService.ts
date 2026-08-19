@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { ModelSelection } from "./orchestration.ts";
 
 // ── Client credential ────────────────────────────────────────────
 
@@ -135,25 +136,34 @@ export type ProjectServiceClientSettingsPatch = typeof ProjectServiceClientSetti
 
 // ── Logical agents ───────────────────────────────────────────────
 
-const LOGICAL_AGENT_ID_MAX_CHARS = 64;
-const LOGICAL_AGENT_ID_PATTERN = /^ag_[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
+// Identity moved to providerInstance.ts (beside ProviderInstanceId) so
+// orchestration payloads can reference it without an import cycle; the
+// re-export keeps every existing import path working.
+export { LogicalAgentId } from "./providerInstance.ts";
+import { LogicalAgentId } from "./providerInstance.ts";
 
-/**
- * Stable agent identity. Generated once (e.g. `ag_` + a UUID), immutable
- * thereafter: threads and future integrations reference it, so a rename only
- * ever touches `agentName`.
- */
-export const LogicalAgentId = TrimmedNonEmptyString.check(
-  Schema.isMaxLength(LOGICAL_AGENT_ID_MAX_CHARS),
-  Schema.isPattern(LOGICAL_AGENT_ID_PATTERN),
-).pipe(Schema.brand("LogicalAgentId"));
-export type LogicalAgentId = typeof LogicalAgentId.Type;
+export const LOGICAL_AGENT_PERSONA_MAX_CHARS = 4000;
 
 export const LogicalAgentConfig = Schema.Struct({
   /** Mutable display name; changing it changes nothing else. */
   agentName: TrimmedNonEmptyString,
   /** Routing to a provider instance; no provider credential is duplicated. */
   providerInstanceId: ProviderInstanceId,
+  /**
+   * Role directive for this agent: WHO it is and HOW it should work (the
+   * Project Service work prompt is WHAT to do — the two compose). Injected
+   * into the agent's wake sessions; empty string = no directive.
+   */
+  persona: TrimmedString.check(Schema.isMaxLength(LOGICAL_AGENT_PERSONA_MAX_CHARS)).pipe(
+    Schema.withDecodingDefault(Effect.succeed("")),
+  ),
+  /**
+   * Optional model selection that wins over the project default for this
+   * agent's wake sessions; null = follow the usual resolution.
+   */
+  modelOverride: Schema.NullOr(ModelSelection).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   project: Schema.Struct({
     enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),

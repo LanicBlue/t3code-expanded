@@ -65,6 +65,10 @@ export interface ProjectWorkRoutingTarget {
   readonly logicalAgentId: LogicalAgentId;
   readonly agentName: string;
   readonly providerInstanceId: string;
+  /** Role directive for this agent; prepended to every wake notification. */
+  readonly persona: string;
+  /** Agent-level model override; null follows the usual resolution. */
+  readonly modelOverride: ModelSelection | null;
   /** The Project Service project the notice named. */
   readonly projectServiceProjectId: string;
   /** Display name from the NOTICE (never a local binding); may be blank. */
@@ -78,6 +82,8 @@ export interface ProjectWorkAgentRouting {
   readonly logicalAgentId: LogicalAgentId;
   readonly agentName: string;
   readonly providerInstanceId: string;
+  readonly persona: string;
+  readonly modelOverride: ModelSelection | null;
   readonly projectServiceProjectId: string;
   readonly projectName: string;
 }
@@ -136,6 +142,8 @@ export const resolveProjectWorkRouting = (
       logicalAgentId: logicalAgentId as LogicalAgentId,
       agentName: agentConfig.agentName,
       providerInstanceId: agentConfig.providerInstanceId,
+      persona: agentConfig.persona,
+      modelOverride: agentConfig.modelOverride,
       projectServiceProjectId: input.projectId,
       projectName: input.projectName ?? "",
     },
@@ -168,6 +176,20 @@ export const aggregateWorkNotificationMessage = (openWorkCount: number): string 
   openWorkCount === 1
     ? "There is 1 assigned Work item waiting. Use the Project tools to inspect it."
     : `There are ${openWorkCount} assigned Work items waiting. Use the Project tools to inspect them.`;
+
+/**
+ * Persona is the agent's role directive (WHO it is, HOW it works); the work
+ * prompt from the Project Service is WHAT to do — the two compose. Prepended
+ * to every wake notification as user-role text: it is the one channel every
+ * provider adapter already consumes identically.
+ */
+export const composeWorkWakeMessage = (persona: string, openWorkCount: number): string => {
+  const directive = persona.trim();
+  const base = aggregateWorkNotificationMessage(openWorkCount);
+  return directive.length === 0
+    ? base
+    : `<agent_directives>\n${directive}\n</agent_directives>\n\n${base}`;
+};
 
 /** Title for sessions this integration creates; display-only. */
 export const workSessionThreadTitle = (
@@ -383,9 +405,12 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       }
       const projectDefault = project.defaultModelSelection;
       const model =
-        projectDefault !== null && projectDefault.instanceId === target.providerInstanceId
-          ? projectDefault.model
-          : (DEFAULT_MODEL_BY_PROVIDER[driverKind.value] ?? DEFAULT_MODEL);
+        target.modelOverride !== null &&
+        target.modelOverride.instanceId === target.providerInstanceId
+          ? target.modelOverride.model
+          : projectDefault !== null && projectDefault.instanceId === target.providerInstanceId
+            ? projectDefault.model
+            : (DEFAULT_MODEL_BY_PROVIDER[driverKind.value] ?? DEFAULT_MODEL);
       return {
         instanceId: target.providerInstanceId as ModelSelection["instanceId"],
         model,
@@ -512,6 +537,8 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         logicalAgentId: resolution.routing.logicalAgentId,
         agentName: resolution.routing.agentName,
         providerInstanceId: resolution.routing.providerInstanceId,
+        persona: resolution.routing.persona,
+        modelOverride: resolution.routing.modelOverride,
         projectServiceProjectId: resolution.routing.projectServiceProjectId,
         projectName: resolution.routing.projectName,
         t3ProjectId,
@@ -546,7 +573,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       message: {
         messageId: MessageId.make(yield* deps.newId),
         role: "user",
-        text: aggregateWorkNotificationMessage(count),
+        text: composeWorkWakeMessage(target.persona, count),
         attachments: [],
       },
       runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,
@@ -589,6 +616,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         threadId,
         projectId: target.t3ProjectId,
         title: workSessionThreadTitle(target.projectName, target.projectServiceProjectId),
+        logicalAgentId: target.logicalAgentId,
         modelSelection,
         runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,
         interactionMode: DEFAULT_ROUTING_INTERACTION_MODE,

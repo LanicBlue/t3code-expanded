@@ -9,6 +9,7 @@
 import {
   CommandId,
   IsoDateTime,
+  LogicalAgentId,
   ModelSelection,
   NonNegativeInt,
   ProjectId,
@@ -28,6 +29,8 @@ export const ProjectionThread = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   title: Schema.String,
+  /** Logical agent the thread serves; null for human-created threads. */
+  logicalAgentId: Schema.NullOr(LogicalAgentId),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,

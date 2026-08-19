@@ -20,6 +20,7 @@ import {
   ProviderSessionStartInput,
   ProviderStopSessionInput,
   type ProviderInstanceId,
+  type LogicalAgentId,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
   type ProviderSession,
@@ -59,6 +60,7 @@ import * as McpCapabilities from "../../mcp/McpCapabilities.ts";
 import type * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 const isModelSelection = Schema.is(ModelSelection);
 
@@ -78,6 +80,13 @@ export interface ProviderServiceLiveOptions {
   readonly issueMcpCredential?: typeof McpSessionRegistry.issueActiveMcpCredential;
   /** Same seam as `issueMcpCredential`, for observing the deny path's revoke. */
   readonly revokeMcpCredential?: typeof McpSessionRegistry.revokeActiveMcpThread;
+  /**
+   * Reads a thread's wake binding (which logical agent it serves). Default:
+   * the persisted thread shell. Injectable so tests can pin a binding.
+   */
+  readonly resolveThreadLogicalAgent?: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<LogicalAgentId>>;
 }
 
 type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["Service"]> =
@@ -228,10 +237,36 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const issueMcpCredential =
     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
   const revokeMcpCredential =
     options?.revokeMcpCredential ?? McpSessionRegistry.revokeActiveMcpThread;
+  const resolveThreadLogicalAgent =
+    options?.resolveThreadLogicalAgent ??
+    ((threadId: ThreadId) =>
+      // An unreadable shell must never break session start: that prepare
+      // loses the binding and falls back to instance-level resolution.
+      snapshotQuery.getThreadShellById(threadId).pipe(
+        Effect.map((shell) =>
+          Option.isSome(shell) &&
+          shell.value.logicalAgentId !== null &&
+          shell.value.logicalAgentId !== undefined
+            ? Option.some(shell.value.logicalAgentId)
+            : Option.none<LogicalAgentId>(),
+        ),
+        // Silent here would be silent wrong: an operator who just bound a
+        // wake thread to an agent would see the session come up
+        // "unbound" (agent-ambiguous on a multi-agent instance, i.e. no
+        // Project tools) with nothing in the log pointing at the read.
+        Effect.tapError((cause) =>
+          Effect.logWarning(
+            "Could not read the thread shell; MCP session resolves its agent as unbound for this start.",
+            { threadId, cause },
+          ),
+        ),
+        Effect.orElseSucceed(() => Option.none<LogicalAgentId>()),
+      ));
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   /**
@@ -252,9 +287,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
    * "off" silently becoming "on" would violate the user's stated choice,
    * whereas the reverse costs an agent one toolset and is visible immediately.
    */
-  const mcpAttachmentCapabilities = (providerInstanceId: ProviderInstanceId) =>
+  const mcpAttachmentCapabilities = (
+    providerInstanceId: ProviderInstanceId,
+    logicalAgentId: LogicalAgentId | null,
+  ) =>
     serverSettings.getSettings.pipe(
-      Effect.map((settings) => McpCapabilities.deriveMcpCapabilities(settings, providerInstanceId)),
+      Effect.map((settings) =>
+        McpCapabilities.deriveMcpCapabilities(
+          settings,
+          providerInstanceId,
+          logicalAgentId ?? undefined,
+        ),
+      ),
       Effect.catch((cause) =>
         Effect.logWarning(
           "Could not read server settings; withholding agent MCP toolsets for this session.",
@@ -265,7 +309,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     Effect.gen(function* () {
-      const capabilities = yield* mcpAttachmentCapabilities(providerInstanceId);
+      const boundAgent = yield* resolveThreadLogicalAgent(threadId);
+      const capabilities = yield* mcpAttachmentCapabilities(
+        providerInstanceId,
+        Option.getOrNull(boundAgent),
+      );
       if (capabilities.size === 0) {
         // Revoke as well as clear. Every other prepare path reaches
         // `issueActiveMcpCredential`, which revokes the thread first, so
@@ -280,6 +328,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const credential = yield* issueMcpCredential({
         threadId,
         providerInstanceId,
+        ...(Option.isSome(boundAgent) ? { logicalAgentId: boundAgent.value } : {}),
         capabilities,
       });
       if (credential) {

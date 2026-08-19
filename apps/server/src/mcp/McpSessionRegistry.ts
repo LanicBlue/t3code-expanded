@@ -1,4 +1,4 @@
-import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { LogicalAgentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -14,6 +14,8 @@ import * as McpProviderSession from "./McpProviderSession.ts";
 export interface McpCredentialRequest {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
+  /** The logical agent this session serves, when the thread carries a wake binding. */
+  readonly logicalAgentId?: LogicalAgentId | undefined;
   /**
    * Capability scopes for the credential. Derived from live settings by the
    * attachment path so a browser-off session can still carry Project scopes;
@@ -134,6 +136,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         threadId: ThreadId.make(request.threadId),
         providerSessionId,
         providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
+        ...(request.logicalAgentId === undefined
+          ? {}
+          : { logicalAgentId: LogicalAgentId.make(request.logicalAgentId) }),
         capabilities: request.capabilities
           ? new Set(request.capabilities)
           : new Set<McpInvocationContext.McpCapability>(["preview"]),

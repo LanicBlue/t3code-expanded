@@ -804,6 +804,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             [LogicalAgentId.make("ag_one")]: {
               agentName: "Ghost rider",
               providerInstanceId: ProviderInstanceId.make("ghost_instance"),
+              persona: "",
+              modelOverride: null,
               project: { enabled: false },
             },
           },
@@ -821,6 +823,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           [LogicalAgentId.make("ag_one")]: {
             agentName: "Build agent",
             providerInstanceId: ProviderInstanceId.make("codex"),
+            persona: "",
+            modelOverride: null,
             project: { enabled: false },
           },
         },
@@ -829,22 +833,51 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
-  it.effect("issue #6 review: at most ONE Project-enabled agent per provider instance", () =>
+  it.effect("several Project-enabled agents may share one provider instance", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
 
+      // The one-agent-per-instance guard is gone: wake threads stamp their
+      // logical agent (thread.create -> logicalAgentId) and MCP credentials
+      // carry it, so tool calls resolve identity from the session binding.
+      // Only unbound sessions fall back to instance-level resolution, which
+      // the tool layer gates (see resolveProjectToolContext).
+      const next = yield* serverSettings.updateSettings({
+        logicalAgents: {
+          [LogicalAgentId.make("ag_build")]: {
+            agentName: "Build agent",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            persona: "",
+            modelOverride: null,
+            project: { enabled: true },
+          },
+          [LogicalAgentId.make("ag_review")]: {
+            agentName: "Review agent",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            persona: "",
+            modelOverride: null,
+            project: { enabled: true },
+          },
+          [LogicalAgentId.make("ag_other")]: {
+            agentName: "Other agent",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            persona: "",
+            modelOverride: null,
+            project: { enabled: true },
+          },
+        },
+      });
+      assert.equal(Object.keys(next.logicalAgents).length, 3);
+      // The rejected-reference rule still stands on its own.
       const error = yield* Effect.flip(
         serverSettings.updateSettings({
           logicalAgents: {
-            [LogicalAgentId.make("ag_build")]: {
-              agentName: "Build agent",
-              providerInstanceId: ProviderInstanceId.make("codex"),
-              project: { enabled: true },
-            },
-            [LogicalAgentId.make("ag_review")]: {
-              agentName: "Review agent",
-              providerInstanceId: ProviderInstanceId.make("codex"),
-              project: { enabled: true },
+            [LogicalAgentId.make("ag_ghost")]: {
+              agentName: "Ghost",
+              providerInstanceId: ProviderInstanceId.make("ghost_instance"),
+              persona: "",
+              modelOverride: null,
+              project: { enabled: false },
             },
           },
         }),
@@ -852,35 +885,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.deepInclude(error, {
         _tag: "ServerSettingsError",
         operation: "validate",
-        providerInstanceId: "codex",
+        providerInstanceId: "ghost_instance",
       });
-      assert.match(
-        error.cause instanceof Error ? error.cause.message : "",
-        /multiple Project-enabled logical agents \(ag_build, ag_review\)/,
-      );
-
-      // Different instances stay legal; so does a second agent with Project
-      // work disabled on the SAME instance.
-      const next = yield* serverSettings.updateSettings({
-        logicalAgents: {
-          [LogicalAgentId.make("ag_build")]: {
-            agentName: "Build agent",
-            providerInstanceId: ProviderInstanceId.make("codex"),
-            project: { enabled: true },
-          },
-          [LogicalAgentId.make("ag_review")]: {
-            agentName: "Review agent",
-            providerInstanceId: ProviderInstanceId.make("codex"),
-            project: { enabled: false },
-          },
-          [LogicalAgentId.make("ag_other")]: {
-            agentName: "Other agent",
-            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
-            project: { enabled: true },
-          },
-        },
-      });
-      assert.equal(Object.keys(next.logicalAgents).length, 3);
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -893,6 +899,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           [LogicalAgentId.make("ag_stable")]: {
             agentName: "Build agent",
             providerInstanceId: ProviderInstanceId.make("codex"),
+            persona: "",
+            modelOverride: null,
             project: { enabled: true },
           },
         },
@@ -928,6 +936,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           [LogicalAgentId.make("ag_one")]: {
             agentName: "Build agent",
             providerInstanceId: ProviderInstanceId.make("codex_personal"),
+            persona: "",
+            modelOverride: null,
             project: { enabled: false },
           },
         },
@@ -978,6 +988,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         [LogicalAgentId.make("ag_one")]: {
           agentName: "Build agent",
           providerInstanceId: ProviderInstanceId.make("codex"),
+          persona: "",
+          modelOverride: null,
           project: { enabled: true },
           projectBindings: [{ projectId: "proj_9", projectName: "Wiki", t3ProjectId: "local-1" }],
         },
@@ -989,6 +1001,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.deepEqual(next.logicalAgents[LogicalAgentId.make("ag_one")], {
         agentName: "Build agent",
         providerInstanceId: ProviderInstanceId.make("codex"),
+        persona: "",
+        modelOverride: null,
         project: { enabled: true },
       });
     }).pipe(Effect.provide(makeServerSettingsLayer())),

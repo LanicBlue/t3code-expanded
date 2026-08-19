@@ -35,6 +35,7 @@ import { primaryServerProvidersAtom, serverEnvironment } from "../../state/serve
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { Textarea } from "../ui/textarea";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
@@ -211,6 +212,9 @@ function AgentRow({
   });
   const patchAgent = (next: LogicalAgentConfig) =>
     updateSettings({ logicalAgents: nextAgentMapWithAgent(agentMap, agentId, next) });
+  const personaInput = useCommitOnBlur<HTMLTextAreaElement>(agent.persona, (persona) => {
+    patchAgent({ ...agent, persona });
+  });
 
   return (
     <SettingsRow
@@ -268,6 +272,12 @@ function AgentRow({
             Project work enabled
           </label>
         </div>
+        <Textarea
+          {...personaInput}
+          aria-label={`Persona for ${agent.agentName}`}
+          placeholder="Persona（角色人设）：这个 agent 是谁、以什么方式工作。留空 = 无。"
+          className="min-h-[56px] w-full font-mono text-[11px]"
+        />
       </div>
     </SettingsRow>
   );

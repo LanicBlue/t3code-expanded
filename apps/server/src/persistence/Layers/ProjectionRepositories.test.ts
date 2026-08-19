@@ -1,4 +1,4 @@
-import { ProjectId, ThreadId, ProviderInstanceId } from "@t3tools/contracts";
+import { ProjectId, ThreadId, ProviderInstanceId, LogicalAgentId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -80,6 +80,7 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
         threadId: ThreadId.make("thread-null-options"),
         projectId: ProjectId.make("project-null-options"),
         title: "Null options thread",
+        logicalAgentId: null,
         modelSelection: {
           instanceId: ProviderInstanceId.make("claudeAgent"),
           model: "claude-opus-4-6",
@@ -143,6 +144,7 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
         threadId: ThreadId.make("thread-settled"),
         projectId: ProjectId.make("project-1"),
         title: "Settled thread",
+        logicalAgentId: null,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5.4",
@@ -199,6 +201,53 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
       assert.strictEqual(updated?.snoozedUntil, null);
       assert.strictEqual(updated?.snoozedAt, null);
       assert.strictEqual(updated?.pinnedAt, null);
+    }),
+  );
+
+  it.effect("round-trips a thread's wake-bound logical agent id", () =>
+    Effect.gen(function* () {
+      const threads = yield* ProjectionThreadRepository;
+
+      const base = {
+        threadId: ThreadId.make("thread-agent-bound"),
+        projectId: ProjectId.make("project-1"),
+        title: "Agent-bound thread",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-opus-4-6",
+        },
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        branch: null,
+        worktreePath: null,
+        latestTurnId: null,
+        createdAt: "2026-03-24T00:00:00.000Z",
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        snoozedUntil: null,
+        snoozedAt: null,
+        pinnedAt: null,
+        latestUserMessageAt: null,
+        pendingApprovalCount: 0,
+        pendingUserInputCount: 0,
+        hasActionableProposedPlan: 0,
+        deletedAt: null,
+      };
+
+      yield* threads.upsert({ ...base, logicalAgentId: LogicalAgentId.make("ag_coder") });
+      const persisted = Option.getOrNull(
+        yield* threads.getById({ threadId: ThreadId.make("thread-agent-bound") }),
+      );
+      assert.strictEqual(persisted?.logicalAgentId, "ag_coder");
+
+      // A later upsert without a binding must overwrite, not keep the stale id.
+      yield* threads.upsert({ ...base, logicalAgentId: null });
+      const cleared = Option.getOrNull(
+        yield* threads.getById({ threadId: ThreadId.make("thread-agent-bound") }),
+      );
+      assert.strictEqual(cleared?.logicalAgentId, null);
     }),
   );
 });
