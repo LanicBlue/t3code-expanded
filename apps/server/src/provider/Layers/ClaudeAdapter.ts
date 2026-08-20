@@ -4142,6 +4142,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
         ...(fastMode ? { fastMode: true } : {}),
         ...(ultracode ? { ultracode: true } : {}),
+        // Pin the auto-compact window per session when the instance
+        // configures one: the CLI otherwise derives its compaction
+        // threshold from CLAUDE_CODE_AUTO_COMPACT_WINDOW in the (shared)
+        // global Claude config, which may be tuned for a different model
+        // than this instance runs — a 400k global window on a 200k model
+        // silently disables compaction entirely.
+        ...(claudeSettings.autoCompactWindow !== null &&
+        claudeSettings.autoCompactWindow !== undefined
+          ? { autoCompactWindow: claudeSettings.autoCompactWindow }
+          : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
       // The attachments dir grant lets the agent Read/copy pasted images at

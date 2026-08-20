@@ -5,10 +5,14 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   ClientSettingsSchema,
   ClientSettingsPatch,
+  ClaudeSettings,
   DEFAULT_SERVER_SETTINGS,
   ServerSettings,
   ServerSettingsPatch,
 } from "./settings.ts";
+
+const decodeClaudeSettings = (input: unknown): ClaudeSettings =>
+  Schema.decodeUnknownSync(ClaudeSettings)(input);
 
 const decodeClientSettings = Schema.decodeUnknownSync(ClientSettingsSchema);
 const decodeClientSettingsPatch = Schema.decodeUnknownSync(ClientSettingsPatch);
@@ -305,5 +309,21 @@ describe("ServerSettingsPatch string normalization", () => {
     expect(encoded.addProjectBaseDirectory).toBe("~/Development");
     expect(encoded.providers?.codex?.binaryPath).toBe("/opt/homebrew/bin/codex");
     expect(encoded.providers?.codex?.launchArgs).toBe("--strict-config");
+  });
+});
+
+describe("ClaudeSettings autoCompactWindow", () => {
+  it("defaults to null (follow the CLI global config)", () => {
+    expect(decodeClaudeSettings({}).autoCompactWindow).toBe(null);
+  });
+
+  it("accepts the offered levels and rejects others", () => {
+    expect(decodeClaudeSettings({ autoCompactWindow: 400_000 }).autoCompactWindow).toBe(400_000);
+    expect(decodeClaudeSettings({ autoCompactWindow: 200_000 }).autoCompactWindow).toBe(200_000);
+    expect(decodeClaudeSettings({ autoCompactWindow: 1_000_000 }).autoCompactWindow).toBe(
+      1_000_000,
+    );
+    expect(() => decodeClaudeSettings({ autoCompactWindow: 300_000 })).toThrow();
+    expect(() => decodeClaudeSettings({ autoCompactWindow: "400000" })).toThrow();
   });
 });

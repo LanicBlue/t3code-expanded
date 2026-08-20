@@ -451,6 +451,44 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("passes the instance auto-compact window into query settings when configured", () => {
+    const harness = makeHarness({
+      claudeConfig: { autoCompactWindow: 400_000 },
+    });
+    const bare = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const settings = harness.getLastCreateQueryInput()?.options.settings;
+      assert.equal((settings as Record<string, unknown> | undefined)?.autoCompactWindow, 400_000);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+      Effect.andThen(
+        Effect.gen(function* () {
+          // Unset (null) leaves the key absent so the CLI's global config wins.
+          const adapter = yield* ClaudeAdapter;
+          yield* adapter.startSession({
+            threadId: THREAD_ID,
+            provider: ProviderDriverKind.make("claudeAgent"),
+            runtimeMode: "full-access",
+          });
+          const settings = bare.getLastCreateQueryInput()?.options.settings as
+            | Record<string, unknown>
+            | undefined;
+          assert.isUndefined(settings?.autoCompactWindow);
+        }).pipe(
+          Effect.provideService(Random.Random, makeDeterministicRandomService()),
+          Effect.provide(bare.layer),
+        ),
+      ),
+    );
+  });
+
   it.effect("forwards claude effort levels into query options", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

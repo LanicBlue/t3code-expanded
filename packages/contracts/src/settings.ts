@@ -267,13 +267,21 @@ const makeBinaryPathSetting = (fallback: string) =>
     Schema.withDecodingDefault(Effect.succeed(fallback)),
   );
 
-export type ProviderSettingsFormControl = "text" | "password" | "textarea" | "switch";
+export type ProviderSettingsFormControl = "text" | "password" | "textarea" | "switch" | "select";
+
+export interface ProviderSettingsFormSelectOption {
+  /** Serialized field value; the empty string means "unset/cleared". */
+  readonly value: string;
+  readonly label: string;
+}
 
 export interface ProviderSettingsFormAnnotation {
   readonly control?: ProviderSettingsFormControl | undefined;
   readonly placeholder?: string | undefined;
   readonly hidden?: boolean | undefined;
   readonly clearWhenEmpty?: "omit" | "persist" | undefined;
+  /** Required for `control: "select"`; the first option should be the unset one. */
+  readonly options?: ReadonlyArray<ProviderSettingsFormSelectOption> | undefined;
 }
 
 export interface ProviderSettingsFormSchemaAnnotation {
@@ -399,9 +407,31 @@ export const ClaudeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    autoCompactWindow: Schema.NullOr(Schema.Literals([200_000, 400_000, 1_000_000])).pipe(
+      Schema.withDecodingDefault(Effect.succeed(null)),
+      Schema.annotateKey({
+        title: "Auto-compact window",
+        description:
+          "Per-session override of the Claude auto-compact window, in tokens. " +
+          "The Claude CLI derives its compaction threshold from this window; " +
+          "a global CLAUDE_CODE_AUTO_COMPACT_WINDOW tuned for another model " +
+          "(e.g. 400k on a 1M model) silently disables compaction on smaller " +
+          "windows, so instances can pin the level they actually run. " +
+          "Unset = follow the CLI's global configuration.",
+        providerSettingsForm: {
+          control: "select",
+          options: [
+            { value: "", label: "Follow global config" },
+            { value: "200000", label: "200k" },
+            { value: "400000", label: "400k" },
+            { value: "1000000", label: "1M" },
+          ],
+        },
+      }),
+    ),
   },
   {
-    order: ["binaryPath", "homePath", "launchArgs"],
+    order: ["binaryPath", "homePath", "launchArgs", "autoCompactWindow"],
   },
 );
 export type ClaudeSettings = typeof ClaudeSettings.Type;
@@ -745,6 +775,9 @@ const ClaudeSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
   homePath: Schema.optionalKey(TrimmedString),
+  autoCompactWindow: Schema.optionalKey(
+    Schema.NullOr(Schema.Literals([200_000, 400_000, 1_000_000])),
+  ),
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
   launchArgs: Schema.optionalKey(TrimmedString),
 });

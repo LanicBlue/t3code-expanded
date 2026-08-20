@@ -12,6 +12,7 @@ import type {
 import { cn } from "../../lib/utils";
 import { DraftInput } from "../ui/draft-input";
 import { Input } from "../ui/input";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import type { ProviderClientDefinition } from "./providerDriverMeta";
@@ -24,6 +25,7 @@ export interface ProviderSettingsFieldModel {
   readonly placeholder?: string | undefined;
   readonly clearWhenEmpty: "omit" | "persist";
   readonly defaultBooleanValue?: boolean | undefined;
+  readonly options?: ReadonlyArray<{ readonly value: string; readonly label: string }> | undefined;
 }
 
 function titleizeFieldKey(key: string): string {
@@ -106,9 +108,16 @@ export function deriveProviderSettingsFields(
           ...(formAnnotation.control === "switch"
             ? { defaultBooleanValue: readFieldBooleanDefault(fieldSchema) }
             : {}),
+          ...(formAnnotation.options !== undefined ? { options: formAnnotation.options } : {}),
         } satisfies ProviderSettingsFieldModel,
       ];
     });
+}
+
+/** Raw (untyped) read for controls that need the original JSON value. */
+export function readProviderConfigRaw(config: unknown, key: string): unknown {
+  if (config === null || typeof config !== "object") return undefined;
+  return (config as Record<string, unknown>)[key];
 }
 
 export function readProviderConfigString(config: unknown, key: string): string {
@@ -130,10 +139,25 @@ export function readProviderConfigBoolean(
 export function nextProviderConfigWithFieldValue(
   config: unknown,
   field: ProviderSettingsFieldModel,
-  value: string | boolean,
+  value: string | boolean | number | null,
 ): Record<string, unknown> | undefined {
   const base: Record<string, unknown> =
     config !== null && typeof config === "object" ? { ...(config as Record<string, unknown>) } : {};
+
+  if (value === null) {
+    // Selects use null as their explicit "unset" answer.
+    if (field.clearWhenEmpty === "omit") {
+      delete base[field.key];
+    } else {
+      base[field.key] = null;
+    }
+    return Object.keys(base).length > 0 ? base : undefined;
+  }
+
+  if (typeof value === "number") {
+    base[field.key] = value;
+    return Object.keys(base).length > 0 ? base : undefined;
+  }
 
   if (typeof value === "boolean") {
     const emptyBooleanValue = field.defaultBooleanValue ?? false;
@@ -213,6 +237,56 @@ function ProviderSettingsFieldRow({
             aria-label={field.label}
           />
         </div>
+      </FieldFrame>
+    );
+  }
+
+  if (field.control === "select") {
+    const options = field.options ?? [];
+    const rawValue = readProviderConfigRaw(value, field.key);
+    // Serialized comparison: schema values are numbers; "" is the unset row.
+    const selected = rawValue === null || rawValue === undefined ? "" : String(rawValue);
+    return (
+      <FieldFrame variant={variant}>
+        <label htmlFor={inputId} className={cn(variant === "card" && "block")}>
+          {label}
+          <Select
+            value={selected}
+            onValueChange={(next) => {
+              if (next === null || next === "") {
+                onChange(nextProviderConfigWithFieldValue(value, field, null));
+                return;
+              }
+              const numeric = Number(next);
+              onChange(
+                nextProviderConfigWithFieldValue(
+                  value,
+                  field,
+                  Number.isFinite(numeric) ? numeric : next,
+                ),
+              );
+            }}
+          >
+            <SelectTrigger
+              id={inputId}
+              size="sm"
+              className={cn("mt-1.5 w-full sm:w-44", variant === "dialog" && "bg-background")}
+              aria-label={field.label}
+            >
+              <SelectValue>
+                {options.find((option) => option.value === selected)?.label ?? selected}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectPopup align="start">
+              {options.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
+          {description}
+        </label>
       </FieldFrame>
     );
   }
