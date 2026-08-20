@@ -210,13 +210,20 @@ export const applyThinkLevelToOptions = (
   return [...existing, { id: effortOptionId, value: level }];
 };
 
-/** Title for sessions this integration creates; display-only. */
+/**
+ * Title for sessions this integration creates; display-only. The agent name
+ * leads so same-project sessions from different agents are distinguishable
+ * in the thread list; the project name disambiguates one agent across
+ * projects.
+ */
 export const workSessionThreadTitle = (
+  agentName: string,
   projectName: string,
   projectServiceProjectId: string,
 ): string => {
-  const name = projectName.trim();
-  return `Project Work — ${name.length > 0 ? name : projectServiceProjectId}`;
+  const project = projectName.trim();
+  const projectLabel = project.length > 0 ? project : projectServiceProjectId;
+  return `${agentName.trim()} — ${projectLabel}`;
 };
 
 // ── Router ───────────────────────────────────────────────────────
@@ -646,7 +653,11 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         commandId: CommandId.make(yield* deps.newId),
         threadId,
         projectId: target.t3ProjectId,
-        title: workSessionThreadTitle(target.projectName, target.projectServiceProjectId),
+        title: workSessionThreadTitle(
+          target.agentName,
+          target.projectName,
+          target.projectServiceProjectId,
+        ),
         logicalAgentId: target.logicalAgentId,
         modelSelection,
         runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,

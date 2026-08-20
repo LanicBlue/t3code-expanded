@@ -488,11 +488,15 @@ it("notification message and session title formats", () => {
     aggregateWorkNotificationMessage(1),
     "There is 1 assigned Work item waiting. Use the Project tools to inspect it.",
   );
-  assert.strictEqual(workSessionThreadTitle("Registry", PS_PROJECT_ID), "Project Work — Registry");
+  // The agent name leads so same-project sessions stay distinguishable.
+  assert.strictEqual(
+    workSessionThreadTitle("coder", "Registry", PS_PROJECT_ID),
+    "coder — Registry",
+  );
   // A blank project name falls back to the stable id, never an empty title.
   assert.strictEqual(
-    workSessionThreadTitle("  ", PS_PROJECT_ID),
-    `Project Work — ${PS_PROJECT_ID}`,
+    workSessionThreadTitle("coder", "  ", PS_PROJECT_ID),
+    `coder — ${PS_PROJECT_ID}`,
   );
 });
 
@@ -620,7 +624,7 @@ it.effect("missing project: the wake creates it under the notice's directory", (
     assert.strictEqual(
       threadCreates(harness.commands)[0]?.type === "thread.create" &&
         threadCreates(harness.commands)[0]?.title,
-      "Project Work — Registry",
+      "Primary Agent — Registry",
     );
     // The thread is stamped with the logical agent the wake routed to, so
     // MCP tool calls resolve identity from the session, not the instance.
@@ -723,11 +727,12 @@ it.effect("a name-less notice titles the project from the directory", () =>
 
     const created = projectCreates(harness.commands)[0];
     assert.strictEqual(created?.type === "project.create" && created.title, "registry");
-    // The thread title falls back to the stable Project Service id.
+    // The thread title falls back to the stable Project Service id for the
+    // project part; the agent name still leads.
     assert.strictEqual(
       threadCreates(harness.commands)[0]?.type === "thread.create" &&
         threadCreates(harness.commands)[0]?.title,
-      `Project Work — ${PS_PROJECT_ID}`,
+      `Primary Agent — ${PS_PROJECT_ID}`,
     );
   }),
 );
