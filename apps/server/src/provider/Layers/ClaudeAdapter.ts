@@ -4110,6 +4110,23 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
       const claudeBinaryPath = claudeSdkExecutablePath;
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
+      // The instance's auto-compact window rides a --settings env block —
+      // the one channel that outranks the user-level settings env. The CLI
+      // applies settings env to process.env at startup (stomping any value
+      // set on the child), and its window resolution reads the env var
+      // before the settings key, so both an inherited global and the SDK
+      // `settings.autoCompactWindow` key lose silently. An explicit
+      // launchArgs `--settings` still wins over ours.
+      if (
+        claudeSettings.autoCompactWindow !== null &&
+        claudeSettings.autoCompactWindow !== undefined &&
+        extraArgs.settings === undefined
+      ) {
+        extraArgs.settings =
+          encodeJsonStringForDiagnostics({
+            env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(claudeSettings.autoCompactWindow) },
+          }) ?? "{}";
+      }
       const agentPersona = input.agentPersona;
       const boundModelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;

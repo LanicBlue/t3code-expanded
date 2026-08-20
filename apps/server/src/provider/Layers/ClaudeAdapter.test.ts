@@ -465,6 +465,13 @@ describe("ClaudeAdapterLive", () => {
       });
       const settings = harness.getLastCreateQueryInput()?.options.settings;
       assert.equal((settings as Record<string, unknown> | undefined)?.autoCompactWindow, 400_000);
+      // The env var beats the settings key in the CLI's window resolution,
+      // so the window must also ride a --settings env block on the CLI args.
+      const extraArgs = harness.getLastCreateQueryInput()?.options.extraArgs;
+      assert.equal(
+        (extraArgs as Record<string, string | null> | undefined)?.settings,
+        '{"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"400000"}}',
+      );
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
