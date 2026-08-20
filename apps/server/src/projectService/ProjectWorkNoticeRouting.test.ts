@@ -488,16 +488,12 @@ it("notification message and session title formats", () => {
     aggregateWorkNotificationMessage(1),
     "There is 1 assigned Work item waiting. Use the Project tools to inspect it.",
   );
-  // The agent name leads so same-project sessions stay distinguishable.
-  assert.strictEqual(
-    workSessionThreadTitle("coder", "Registry", PS_PROJECT_ID),
-    "coder — Registry",
-  );
-  // A blank project name falls back to the stable id, never an empty title.
-  assert.strictEqual(
-    workSessionThreadTitle("coder", "  ", PS_PROJECT_ID),
-    `coder — ${PS_PROJECT_ID}`,
-  );
+  // The agent name alone titles the session — the UI already groups sessions
+  // by project, so same-project sessions stay distinguishable by agent.
+  assert.strictEqual(workSessionThreadTitle("coder"), "coder");
+  // Whitespace trims; an agent name is never blank in practice, but the title
+  // must not carry stray padding either way.
+  assert.strictEqual(workSessionThreadTitle("  coder  "), "coder");
 });
 
 describe("wake message and agent-level model parameters", () => {
@@ -624,7 +620,7 @@ it.effect("missing project: the wake creates it under the notice's directory", (
     assert.strictEqual(
       threadCreates(harness.commands)[0]?.type === "thread.create" &&
         threadCreates(harness.commands)[0]?.title,
-      "Primary Agent — Registry",
+      "Primary Agent",
     );
     // The thread is stamped with the logical agent the wake routed to, so
     // MCP tool calls resolve identity from the session, not the instance.
@@ -719,20 +715,22 @@ it.effect(
     }),
 );
 
-it.effect("a name-less notice titles the project from the directory", () =>
+it.effect("a name-less notice titles the project from the stable Project Service id", () =>
   Effect.gen(function* () {
     const harness = yield* makeHarness(makeSettings());
 
     yield* harness.router.routeWake(wakeInput({ projectName: undefined }));
 
+    // One naming authority: the project title reuses the Project Service
+    // name; with no name to reuse the stable id stands in — the directory
+    // never leaks into titles.
     const created = projectCreates(harness.commands)[0];
-    assert.strictEqual(created?.type === "project.create" && created.title, "registry");
-    // The thread title falls back to the stable Project Service id for the
-    // project part; the agent name still leads.
+    assert.strictEqual(created?.type === "project.create" && created.title, PS_PROJECT_ID);
+    // The thread title is the agent name alone regardless.
     assert.strictEqual(
       threadCreates(harness.commands)[0]?.type === "thread.create" &&
         threadCreates(harness.commands)[0]?.title,
-      `Primary Agent — ${PS_PROJECT_ID}`,
+      "Primary Agent",
     );
   }),
 );

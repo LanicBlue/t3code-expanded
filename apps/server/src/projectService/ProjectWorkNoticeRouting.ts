@@ -212,19 +212,10 @@ export const applyThinkLevelToOptions = (
 
 /**
  * Title for sessions this integration creates; display-only. The agent name
- * leads so same-project sessions from different agents are distinguishable
- * in the thread list; the project name disambiguates one agent across
- * projects.
+ * alone — the T3 UI already groups sessions by project, so the project half
+ * would only duplicate the grouping.
  */
-export const workSessionThreadTitle = (
-  agentName: string,
-  projectName: string,
-  projectServiceProjectId: string,
-): string => {
-  const project = projectName.trim();
-  const projectLabel = project.length > 0 ? project : projectServiceProjectId;
-  return `${agentName.trim()} — ${projectLabel}`;
-};
+export const workSessionThreadTitle = (agentName: string): string => agentName.trim();
 
 // ── Router ───────────────────────────────────────────────────────
 
@@ -350,12 +341,6 @@ const routingKeyParts = (key: string): { readonly agentId: string; readonly proj
     agentId: separator === -1 ? key : key.slice(0, separator),
     projectId: separator === -1 ? "" : key.slice(separator + 2),
   };
-};
-
-/** Last path segment of a normalized workspace root (bootstrap-precedent style). */
-const workspaceRootBasename = (workspaceRoot: string): string => {
-  const segments = workspaceRoot.split(/[/\\]/).filter(Boolean);
-  return segments.at(-1) ?? "";
 };
 
 export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRouter")(function* (
@@ -509,9 +494,11 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         });
       }
       const t3ProjectId = ProjectId.make(yield* deps.newId);
+      // The auto-created project's title reuses the Project Service project's
+      // name verbatim (falling back to its stable id on a name-less notice) —
+      // one naming authority, no directory-derived alternatives.
       const noticeName = agentRouting.projectName.trim();
-      const title =
-        (noticeName.length > 0 ? noticeName : workspaceRootBasename(workspaceRoot)) || "project";
+      const title = noticeName.length > 0 ? noticeName : agentRouting.projectServiceProjectId;
       const created = yield* deps
         .dispatchCommand({
           type: "project.create",
@@ -653,11 +640,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         commandId: CommandId.make(yield* deps.newId),
         threadId,
         projectId: target.t3ProjectId,
-        title: workSessionThreadTitle(
-          target.agentName,
-          target.projectName,
-          target.projectServiceProjectId,
-        ),
+        title: workSessionThreadTitle(target.agentName),
         logicalAgentId: target.logicalAgentId,
         modelSelection,
         runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,
