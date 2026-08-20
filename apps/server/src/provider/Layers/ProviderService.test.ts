@@ -2016,6 +2016,9 @@ describe("agent browser access", () => {
         ProviderAdapterRegistry.ProviderAdapterRegistry,
         makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
       );
+      // Exposed so tests can inspect what the adapter was actually started
+      // with (vi.fn call log), not just the credential side effects.
+      void codex;
       const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
         Layer.provide(SqlitePersistenceMemory),
       );
@@ -2067,7 +2070,9 @@ describe("agent browser access", () => {
         });
       }).pipe(Effect.provide(providerLayer));
 
-      return { issued, issuedCapabilities };
+      // `codex` exposes the fake adapter's vi.fn call log so tests can
+      // assert what the adapter was actually started with.
+      return { issued, issuedCapabilities, codex };
     });
 
   // Credential issuance is the observable that matters: it is the only place a
@@ -2172,6 +2177,45 @@ describe("agent browser access", () => {
         twoProjectAgents,
       );
       assert.deepEqual(unbound.issued, []);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  // The persona is agent-level and read at start: the adapter receives it as
+  // a system-prompt directive, and an unbound thread receives none.
+  it.effect("passes the bound agent's persona to the adapter start input", () =>
+    Effect.gen(function* () {
+      const bound = yield* startSessionWith(
+        false,
+        asThreadId("thread-persona"),
+        {
+          enableAgentBrowserAccess: false,
+          logicalAgents: {
+            ag_codex: {
+              agentName: "Codex Agent",
+              providerInstanceId: codexInstanceId,
+              persona: "  You are the investigator.  ",
+              project: { enabled: true },
+            },
+          } as ServerSettingsValues["logicalAgents"],
+        },
+        LogicalAgentId.make("ag_codex"),
+      );
+      const startedWith = bound.codex.startSession.mock.calls[0]?.[0];
+      assert.equal(startedWith?.agentPersona, "You are the investigator.");
+
+      const unbound = yield* startSessionWith(false, asThreadId("thread-no-persona"), {
+        enableAgentBrowserAccess: false,
+        logicalAgents: {
+          ag_codex: {
+            agentName: "Codex Agent",
+            providerInstanceId: codexInstanceId,
+            persona: "You are the investigator.",
+            project: { enabled: true },
+          },
+        } as ServerSettingsValues["logicalAgents"],
+      });
+      const unboundStartedWith = unbound.codex.startSession.mock.calls[0]?.[0];
+      assert.isUndefined(unboundStartedWith?.agentPersona);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

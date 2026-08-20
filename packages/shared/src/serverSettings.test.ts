@@ -528,6 +528,7 @@ describe("project service + logical agents patching", () => {
     agentName: overrides.agentName ?? "Build agent",
     providerInstanceId: overrides.providerInstanceId ?? ProviderInstanceId.make("codex"),
     persona: "",
+    thinkLevel: null,
     modelOverride: null,
     project: { enabled: false },
   });

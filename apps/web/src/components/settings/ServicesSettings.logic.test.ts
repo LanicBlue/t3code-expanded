@@ -23,6 +23,7 @@ describe("makeEmptyLogicalAgentConfig", () => {
       agentName: "New agent",
       providerInstanceId: "codex",
       persona: "",
+      thinkLevel: null,
       modelOverride: null,
       project: { enabled: false },
     });

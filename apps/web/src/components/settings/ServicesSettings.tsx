@@ -187,6 +187,13 @@ function ProjectServiceClientSection() {
   );
 }
 
+/**
+ * Effort levels offered for an agent's thinkLevel. Free-form in the schema
+ * on purpose (drivers drop values their model does not support); the UI
+ * offers the levels the bundled drivers currently honor.
+ */
+const THINK_LEVEL_OPTIONS: ReadonlyArray<string> = ["", "low", "medium", "high", "xhigh", "max"];
+
 function AgentRow({
   agentId,
   agent,
@@ -271,6 +278,31 @@ function AgentRow({
             />
             Project work enabled
           </label>
+          <Select
+            value={agent.thinkLevel ?? ""}
+            onValueChange={(thinkLevel) => {
+              // "" = follow the model default; anything else is the effort
+              // level the agent's driver reads (drivers drop unsupported
+              // values themselves).
+              patchAgent({
+                ...agent,
+                thinkLevel: thinkLevel === null || thinkLevel === "" ? null : thinkLevel,
+              });
+            }}
+          >
+            <SelectTrigger size="sm" className="w-36" aria-label="Think level">
+              <SelectValue>
+                {agent.thinkLevel === null ? "Think: default" : `Think: ${agent.thinkLevel}`}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectPopup align="start">
+              {THINK_LEVEL_OPTIONS.map((level) => (
+                <SelectItem key={level} value={level}>
+                  {level === "" ? "Default" : level}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
         </div>
         <Textarea
           {...personaInput}

@@ -419,6 +419,38 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("appends the bound agent's persona to the claude_code system prompt preset", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+        agentPersona: "You are the investigator; analyze, never edit.",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.deepEqual(createInput?.options.systemPrompt, {
+        type: "preset",
+        preset: "claude_code",
+        append: "You are the investigator; analyze, never edit.",
+      });
+
+      // And a start without a persona keeps the bare preset.
+      yield* adapter.startSession({
+        threadId: ThreadId.make("thread-persona-free"),
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const bare = harness.getLastCreateQueryInput();
+      assert.deepEqual(bare?.options.systemPrompt, { type: "preset", preset: "claude_code" });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("forwards claude effort levels into query options", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

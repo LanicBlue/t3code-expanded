@@ -22,6 +22,7 @@ export function makeEmptyLogicalAgentConfig(
     agentName: "New agent",
     providerInstanceId,
     persona: "",
+    thinkLevel: null,
     modelOverride: null,
     project: { enabled: false },
   };

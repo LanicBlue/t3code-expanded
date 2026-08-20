@@ -151,11 +151,24 @@ export const LogicalAgentConfig = Schema.Struct({
   providerInstanceId: ProviderInstanceId,
   /**
    * Role directive for this agent: WHO it is and HOW it should work (the
-   * Project Service work prompt is WHAT to do — the two compose). Injected
-   * into the agent's wake sessions; empty string = no directive.
+   * Project Service work prompt is WHAT to do — the two compose). Folded
+   * into the system prompt of the agent's sessions at start time; empty
+   * string = no directive.
    */
   persona: TrimmedString.check(Schema.isMaxLength(LOGICAL_AGENT_PERSONA_MAX_CHARS)).pipe(
     Schema.withDecodingDefault(Effect.succeed("")),
+  ),
+  /**
+   * Optional reasoning-effort level for this agent's sessions (values like
+   * "low" | "medium" | "high" | "xhigh" | "max"; each driver drops values
+   * its model does not support). Applied as the provider option the
+   * agent's driver reads (Claude "effort", Codex "reasoningEffort") when
+   * the resolved model selection does not already carry one; null = follow
+   * the model default. A blank string is tolerated (treated as null at
+   * use time) so a hand-edited settings.json cannot brick the whole file.
+   */
+  thinkLevel: Schema.NullOr(TrimmedString.check(Schema.isMaxLength(24))).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   /**
    * Optional model selection that wins over the project default for this

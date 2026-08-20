@@ -21,7 +21,7 @@ import * as Option from "effect/Option";
 
 import {
   aggregateWorkNotificationMessage,
-  composeWorkWakeMessage,
+  applyThinkLevelToOptions,
   makeProjectWorkSessionRouter,
   type ProjectWorkSessionRouter,
   ProjectWorkRoutingError,
@@ -45,6 +45,7 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
       agentName: "Primary Agent",
       providerInstanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
       persona: "",
+      thinkLevel: null,
       modelOverride: null,
       project: { enabled: true },
     },
@@ -52,6 +53,7 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
       agentName: "Secondary Agent",
       providerInstanceId: ProviderInstanceId.make("other-instance"),
       persona: "",
+      thinkLevel: null,
       modelOverride: null,
       project: { enabled: false },
     },
@@ -441,7 +443,7 @@ it("routing resolution is id-based and structural", () => {
       logicalAgentId: LogicalAgentId.make(AGENT_ID),
       agentName: "Primary Agent",
       providerInstanceId: PROVIDER_INSTANCE,
-      persona: "",
+      thinkLevel: null,
       modelOverride: null,
       projectServiceProjectId: PS_PROJECT_ID,
       projectName: "Registry",
@@ -494,21 +496,8 @@ it("notification message and session title formats", () => {
   );
 });
 
-describe("composeWorkWakeMessage", () => {
-  it("returns the bare aggregate when the agent has no persona", () => {
-    assert.equal(composeWorkWakeMessage("", 2), aggregateWorkNotificationMessage(2));
-    assert.equal(composeWorkWakeMessage("   ", 1), aggregateWorkNotificationMessage(1));
-  });
-
-  it("prepends the persona as agent directives", () => {
-    const message = composeWorkWakeMessage("You are the reviewer.", 3);
-    assert.isTrue(
-      message.startsWith("<agent_directives>\nYou are the reviewer.\n</agent_directives>\n\n"),
-    );
-    assert.isTrue(message.endsWith(aggregateWorkNotificationMessage(3)));
-  });
-
-  it("persona rides the delivered aggregate turn", () =>
+describe("wake message and agent-level model parameters", () => {
+  it("the wake message is the bare aggregate regardless of persona (persona rides the system prompt now)", () =>
     Effect.gen(function* () {
       const settings = makeSettings((base) => ({
         ...base,
@@ -525,8 +514,56 @@ describe("composeWorkWakeMessage", () => {
       assert.strictEqual(
         turnStarts(harness.commands)[0]?.type === "thread.turn.start" &&
           turnStarts(harness.commands)[0]?.message.text,
-        composeWorkWakeMessage("You are the primary agent; be terse.", 2),
+        aggregateWorkNotificationMessage(2),
       );
+    }));
+
+  it("thinkLevel maps to the driver's effort option on the created thread", () =>
+    Effect.gen(function* () {
+      const settings = makeSettings((base) => ({
+        ...base,
+        logicalAgents: {
+          ...base.logicalAgents,
+          [LogicalAgentId.make(AGENT_ID)]: {
+            ...base.logicalAgents[LogicalAgentId.make(AGENT_ID)]!,
+            thinkLevel: "high",
+          },
+        },
+      }));
+      const harness = yield* makeHarness(settings);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      assert.deepEqual(
+        created?.type === "thread.create" && created.modelSelection.options,
+        // The harness resolves PROVIDER_INSTANCE as a codex instance, so the
+        // codex effort option id applies.
+        [{ id: "reasoningEffort", value: "high" }],
+      );
+    }));
+
+  it("an explicit effort option on the model override beats thinkLevel", () =>
+    Effect.gen(function* () {
+      const settings = makeSettings((base) => ({
+        ...base,
+        logicalAgents: {
+          ...base.logicalAgents,
+          [LogicalAgentId.make(AGENT_ID)]: {
+            ...base.logicalAgents[LogicalAgentId.make(AGENT_ID)]!,
+            thinkLevel: "low",
+            modelOverride: {
+              instanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
+              model: "override-model",
+              options: [{ id: "reasoningEffort", value: "max" }],
+            },
+          },
+        },
+      }));
+      const harness = yield* makeHarness(settings);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      assert.deepEqual(created?.type === "thread.create" && created.modelSelection.options, [
+        { id: "reasoningEffort", value: "max" },
+      ]);
     }));
 
   it("agent modelOverride targeting the agent's instance wins over the project default", () =>
@@ -1240,3 +1277,36 @@ it.effect("a deferred event after the resolved project vanished never re-creates
     assert.isTrue(sessions[0]?.pendingWork);
   }),
 );
+
+describe("applyThinkLevelToOptions", () => {
+  it("maps the driver's effort option id and leaves explicit selections alone", () => {
+    assert.deepEqual(applyThinkLevelToOptions(undefined, "high", "claudeAgent"), [
+      { id: "effort", value: "high" },
+    ]);
+    assert.deepEqual(applyThinkLevelToOptions(undefined, "high", "codex"), [
+      { id: "reasoningEffort", value: "high" },
+    ]);
+    // Cursor rides its own reasoning option id.
+    assert.deepEqual(applyThinkLevelToOptions(undefined, "high", "cursor"), [
+      { id: "reasoning", value: "high" },
+    ]);
+    // Drivers without a known effort option carry no thinkLevel at all.
+    assert.isNull(applyThinkLevelToOptions(undefined, "high", "grok"));
+    // Blank thinkLevel = follow the model default.
+    assert.isNull(applyThinkLevelToOptions(undefined, null, "codex"));
+    assert.isNull(applyThinkLevelToOptions(undefined, "   ", "claudeAgent"));
+    // An explicit effort option is the more specific intent and wins.
+    assert.deepEqual(
+      applyThinkLevelToOptions([{ id: "effort", value: "low" }], "high", "claudeAgent"),
+      [{ id: "effort", value: "low" }],
+    );
+    // Non-effort options ride along untouched.
+    assert.deepEqual(
+      applyThinkLevelToOptions([{ id: "fastMode", value: true }], "high", "claudeAgent"),
+      [
+        { id: "fastMode", value: true },
+        { id: "effort", value: "high" },
+      ],
+    );
+  });
+});

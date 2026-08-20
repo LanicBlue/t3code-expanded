@@ -65,8 +65,8 @@ export interface ProjectWorkRoutingTarget {
   readonly logicalAgentId: LogicalAgentId;
   readonly agentName: string;
   readonly providerInstanceId: string;
-  /** Role directive for this agent; prepended to every wake notification. */
-  readonly persona: string;
+  /** Agent-level reasoning effort; null follows the model default. */
+  readonly thinkLevel: string | null;
   /** Agent-level model override; null follows the usual resolution. */
   readonly modelOverride: ModelSelection | null;
   /** The Project Service project the notice named. */
@@ -82,7 +82,7 @@ export interface ProjectWorkAgentRouting {
   readonly logicalAgentId: LogicalAgentId;
   readonly agentName: string;
   readonly providerInstanceId: string;
-  readonly persona: string;
+  readonly thinkLevel: string | null;
   readonly modelOverride: ModelSelection | null;
   readonly projectServiceProjectId: string;
   readonly projectName: string;
@@ -142,7 +142,7 @@ export const resolveProjectWorkRouting = (
       logicalAgentId: logicalAgentId as LogicalAgentId,
       agentName: agentConfig.agentName,
       providerInstanceId: agentConfig.providerInstanceId,
-      persona: agentConfig.persona,
+      thinkLevel: agentConfig.thinkLevel,
       modelOverride: agentConfig.modelOverride,
       projectServiceProjectId: input.projectId,
       projectName: input.projectName ?? "",
@@ -178,17 +178,36 @@ export const aggregateWorkNotificationMessage = (openWorkCount: number): string 
     : `There are ${openWorkCount} assigned Work items waiting. Use the Project tools to inspect them.`;
 
 /**
- * Persona is the agent's role directive (WHO it is, HOW it works); the work
- * prompt from the Project Service is WHAT to do — the two compose. Prepended
- * to every wake notification as user-role text: it is the one channel every
- * provider adapter already consumes identically.
+ * The provider-option id each driver reads for reasoning effort. Drivers
+ * without a known effort option (grok, opencode) get none — thinkLevel then
+ * only applies where it can be honored.
  */
-export const composeWorkWakeMessage = (persona: string, openWorkCount: number): string => {
-  const directive = persona.trim();
-  const base = aggregateWorkNotificationMessage(openWorkCount);
-  return directive.length === 0
-    ? base
-    : `<agent_directives>\n${directive}\n</agent_directives>\n\n${base}`;
+const EFFORT_OPTION_ID_BY_DRIVER: Readonly<Record<string, string>> = {
+  claudeAgent: "effort",
+  cursor: "reasoning",
+  codex: "reasoningEffort",
+};
+
+/**
+ * Add the agent's thinkLevel as the driver's effort option unless the
+ * selection already carries one (explicit beats generic). Returns null when
+ * there is nothing to carry so callers can omit `options` entirely.
+ */
+export const applyThinkLevelToOptions = (
+  options: ModelSelection["options"] | undefined,
+  thinkLevel: string | null,
+  driverKind: string,
+): ModelSelection["options"] | null => {
+  const effortOptionId = EFFORT_OPTION_ID_BY_DRIVER[driverKind];
+  const level = thinkLevel?.trim() ?? "";
+  if (effortOptionId === undefined || level.length === 0) {
+    return options ?? null;
+  }
+  const existing = options ?? [];
+  if (existing.some((option) => option.id === effortOptionId)) {
+    return existing;
+  }
+  return [...existing, { id: effortOptionId, value: level }];
 };
 
 /** Title for sessions this integration creates; display-only. */
@@ -389,8 +408,13 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     });
 
   // The model a created session runs on: the agent's provider instance is
-  // fixed by routing; the model falls back from the project's default
-  // (when it targets the same instance) to the driver default.
+  // fixed by routing; the model (and its provider options — an override or
+  // project default carrying an effort selection keeps it) falls back from
+  // the agent's override to the project's default (same-instance guard) to
+  // the driver default. `thinkLevel` is the agent-level effort knob: it is
+  // applied as the option id the driver reads, and only when the resolved
+  // selection does not already carry one — an explicit option is the more
+  // specific intent and wins.
   const resolveModelSelection = Effect.fn("ProjectWorkSessionRouter.resolveModelSelection")(
     function* (
       target: ProjectWorkRoutingTarget,
@@ -403,17 +427,24 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           detail: `provider instance ${target.providerInstanceId} for agent ${target.logicalAgentId} is not available`,
         });
       }
-      const projectDefault = project.defaultModelSelection;
-      const model =
+      const override =
         target.modelOverride !== null &&
         target.modelOverride.instanceId === target.providerInstanceId
-          ? target.modelOverride.model
-          : projectDefault !== null && projectDefault.instanceId === target.providerInstanceId
-            ? projectDefault.model
-            : (DEFAULT_MODEL_BY_PROVIDER[driverKind.value] ?? DEFAULT_MODEL);
+          ? target.modelOverride
+          : null;
+      const projectDefault =
+        project.defaultModelSelection !== null &&
+        project.defaultModelSelection.instanceId === target.providerInstanceId
+          ? project.defaultModelSelection
+          : null;
+      const base = override ?? projectDefault;
+      const model = base?.model ?? DEFAULT_MODEL_BY_PROVIDER[driverKind.value] ?? DEFAULT_MODEL;
+      const appliedOptions =
+        applyThinkLevelToOptions(base?.options, target.thinkLevel, driverKind.value) ?? null;
       return {
         instanceId: target.providerInstanceId as ModelSelection["instanceId"],
         model,
+        ...(appliedOptions !== null ? { options: appliedOptions } : {}),
       } satisfies ModelSelection;
     },
   );
@@ -537,7 +568,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         logicalAgentId: resolution.routing.logicalAgentId,
         agentName: resolution.routing.agentName,
         providerInstanceId: resolution.routing.providerInstanceId,
-        persona: resolution.routing.persona,
+        thinkLevel: resolution.routing.thinkLevel,
         modelOverride: resolution.routing.modelOverride,
         projectServiceProjectId: resolution.routing.projectServiceProjectId,
         projectName: resolution.routing.projectName,
@@ -573,7 +604,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       message: {
         messageId: MessageId.make(yield* deps.newId),
         role: "user",
-        text: composeWorkWakeMessage(target.persona, count),
+        text: aggregateWorkNotificationMessage(count),
         attachments: [],
       },
       runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,

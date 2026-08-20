@@ -92,6 +92,8 @@ interface CodexAdapterSessionContext {
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
+  /** Bound logical agent's role directive from session start, if any. */
+  readonly agentPersona?: string | undefined;
   stopped: boolean;
 }
 
@@ -1761,6 +1763,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           runtime,
           eventFiber,
           stopped: false,
+          // The bound logical agent's role directive, resolved at start; it
+          // rides every turn's developer instructions (Codex has no
+          // session-level system-prompt channel).
+          agentPersona: input.agentPersona,
         });
         sessionScopeTransferred = true;
 
@@ -1830,6 +1836,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         ...(serviceTier ? { serviceTier } : {}),
         ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
         ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
+        ...(session.agentPersona !== undefined ? { agentPersona: session.agentPersona } : {}),
       })
       .pipe(Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)));
   });

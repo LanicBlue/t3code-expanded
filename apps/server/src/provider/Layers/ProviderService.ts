@@ -307,6 +307,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       ),
     );
 
+  /**
+   * The bound agent's role directive, read fresh from settings at every
+   * session start. Deliberately agent-level (not persisted on the thread):
+   * a persona edit applies to the next start/restart without re-creating
+   * wake threads, and every restart path funnels through startSession so
+   * the directive is re-applied everywhere. An unreadable binding or
+   * settings read must never block a session start — empty string means
+   * "no directive".
+   */
+  const resolveBoundAgentPersona = (threadId: ThreadId) =>
+    resolveThreadLogicalAgent(threadId).pipe(
+      Effect.flatMap((boundAgent) =>
+        Option.isNone(boundAgent)
+          ? Effect.succeed("")
+          : serverSettings.getSettings.pipe(
+              Effect.map(
+                (settings) => settings.logicalAgents[boundAgent.value]?.persona?.trim() ?? "",
+              ),
+              Effect.catch(() => Effect.succeed("")),
+            ),
+      ),
+      Effect.catch(() => Effect.succeed("")),
+    );
+
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     Effect.gen(function* () {
       const boundAgent = yield* resolveThreadLogicalAgent(threadId);
@@ -511,12 +535,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
+      // Recovery rebuilds the adapter session from persisted state; the
+      // persona is agent-level and re-resolved from settings so a recovered
+      // session keeps its directive (nothing else re-supplies it — the
+      // runtime payload deliberately does not persist prompt text).
+      const recoveredAgentPersona = yield* resolveBoundAgentPersona(input.binding.threadId);
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
       const resumed = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
           provider: input.binding.provider,
           providerInstanceId: bindingInstanceId,
+          ...(recoveredAgentPersona.length > 0 ? { agentPersona: recoveredAgentPersona } : {}),
           ...(persistedCwd ? { cwd: persistedCwd } : {}),
           ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
@@ -665,8 +695,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             `Provider instance '${resolvedInstanceId}' belongs to driver '${resolvedProvider}', not '${parsed.provider}'.`,
           );
         }
+        // `agentPersona` is server-resolved from the thread's bound agent;
+        // a caller-supplied value must never reach the adapter, so it is
+        // stripped here and re-attached (if any) from settings below.
+        const { agentPersona: _callerPersona, ...callerInput } = parsed;
+        void _callerPersona;
         const input = {
-          ...parsed,
+          ...callerInput,
           threadId,
           provider: resolvedProvider,
         };
@@ -707,11 +742,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.cwd.effective": effectiveCwd ?? "",
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
+        const boundAgentPersona = yield* resolveBoundAgentPersona(threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
         const session = yield* adapter
           .startSession({
             ...input,
             providerInstanceId: resolvedInstanceId,
+            ...(boundAgentPersona.length > 0 ? { agentPersona: boundAgentPersona } : {}),
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
           })

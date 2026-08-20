@@ -104,6 +104,7 @@ describe("ServerSettings project service surfaces", () => {
       agentName: "Build agent",
       providerInstanceId: "codex",
       persona: "",
+      thinkLevel: null,
       modelOverride: null,
       project: { enabled: true },
     });
@@ -120,9 +121,29 @@ describe("ServerSettings project service surfaces", () => {
       agentName: "A",
       providerInstanceId: "codex",
       persona: "",
+      thinkLevel: null,
       modelOverride: null,
       project: { enabled: false },
     });
+  });
+
+  it("tolerates a blank hand-edited thinkLevel instead of rejecting the file", () => {
+    // A hand-edited "" must decode (treated as no think level at use time);
+    // rejecting it would take the whole settings file down.
+    expect(
+      decodeLogicalAgentConfig({
+        agentName: "A",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        thinkLevel: "",
+      }).thinkLevel,
+    ).toBe("");
+    expect(
+      decodeLogicalAgentConfig({
+        agentName: "A",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        thinkLevel: "high",
+      }).thinkLevel,
+    ).toBe("high");
   });
 
   it("strips a stale projectBindings key from a hand-edited settings.json silently", () => {
@@ -146,6 +167,7 @@ describe("ServerSettings project service surfaces", () => {
       agentName: "Build agent",
       providerInstanceId: "codex",
       persona: "",
+      thinkLevel: null,
       modelOverride: null,
       project: { enabled: true },
     });
@@ -190,6 +212,7 @@ describe("ServerSettingsPatch project service surfaces", () => {
       agentName: "One",
       providerInstanceId: "codex",
       persona: "",
+      thinkLevel: null,
       modelOverride: null,
       project: { enabled: false },
     });

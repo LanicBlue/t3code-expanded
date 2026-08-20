@@ -189,12 +189,22 @@ export function buildCodexDeveloperInstructions(
    * setting, so the prompt cannot claim tools the turn doesn't have.
    */
   browserToolsAvailable = true,
+  /**
+   * Role directive for the logical agent the session's thread is bound to
+   * (WHO it is, HOW it works). Codex has no session-level system-prompt
+   * channel, so the directive rides developer instructions every turn.
+   * Undefined/empty = no directive.
+   */
+  agentPersona?: string | undefined,
 ): string {
   const base =
     interactionMode === "plan"
       ? codexPlanModeDeveloperInstructions(browserToolsAvailable)
       : codexDefaultModeDeveloperInstructions(browserToolsAvailable);
-  return `${base}
+  const directive = agentPersona?.trim() ?? "";
+  const personaBlock =
+    directive.length > 0 ? `\n\n<agent_directives>\n${directive}\n</agent_directives>` : "";
+  return `${base}${personaBlock}
 
 <runtime_info>In case you're asked: you are running in T3 Code through the Codex harness, as ${toSingleLine(runtime.model)} with ${toSingleLine(runtime.reasoningEffort)} reasoning effort. No need to mention this otherwise.</runtime_info>`;
 }

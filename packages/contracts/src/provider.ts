@@ -62,6 +62,13 @@ export const ProviderSessionStartInput = Schema.Struct({
   approvalPolicy: Schema.optional(ProviderApprovalPolicy),
   sandboxMode: Schema.optional(ProviderSandboxMode),
   runtimeMode: RuntimeMode,
+  /**
+   * Role directive for the logical agent this thread is bound to, resolved
+   * from settings at start time. Absent = no directive. Adapters fold it
+   * into their system-prompt channel (Claude: `claude_code` preset append;
+   * Codex: developer instructions) — never into user turn text.
+   */
+  agentPersona: Schema.optional(TrimmedNonEmptyString),
 });
 export type ProviderSessionStartInput = typeof ProviderSessionStartInput.Type;
 
