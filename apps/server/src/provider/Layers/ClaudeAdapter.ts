@@ -4110,23 +4110,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
       const claudeBinaryPath = claudeSdkExecutablePath;
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
-      // The instance's auto-compact window rides a --settings env block —
-      // the one channel that outranks the user-level settings env. The CLI
-      // applies settings env to process.env at startup (stomping any value
-      // set on the child), and its window resolution reads the env var
-      // before the settings key, so both an inherited global and the SDK
-      // `settings.autoCompactWindow` key lose silently. An explicit
-      // launchArgs `--settings` still wins over ours.
-      if (
-        claudeSettings.autoCompactWindow !== null &&
-        claudeSettings.autoCompactWindow !== undefined &&
-        extraArgs.settings === undefined
-      ) {
-        extraArgs.settings =
-          encodeJsonStringForDiagnostics({
-            env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(claudeSettings.autoCompactWindow) },
-          }) ?? "{}";
-      }
       const agentPersona = input.agentPersona;
       const boundModelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
@@ -4168,14 +4151,22 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(fastMode ? { fastMode: true } : {}),
         ...(ultracode ? { ultracode: true } : {}),
         // Pin the auto-compact window per session when the instance
-        // configures one: the CLI otherwise derives its compaction
-        // threshold from CLAUDE_CODE_AUTO_COMPACT_WINDOW in the (shared)
-        // global Claude config, which may be tuned for a different model
-        // than this instance runs — a 400k global window on a 200k model
-        // silently disables compaction entirely.
+        // configures one. Two keys are needed because of CLI precedence:
+        // its window resolution reads CLAUDE_CODE_AUTO_COMPACT_WINDOW from
+        // process.env before any settings key, and at startup the CLI
+        // applies the user-level settings env to process.env — overwriting
+        // whatever value the child was spawned with. The `env` block here
+        // rides the flag-settings source, the one tier that outranks the
+        // user-level env block, so the variable the resolver actually
+        // reads carries the instance value.
         ...(claudeSettings.autoCompactWindow !== null &&
         claudeSettings.autoCompactWindow !== undefined
-          ? { autoCompactWindow: claudeSettings.autoCompactWindow }
+          ? {
+              autoCompactWindow: claudeSettings.autoCompactWindow,
+              env: {
+                CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(claudeSettings.autoCompactWindow),
+              },
+            }
           : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
