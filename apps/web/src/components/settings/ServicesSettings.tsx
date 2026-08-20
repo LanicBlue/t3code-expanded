@@ -12,14 +12,14 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   type LogicalAgentConfig,
   type ProjectServiceConnectionTestResult,
-  ProviderInstanceId,
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { PlugZapIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { ChevronRightIcon, PlugZapIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import { useState } from "react";
 
 import { useCommitOnBlur } from "../../hooks/useCommitOnBlur";
@@ -35,8 +35,6 @@ import { primaryServerProvidersAtom, serverEnvironment } from "../../state/serve
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
-import { Textarea } from "../ui/textarea";
-import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import {
@@ -188,178 +186,71 @@ function ProjectServiceClientSection() {
 }
 
 /**
- * Effort levels offered for an agent's thinkLevel. Free-form in the schema
- * on purpose (drivers drop values their model does not support); the UI
- * offers the levels the bundled drivers currently honor.
+ * Effort levels offered for an agent's thinkLevel live on the agent detail
+ * page (AgentSettingsPanel) — the list keeps only the enable switch.
  */
-const THINK_LEVEL_OPTIONS: ReadonlyArray<string> = ["", "low", "medium", "high", "xhigh", "max"];
 
 function AgentRow({
   agentId,
   agent,
   agentMap,
-  instanceOptions,
-  modelOptionsByInstance,
   updateSettings,
 }: {
   readonly agentId: string;
   readonly agent: LogicalAgentConfig;
   readonly agentMap: Readonly<Record<string, LogicalAgentConfig>>;
-  readonly instanceOptions: ReadonlyArray<{
-    readonly id: ProviderInstanceId;
-    readonly label: string;
-  }>;
-  /** Catalog models per instance, for the agent's model-override picker. */
-  readonly modelOptionsByInstance: ReadonlyMap<
-    ProviderInstanceId,
-    ReadonlyArray<{ readonly slug: string; readonly name: string }>
-  >;
   readonly updateSettings: (patch: ServerSettingsPatch) => void;
 }) {
-  const nameInput = useCommitOnBlur(agent.agentName, (agentName) => {
-    if (agentName.trim().length > 0) {
-      updateSettings({
-        logicalAgents: nextAgentMapWithAgent(agentMap, agentId, { ...agent, agentName }),
-      });
-    }
-  });
-  const patchAgent = (next: LogicalAgentConfig) =>
-    updateSettings({ logicalAgents: nextAgentMapWithAgent(agentMap, agentId, next) });
-  const personaInput = useCommitOnBlur<HTMLTextAreaElement>(agent.persona, (persona) => {
-    patchAgent({ ...agent, persona });
-  });
+  const navigate = useNavigate();
 
   return (
     <SettingsRow
-      title={agent.agentName}
+      title={
+        <Link
+          to="/agents/$agentId"
+          params={{ agentId }}
+          className="font-medium hover:underline"
+          aria-label={`Configure agent ${agent.agentName}`}
+        >
+          {agent.agentName}
+        </Link>
+      }
       description={<span className="font-mono text-[11px]">{agentId}</span>}
       control={
-        <Button
-          variant="ghost-muted"
-          size="icon-sm"
-          aria-label={`Remove agent ${agent.agentName}`}
-          onClick={() =>
-            updateSettings({ logicalAgents: nextAgentMapWithoutAgent(agentMap, agentId) })
-          }
-        >
-          <Trash2Icon className="size-3.5" />
-        </Button>
-      }
-    >
-      <div className="mb-3 space-y-2 rounded-lg border border-border/60 bg-muted/20 p-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <Input {...nameInput} aria-label="Agent name" className="w-48" />
-          <Select
-            value={agent.providerInstanceId}
-            onValueChange={(providerInstanceId) => {
-              if (providerInstanceId !== null) {
-                patchAgent({
+        <div className="flex items-center gap-2">
+          <Switch
+            checked={agent.project.enabled}
+            onCheckedChange={(checked) =>
+              updateSettings({
+                logicalAgents: nextAgentMapWithAgent(agentMap, agentId, {
                   ...agent,
-                  providerInstanceId: ProviderInstanceId.make(providerInstanceId),
-                  // A model override is instance-scoped; moving the agent to
-                  // another instance would leave it pointing at a model the
-                  // new instance may not serve.
-                  modelOverride: null,
-                });
-              }
-            }}
-          >
-            <SelectTrigger size="sm" className="w-56" aria-label="Provider instance">
-              <SelectValue>
-                {instanceOptions.find((instance) => instance.id === agent.providerInstanceId)
-                  ?.label ?? agent.providerInstanceId}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectPopup align="start">
-              {instanceOptions.map((instance) => (
-                <SelectItem key={instance.id} value={instance.id}>
-                  {instance.label}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
-          <label className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Switch
-              checked={agent.project.enabled}
-              onCheckedChange={(checked) =>
-                patchAgent({ ...agent, project: { enabled: Boolean(checked) } })
-              }
-              aria-label="Project work enabled"
-            />
-            Project work enabled
-          </label>
-          <Select
-            value={
-              agent.modelOverride !== null &&
-              agent.modelOverride.instanceId === agent.providerInstanceId
-                ? agent.modelOverride.model
-                : ""
+                  project: { enabled: Boolean(checked) },
+                }),
+              })
             }
-            onValueChange={(model) => {
-              patchAgent({
-                ...agent,
-                modelOverride:
-                  model === null || model === ""
-                    ? null
-                    : {
-                        instanceId: agent.providerInstanceId,
-                        model,
-                      },
-              });
-            }}
+            aria-label={`Project work enabled for ${agent.agentName}`}
+          />
+          <Button
+            variant="ghost-muted"
+            size="icon-sm"
+            aria-label={`Remove agent ${agent.agentName}`}
+            onClick={() =>
+              updateSettings({ logicalAgents: nextAgentMapWithoutAgent(agentMap, agentId) })
+            }
           >
-            <SelectTrigger size="sm" className="w-44" aria-label="Model override">
-              <SelectValue>
-                {agent.modelOverride === null
-                  ? "Model: default"
-                  : agent.modelOverride.instanceId === agent.providerInstanceId
-                    ? `Model: ${agent.modelOverride.model}`
-                    : "Model: default"}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectPopup align="start">
-              <SelectItem value="">Default</SelectItem>
-              {(modelOptionsByInstance.get(agent.providerInstanceId) ?? []).map((model) => (
-                <SelectItem key={model.slug} value={model.slug}>
-                  {model.name}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
-          <Select
-            value={agent.thinkLevel ?? ""}
-            onValueChange={(thinkLevel) => {
-              // "" = follow the model default; anything else is the effort
-              // level the agent's driver reads (drivers drop unsupported
-              // values themselves).
-              patchAgent({
-                ...agent,
-                thinkLevel: thinkLevel === null || thinkLevel === "" ? null : thinkLevel,
-              });
-            }}
+            <Trash2Icon className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost-muted"
+            size="icon-sm"
+            aria-label={`Configure agent ${agent.agentName}`}
+            onClick={() => void navigate({ to: "/agents/$agentId", params: { agentId } })}
           >
-            <SelectTrigger size="sm" className="w-36" aria-label="Think level">
-              <SelectValue>
-                {agent.thinkLevel === null ? "Think: default" : `Think: ${agent.thinkLevel}`}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectPopup align="start">
-              {THINK_LEVEL_OPTIONS.map((level) => (
-                <SelectItem key={level} value={level}>
-                  {level === "" ? "Default" : level}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
+            <ChevronRightIcon className="size-3.5" />
+          </Button>
         </div>
-        <Textarea
-          {...personaInput}
-          aria-label={`Persona for ${agent.agentName}`}
-          placeholder="Persona（角色人设）：这个 agent 是谁、以什么方式工作。留空 = 无。"
-          className="min-h-[56px] w-full font-mono text-[11px]"
-        />
-      </div>
-    </SettingsRow>
+      }
+    />
   );
 }
 
@@ -368,27 +259,18 @@ function LogicalAgentsSection() {
   const agentMap = settings.logicalAgents;
   const updateSettings = useUpdatePrimarySettings();
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
+  const navigate = useNavigate();
 
   const providerEntries = sortProviderInstanceEntries(
     applyProviderInstanceSettings(deriveProviderInstanceEntries(serverProviders), settings),
   );
-  const instanceOptions = providerEntries.map((entry) => ({
-    id: entry.instanceId,
-    label: entry.displayName,
-  }));
-  const modelOptionsByInstance = new Map(
-    providerEntries.map((entry) => [
-      entry.instanceId,
-      entry.models.map((model) => ({ slug: model.slug, name: model.name })),
-    ]),
-  );
-  const defaultInstance = instanceOptions[0]?.id ?? null;
+  const defaultInstance = providerEntries[0]?.instanceId ?? null;
 
   return (
     <SettingsSection title="Logical Agents">
       <SettingsRow
         title="Agents"
-        description="Each agent is a stable identity (the ag_ id never changes) routed through one provider instance. Work notices route by workspace directory — no per-project configuration is needed here."
+        description="Each agent is a stable identity (the ag_ id never changes) routed through one provider instance. The list keeps the project-work switch; open an agent to edit its name, model, think level, and persona. Work notices route by workspace directory — no per-project configuration is needed here."
       >
         {Object.keys(agentMap).length === 0 ? (
           <p className="px-3 pb-3 text-xs text-muted-foreground sm:px-4">No agents yet.</p>
@@ -399,8 +281,6 @@ function LogicalAgentsSection() {
               agentId={agentId}
               agent={agent}
               agentMap={agentMap}
-              instanceOptions={instanceOptions}
-              modelOptionsByInstance={modelOptionsByInstance}
               updateSettings={updateSettings}
             />
           ))
@@ -412,13 +292,15 @@ function LogicalAgentsSection() {
             disabled={defaultInstance === null}
             onClick={() => {
               if (defaultInstance === null) return;
+              const newAgentId = makeLogicalAgentId(randomUUID());
               updateSettings({
                 logicalAgents: nextAgentMapWithAgent(
                   agentMap,
-                  makeLogicalAgentId(randomUUID()),
+                  newAgentId,
                   makeEmptyLogicalAgentConfig(defaultInstance),
                 ),
               });
+              void navigate({ to: "/agents/$agentId", params: { agentId: newAgentId } });
             }}
           >
             <PlusIcon className="size-3.5" />
