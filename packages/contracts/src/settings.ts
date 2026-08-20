@@ -407,6 +407,25 @@ export const ClaudeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    contextWindow: Schema.NullOr(Schema.Literals(["200k", "1m"])).pipe(
+      Schema.withDecodingDefault(Effect.succeed(null)),
+      Schema.annotateKey({
+        title: "Context window",
+        description:
+          "Default context window for sessions on this instance, applied when " +
+          'a session does not pick one itself. "1m" requests the model\'s ' +
+          "1M-context variant (model id [1m] suffix). Unset = the model's own " +
+          "default (200k for most models).",
+        providerSettingsForm: {
+          control: "select",
+          options: [
+            { value: "", label: "Model default" },
+            { value: "200k", label: "200k" },
+            { value: "1m", label: "1M" },
+          ],
+        },
+      }),
+    ),
     autoCompactWindow: Schema.NullOr(Schema.Literals([200_000, 400_000, 1_000_000])).pipe(
       Schema.withDecodingDefault(Effect.succeed(null)),
       Schema.annotateKey({
@@ -431,7 +450,7 @@ export const ClaudeSettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["binaryPath", "homePath", "launchArgs", "autoCompactWindow"],
+    order: ["binaryPath", "homePath", "launchArgs", "contextWindow", "autoCompactWindow"],
   },
 );
 export type ClaudeSettings = typeof ClaudeSettings.Type;
@@ -775,6 +794,7 @@ const ClaudeSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
   homePath: Schema.optionalKey(TrimmedString),
+  contextWindow: Schema.optionalKey(Schema.NullOr(Schema.Literals(["200k", "1m"]))),
   autoCompactWindow: Schema.optionalKey(
     Schema.NullOr(Schema.Literals([200_000, 400_000, 1_000_000])),
   ),

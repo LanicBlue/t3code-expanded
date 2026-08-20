@@ -461,6 +461,40 @@ export function resolveClaudeContextWindow(
   return typeof value === "string" ? value : undefined;
 }
 
+/**
+ * Apply the instance-level context-window default to a session's model
+ * selection. An explicit per-session `contextWindow` option always wins; the
+ * default is also dropped when the selected model's catalog entry does not
+ * offer that window (e.g. haiku has no choice, opus 4.7/4.8 are always 1M),
+ * so an instance default can never invent a window the model lacks.
+ */
+export function applyClaudeInstanceContextWindowDefault(
+  modelSelection: ModelSelection | undefined,
+  instanceWindow: "200k" | "1m" | null | undefined,
+): ModelSelection | undefined {
+  if (modelSelection === undefined || instanceWindow === null || instanceWindow === undefined) {
+    return modelSelection;
+  }
+  if (getModelSelectionStringOptionValue(modelSelection, "contextWindow") !== undefined) {
+    return modelSelection;
+  }
+  const descriptors = getProviderOptionDescriptors({
+    caps: getClaudeModelCapabilities(modelSelection.model),
+  });
+  const descriptor = descriptors.find((candidate) => candidate.id === "contextWindow");
+  const offered =
+    descriptor !== undefined &&
+    descriptor.type === "select" &&
+    descriptor.options.some((option) => option.id === instanceWindow);
+  if (!offered) {
+    return modelSelection;
+  }
+  return {
+    ...modelSelection,
+    options: [...(modelSelection.options ?? []), { id: "contextWindow", value: instanceWindow }],
+  };
+}
+
 export function resolveClaudeApiModelId(modelSelection: ModelSelection): string {
   switch (resolveClaudeContextWindow(modelSelection)) {
     case "1m":

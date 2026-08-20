@@ -81,6 +81,7 @@ import {
   getClaudeModelCapabilities,
   isClaudeUltracodeEffort,
   normalizeClaudeCliEffort,
+  applyClaudeInstanceContextWindowDefault,
   resolveClaudeApiModelId,
   resolveClaudeContextWindow,
   resolveClaudeEffort,
@@ -4110,8 +4111,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const claudeBinaryPath = claudeSdkExecutablePath;
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
       const agentPersona = input.agentPersona;
-      const modelSelection =
+      const boundModelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+      // The instance's context-window default rides under a session's own
+      // choice: explicit per-session selections win, and models that do not
+      // offer the window are left alone.
+      const modelSelection = applyClaudeInstanceContextWindowDefault(
+        boundModelSelection,
+        claudeSettings.contextWindow,
+      );
       const caps = getClaudeModelCapabilities(modelSelection?.model);
       const descriptors = getProviderOptionDescriptors({ caps });
       const apiModelId = modelSelection ? resolveClaudeApiModelId(modelSelection) : undefined;
@@ -4373,10 +4381,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
   const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
-    const modelSelection =
+    const boundTurnModelSelection =
       input.modelSelection !== undefined && input.modelSelection.instanceId === boundInstanceId
         ? input.modelSelection
         : undefined;
+    // Same instance context-window default as session start, so a mid-thread
+    // model change resolves to the same variant the session started with.
+    const turnModelSelection = applyClaudeInstanceContextWindowDefault(
+      boundTurnModelSelection,
+      claudeSettings.contextWindow,
+    );
 
     // A sendTurn while a real turn is running is a steer: the message is
     // queued into the live SDK agent loop and the work continues as the same
@@ -4389,8 +4403,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       yield* completeTurn(context, "completed");
     }
 
-    if (modelSelection?.model) {
-      const apiModelId = resolveClaudeApiModelId(modelSelection);
+    if (turnModelSelection?.model) {
+      const apiModelId = resolveClaudeApiModelId(turnModelSelection);
       if (context.currentApiModelId !== apiModelId) {
         yield* Effect.tryPromise({
           try: () => context.query.setModel(apiModelId),
@@ -4400,15 +4414,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
       context.session = {
         ...context.session,
-        model: modelSelection.model,
+        model: turnModelSelection.model,
       };
-      const turnCaps = getClaudeModelCapabilities(modelSelection.model);
+      const turnCaps = getClaudeModelCapabilities(turnModelSelection.model);
       const turnEffort = resolveClaudeEffort(
         turnCaps,
-        getModelSelectionStringOptionValue(modelSelection, "effort"),
+        getModelSelectionStringOptionValue(turnModelSelection, "effort"),
       );
       context.currentEffort =
-        getEffectiveClaudeAgentEffort(turnEffort ?? null, modelSelection.model) ?? undefined;
+        getEffectiveClaudeAgentEffort(turnEffort ?? null, turnModelSelection.model) ?? undefined;
     }
 
     // Apply interaction mode by switching the SDK's permission mode.
@@ -4456,7 +4470,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         createdAt: turnStartedStamp.createdAt,
         threadId: context.session.threadId,
         turnId,
-        payload: modelSelection?.model ? { model: modelSelection.model } : {},
+        payload: turnModelSelection?.model ? { model: turnModelSelection.model } : {},
         providerRefs: {},
       });
     }

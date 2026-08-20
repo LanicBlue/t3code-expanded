@@ -317,6 +317,14 @@ describe("ClaudeSettings autoCompactWindow", () => {
     expect(decodeClaudeSettings({}).autoCompactWindow).toBe(null);
   });
 
+  it("contextWindow defaults to null and only accepts the offered levels", () => {
+    expect(decodeClaudeSettings({}).contextWindow).toBe(null);
+    expect(decodeClaudeSettings({ contextWindow: "1m" }).contextWindow).toBe("1m");
+    expect(decodeClaudeSettings({ contextWindow: "200k" }).contextWindow).toBe("200k");
+    expect(() => decodeClaudeSettings({ contextWindow: "2m" })).toThrow();
+    expect(() => decodeClaudeSettings({ contextWindow: "1M" })).toThrow();
+  });
+
   it("accepts the offered levels and rejects others", () => {
     expect(decodeClaudeSettings({ autoCompactWindow: 400_000 }).autoCompactWindow).toBe(400_000);
     expect(decodeClaudeSettings({ autoCompactWindow: 200_000 }).autoCompactWindow).toBe(200_000);

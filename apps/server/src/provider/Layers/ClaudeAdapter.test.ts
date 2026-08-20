@@ -489,6 +489,52 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("applies the instance context-window default under the session's own choice", () => {
+    const oneMeg = makeHarness({ claudeConfig: { contextWindow: "1m" } });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      // Session carries no contextWindow option → instance default applies.
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-sonnet-5",
+        ),
+        runtimeMode: "full-access",
+      });
+      assert.equal(oneMeg.getLastCreateQueryInput()?.options.model, "claude-sonnet-5[1m]");
+
+      // Explicit per-session 200k wins over the instance default.
+      yield* adapter.startSession({
+        threadId: ThreadId.make("thread-cw-explicit"),
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-sonnet-5",
+          [{ id: "contextWindow", value: "200k" }],
+        ),
+        runtimeMode: "full-access",
+      });
+      assert.equal(oneMeg.getLastCreateQueryInput()?.options.model, "claude-sonnet-5");
+
+      // A model with no contextWindow options (haiku) is untouched.
+      yield* adapter.startSession({
+        threadId: ThreadId.make("thread-cw-haiku"),
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-haiku-4-5",
+        ),
+        runtimeMode: "full-access",
+      });
+      assert.equal(oneMeg.getLastCreateQueryInput()?.options.model, "claude-haiku-4-5");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(oneMeg.layer),
+    );
+  });
+
   it.effect("forwards claude effort levels into query options", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
