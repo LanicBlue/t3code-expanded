@@ -199,6 +199,7 @@ function AgentRow({
   agent,
   agentMap,
   instanceOptions,
+  modelOptionsByInstance,
   updateSettings,
 }: {
   readonly agentId: string;
@@ -208,6 +209,11 @@ function AgentRow({
     readonly id: ProviderInstanceId;
     readonly label: string;
   }>;
+  /** Catalog models per instance, for the agent's model-override picker. */
+  readonly modelOptionsByInstance: ReadonlyMap<
+    ProviderInstanceId,
+    ReadonlyArray<{ readonly slug: string; readonly name: string }>
+  >;
   readonly updateSettings: (patch: ServerSettingsPatch) => void;
 }) {
   const nameInput = useCommitOnBlur(agent.agentName, (agentName) => {
@@ -250,6 +256,10 @@ function AgentRow({
                 patchAgent({
                   ...agent,
                   providerInstanceId: ProviderInstanceId.make(providerInstanceId),
+                  // A model override is instance-scoped; moving the agent to
+                  // another instance would leave it pointing at a model the
+                  // new instance may not serve.
+                  modelOverride: null,
                 });
               }
             }}
@@ -278,6 +288,44 @@ function AgentRow({
             />
             Project work enabled
           </label>
+          <Select
+            value={
+              agent.modelOverride !== null &&
+              agent.modelOverride.instanceId === agent.providerInstanceId
+                ? agent.modelOverride.model
+                : ""
+            }
+            onValueChange={(model) => {
+              patchAgent({
+                ...agent,
+                modelOverride:
+                  model === null || model === ""
+                    ? null
+                    : {
+                        instanceId: agent.providerInstanceId,
+                        model,
+                      },
+              });
+            }}
+          >
+            <SelectTrigger size="sm" className="w-44" aria-label="Model override">
+              <SelectValue>
+                {agent.modelOverride === null
+                  ? "Model: default"
+                  : agent.modelOverride.instanceId === agent.providerInstanceId
+                    ? `Model: ${agent.modelOverride.model}`
+                    : "Model: default"}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectPopup align="start">
+              <SelectItem value="">Default</SelectItem>
+              {(modelOptionsByInstance.get(agent.providerInstanceId) ?? []).map((model) => (
+                <SelectItem key={model.slug} value={model.slug}>
+                  {model.name}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
           <Select
             value={agent.thinkLevel ?? ""}
             onValueChange={(thinkLevel) => {
@@ -321,9 +369,19 @@ function LogicalAgentsSection() {
   const updateSettings = useUpdatePrimarySettings();
   const serverProviders = useAtomValue(primaryServerProvidersAtom);
 
-  const instanceOptions = sortProviderInstanceEntries(
+  const providerEntries = sortProviderInstanceEntries(
     applyProviderInstanceSettings(deriveProviderInstanceEntries(serverProviders), settings),
-  ).map((entry) => ({ id: entry.instanceId, label: entry.displayName }));
+  );
+  const instanceOptions = providerEntries.map((entry) => ({
+    id: entry.instanceId,
+    label: entry.displayName,
+  }));
+  const modelOptionsByInstance = new Map(
+    providerEntries.map((entry) => [
+      entry.instanceId,
+      entry.models.map((model) => ({ slug: model.slug, name: model.name })),
+    ]),
+  );
   const defaultInstance = instanceOptions[0]?.id ?? null;
 
   return (
@@ -342,6 +400,7 @@ function LogicalAgentsSection() {
               agent={agent}
               agentMap={agentMap}
               instanceOptions={instanceOptions}
+              modelOptionsByInstance={modelOptionsByInstance}
               updateSettings={updateSettings}
             />
           ))
