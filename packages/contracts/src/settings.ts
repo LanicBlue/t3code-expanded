@@ -426,7 +426,9 @@ export const ClaudeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
-    autoCompactWindow: Schema.NullOr(Schema.Literals([200_000, 400_000, 1_000_000])).pipe(
+    autoCompactWindow: Schema.NullOr(
+      Schema.Literals([100_000, 150_000, 200_000, 400_000, 1_000_000]),
+    ).pipe(
       Schema.withDecodingDefault(Effect.succeed(null)),
       Schema.annotateKey({
         title: "Auto-compact window",
@@ -436,11 +438,16 @@ export const ClaudeSettings = makeProviderSettingsSchema(
           "a global CLAUDE_CODE_AUTO_COMPACT_WINDOW tuned for another model " +
           "(e.g. 400k on a 1M model) silently disables compaction on smaller " +
           "windows, so instances can pin the level they actually run. " +
-          "Unset = follow the CLI's global configuration.",
+          "Pick a level safely below the API backend's real input ceiling: " +
+          "on a 200k backend serving a [1m] variant the CLI asks for a 64k " +
+          "output budget, so requests fail above ~136k input regardless of " +
+          "the believed window. Unset = follow the CLI's global configuration.",
         providerSettingsForm: {
           control: "select",
           options: [
             { value: "", label: "Follow global config" },
+            { value: "100000", label: "100k" },
+            { value: "150000", label: "150k" },
             { value: "200000", label: "200k" },
             { value: "400000", label: "400k" },
             { value: "1000000", label: "1M" },
@@ -796,7 +803,7 @@ const ClaudeSettingsPatch = Schema.Struct({
   homePath: Schema.optionalKey(TrimmedString),
   contextWindow: Schema.optionalKey(Schema.NullOr(Schema.Literals(["200k", "1m"]))),
   autoCompactWindow: Schema.optionalKey(
-    Schema.NullOr(Schema.Literals([200_000, 400_000, 1_000_000])),
+    Schema.NullOr(Schema.Literals([100_000, 150_000, 200_000, 400_000, 1_000_000])),
   ),
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
   launchArgs: Schema.optionalKey(TrimmedString),
