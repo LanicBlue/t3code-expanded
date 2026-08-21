@@ -160,6 +160,13 @@ const EnvelopeError = Schema.Struct({
 /** A failure envelope on routes this module calls directly (not via the SDK). */
 const FailureEnvelope = Schema.Struct({ ok: Schema.Literals([false]), error: EnvelopeError });
 
+/** A spawned flow instance (tree branching): the child handle agents report upward. */
+export const ProjectFlowSpawnRecord = Schema.Struct({
+  instanceId: Schema.String,
+  eventId: Schema.String,
+});
+export type ProjectFlowSpawnRecord = typeof ProjectFlowSpawnRecord.Type;
+
 export const ProjectWorkOperationRecord = Schema.Union([
   Schema.Struct({
     status: Schema.Literals(["pending"]),
@@ -295,6 +302,20 @@ export class ProjectServiceWorkClient extends Context.Service<
     readonly getOperation: (
       operationId: string,
     ) => Effect.Effect<ProjectWorkOperationRecord | null, ProjectServiceWorkClientError>;
+    /**
+     * Tree-branch spawn (POST /:id/flow/instances): start a flow instance of a
+     * definition whose active version opted in via `consumerStartable`. The
+     * ordinary credential is the authorization; promptOverrides inject task
+     * prompts into the definition's works before the create (definition-level:
+     * same-definition parallel children clobber — spawn sequentially).
+     */
+    readonly startFlow: (input: {
+      readonly projectId: string;
+      readonly idempotencyKey: string;
+      readonly definitionId: string;
+      readonly name: string;
+      readonly promptOverrides?: Readonly<Record<string, string>>;
+    }) => Effect.Effect<ProjectFlowSpawnRecord, ProjectServiceWorkClientError>;
   }
 >()("t3/projectService/ProjectServiceWorkClient") {}
 
@@ -582,6 +603,20 @@ export const make = Effect.gen(function* () {
       agentId: input.agentId,
       result: input.result,
     }) as unknown as Parameters<ProjectConsumerWorkClient["submitRun"]>[0];
+  const startFlowArgs = (input: {
+    readonly projectId: string;
+    readonly idempotencyKey: string;
+    readonly definitionId: string;
+    readonly name: string;
+    readonly promptOverrides?: Readonly<Record<string, string>>;
+  }) =>
+    ({
+      projectId: input.projectId,
+      idempotencyKey: input.idempotencyKey,
+      definitionId: input.definitionId,
+      name: input.name,
+      ...(input.promptOverrides === undefined ? {} : { promptOverrides: input.promptOverrides }),
+    }) as Parameters<ProjectConsumerWorkClient["startFlow"]>[0];
 
   return ProjectServiceWorkClient.of({
     listProjects,
@@ -625,6 +660,12 @@ export const make = Effect.gen(function* () {
           value === null || value === undefined
             ? null
             : projectOperationRecord(decodeOrIncompatible(ProjectWorkOperationRecord, value)),
+      ),
+    startFlow: (input) =>
+      withClient(
+        undefined,
+        (client) => client.startFlow(startFlowArgs(input)),
+        (value) => decodeOrIncompatible(ProjectFlowSpawnRecord, value),
       ),
   });
 });

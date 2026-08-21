@@ -151,13 +151,23 @@ interface CapturedSubmit {
   readonly idempotencyKey: string;
 }
 
+interface CapturedSpawn {
+  readonly projectId: string;
+  readonly idempotencyKey: string;
+  readonly definitionId: string;
+  readonly name: string;
+  readonly promptOverrides?: Readonly<Record<string, string>>;
+}
+
 const makeWorkClientLayer = (overrides?: {
   readonly runs?: readonly ProjectServiceWorkClient.ProjectWorkRunRecord[];
   readonly positions?: readonly ProjectServiceWorkClient.ProjectWorkPositionRecord[];
   readonly run?: ProjectServiceWorkClient.ProjectWorkRunRecord | null;
   readonly serviceProjects?: readonly ProjectServiceWorkClient.ProjectServiceProjectRecord[];
+  readonly spawnError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
 }) => {
   const submitted: CapturedSubmit[] = [];
+  const spawned: CapturedSpawn[] = [];
   const service = ProjectServiceWorkClient.ProjectServiceWorkClient.of({
     // The directory-keyed mapping: one service project registered at the
     // thread project's workspace root.
@@ -194,9 +204,20 @@ const makeWorkClientLayer = (overrides?: {
       );
     },
     getOperation: () => Effect.succeed(COMMITTED_OPERATION),
+    startFlow: (input) => {
+      spawned.push({ ...input });
+      if (overrides?.spawnError !== undefined) {
+        return Effect.fail(overrides.spawnError);
+      }
+      return Effect.succeed<ProjectServiceWorkClient.ProjectFlowSpawnRecord>({
+        instanceId: "fin_spawn_1",
+        eventId: "evt_spawn_1",
+      });
+    },
   });
   return {
     submitted,
+    spawned,
     layer: Layer.succeed(ProjectServiceWorkClient.ProjectServiceWorkClient, service),
   };
 };
@@ -294,6 +315,63 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       assert.deepEqual(result.positions, [POSITION_VIEW]);
     });
   });
+
+  it.effect(
+    "project_flow_start spawns through the derived identity, injecting the task prompts",
+    () => {
+      const { spawned, layer } = makeWorkClientLayer();
+
+      return Effect.gen(function* () {
+        const child = yield* ProjectWorkToolkitHandlers.project_flow_start({
+          definitionId: "bounded-delivery",
+          name: "login bug fix",
+          promptOverrides: { "bounded-delivery.implement-work": "TASK: fix the login loop" },
+        }).pipe(withHandlerLayers({ workClientLayer: layer }));
+
+        assert.equal(child.instanceId, "fin_spawn_1");
+        assert.equal(spawned.length, 1);
+        const call = spawned[0];
+        // The project comes from the directory-keyed mapping, never the arguments.
+        assert.equal(call?.projectId, "proj_ps_1");
+        assert.equal(call?.definitionId, "bounded-delivery");
+        assert.equal(call?.name, "login bug fix");
+        assert.deepEqual(call?.promptOverrides, {
+          "bounded-delivery.implement-work": "TASK: fix the login loop",
+        });
+        // Fresh idempotency key per invocation: a retry after failure is a NEW
+        // spawn, never a silent replay of the original arguments.
+        assert.match(call?.idempotencyKey ?? "", /^[0-9a-f-]{36}$/);
+      });
+    },
+  );
+
+  it.effect(
+    "project_flow_start answers the spawn-refusal error, not an authentication failure",
+    () => {
+      const { layer } = makeWorkClientLayer({
+        spawnError: new ProjectServiceWorkClient.ProjectServiceWorkServiceRejectedError({
+          code: "PROJECT_CONSUMER_SPAWN_NOT_AUTHORIZED",
+          status: 403,
+          message: "this Flow Definition did not opt in to consumer spawning",
+        }),
+      });
+
+      return Effect.gen(function* () {
+        const failure = yield* ProjectWorkToolkitHandlers.project_flow_start({
+          definitionId: "closed",
+          name: "refused",
+        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+
+        // The 403 bucket stays reserved for credential problems; the refusal is
+        // about the DEFINITION's opt-in.
+        assert.deepEqual(plainError(failure), {
+          _tag: "ProjectFlowSpawnRefusedError",
+          code: "PROJECT_CONSUMER_SPAWN_NOT_AUTHORIZED",
+          serviceMessage: "this Flow Definition did not opt in to consumer spawning",
+        });
+      });
+    },
+  );
 
   it.effect("project_work_get answers a structured not-found when the service returns null", () => {
     const { layer } = makeWorkClientLayer({ run: null });

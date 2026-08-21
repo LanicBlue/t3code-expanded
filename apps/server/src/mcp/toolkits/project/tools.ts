@@ -103,6 +103,20 @@ export class ProjectWorkRejectedError extends Schema.TaggedErrorClass<ProjectWor
   }
 }
 
+/**
+ * The definition refused consumer spawning: only flow definitions whose ACTIVE
+ * version opted in (`consumerStartable`) can be started by this client. Not a
+ * credential problem — the definition must be re-published with the opt-in.
+ */
+export class ProjectFlowSpawnRefusedError extends Schema.TaggedErrorClass<ProjectFlowSpawnRefusedError>()(
+  "ProjectFlowSpawnRefusedError",
+  { code: Schema.String, serviceMessage: Schema.String },
+) {
+  override get message(): string {
+    return `${this.serviceMessage} Only definitions whose active version opts in (consumerStartable) can be started.`;
+  }
+}
+
 export const ProjectWorkError = Schema.Union([
   ProjectWorkUnavailableError,
   ProjectWorkAuthenticationError,
@@ -110,6 +124,7 @@ export const ProjectWorkError = Schema.Union([
   ProjectWorkUncertainError,
   ProjectWorkNotFoundError,
   ProjectWorkIncompatibleError,
+  ProjectFlowSpawnRefusedError,
   ProjectWorkRejectedError,
 ]);
 export type ProjectWorkError = typeof ProjectWorkError.Type;
@@ -151,6 +166,22 @@ export const ProjectOperationGetInput = Schema.Struct({
     description:
       "The operation identifier returned by project_work_submit or surfaced by its uncertain-outcome error.",
   }),
+});
+
+export const ProjectFlowStartInput = Schema.Struct({
+  definitionId: Schema.String.annotate({
+    description:
+      'The flow definition to start, e.g. "spike-probe". Only definitions whose active version opted in to consumer spawning answer; others refuse with a structured error.',
+  }),
+  name: Schema.String.annotate({
+    description: "A short human-readable name for the new flow instance.",
+  }),
+  promptOverrides: Schema.optional(
+    Schema.Record(Schema.String, Schema.String).annotate({
+      description:
+        'Task injection: workDefinitionId → prompt, applied to the definition\'s works BEFORE the instance is created (e.g. { "spike-probe.perform-work": "TASK: fix login bug in auth.ts" }). Prompts are definition-level, so spawn the same definition sequentially, never in parallel.',
+    }),
+  ),
 });
 
 // ── Result schemas ───────────────────────────────────────────────
@@ -234,9 +265,22 @@ export const ProjectOperationGetTool = Tool.make("project_operation_get", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
+export const ProjectFlowStartTool = Tool.make("project_flow_start", {
+  description:
+    "Start a new flow instance in the session project (tree branching): a one-way fork into a child flow — the parent flow does not wait for it or observe its completion. Use it to hand follow-up work to a differently-shaped process instead of looping back (e.g. after triage, start the spike/bounded/architectural delivery flow). Optionally inject task prompts into the child's works before it is created. Same-definition spawns are sequential (prompts are definition-level).",
+  parameters: ProjectFlowStartInput,
+  success: ProjectServiceWorkClient.ProjectFlowSpawnRecord,
+  failure: ProjectWorkError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Start a Project flow instance")
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true);
+
 export const ProjectWorkToolkit = Toolkit.make(
   ProjectWorkListTool,
   ProjectWorkGetTool,
   ProjectWorkSubmitTool,
   ProjectOperationGetTool,
+  ProjectFlowStartTool,
 );
