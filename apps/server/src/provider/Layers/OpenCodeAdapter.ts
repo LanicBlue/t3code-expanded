@@ -13,10 +13,13 @@ import {
   type UserInputQuestion,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
@@ -61,6 +64,41 @@ const PROVIDER = ProviderDriverKind.make("opencode");
  * rather than misread (mirrors GROK_RESUME_VERSION / CURSOR_RESUME_VERSION).
  */
 const OPENCODE_RESUME_VERSION = 1 as const;
+
+/**
+ * T3-level resends of a rate-limited turn before the failure settles for
+ * good. OpenCode already retries a limited prompt internally (5 attempts
+ * honoring retry-after); these resends cover the terminal exhaustion case —
+ * a hard window (e.g. a five-hour reset) that outlives OpenCode's own
+ * backoff, where the only recovery is to re-send after the window resets.
+ */
+const OPENCODE_RATE_LIMIT_MAX_RESENDS = 3;
+/** Floor/cap on the resend delay so a hostile retry-after can never hot-loop or sleep forever. */
+const OPENCODE_RATE_LIMIT_MIN_DELAY_MS = 30_000;
+const OPENCODE_RATE_LIMIT_MAX_DELAY_MS = 6 * 60 * 60_000;
+/** Resend delays when the terminal error carries no parseable retry-after. */
+const OPENCODE_RATE_LIMIT_FALLBACK_DELAYS_MS = [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000] as const;
+
+/** The prompt arguments of a sendTurn, replayable verbatim by the resend. */
+type OpenCodePromptPayload = Omit<
+  NonNullable<Parameters<OpencodeClient["session"]["promptAsync"]>[0]>,
+  "sessionID"
+>;
+
+/**
+ * In-memory wait between a terminal rate-limit rejection and the automatic
+ * re-send of the held turn's prompt. The failed turn is held open (not
+ * settled) so the session stays alive and the resend continues the same
+ * turn; an interrupt, a stop, or a new user message cancels the wait and
+ * settles the turn as the failure it already is. Lost on restart by design.
+ */
+interface OpenCodeRateLimitWait {
+  readonly turnId: TurnId;
+  readonly retryAtMs: number;
+  readonly failureMessage: string;
+  readonly prompt: OpenCodePromptPayload;
+  fiber: Fiber.Fiber<void> | undefined;
+}
 
 /**
  * Decode a persisted resume cursor into the upstream `ses_…` id. Anything
@@ -237,6 +275,23 @@ interface OpenCodeSessionContext {
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
+  /**
+   * Role directive for the bound logical agent, resolved from settings at
+   * session start. OpenCode has no per-session persona channel — it is
+   * appended per prompt via the `system` field, which OpenCode splices into
+   * the agent's system prompt (never into user turn text).
+   */
+  readonly agentPersona: string | undefined;
+  /**
+   * The prompt payload of the last sendTurn (latest steer wins). Held so the
+   * rate-limit resend can replay exactly what the user sent once the
+   * provider's limit window resets.
+   */
+  heldPrompt: OpenCodePromptPayload | undefined;
+  /** Pending rate-limit resend of the held turn, if any. */
+  rateLimitWait: OpenCodeRateLimitWait | undefined;
+  /** Resends already consumed by the current turn chain (reset on completion). */
+  rateLimitResends: number;
   /**
    * One-shot guard flipped by `stopOpenCodeContext` / `emitUnexpectedExit`.
    * The session lifecycle is owned by `sessionScope`; this Ref exists only
@@ -528,6 +583,79 @@ function sessionErrorMessage(error: unknown): string {
     : "OpenCode session failed.";
 }
 
+/**
+ * Whether a terminal session error is a usage/rate-limit rejection — the one
+ * failure class where re-sending later is the designed recovery. Decides on
+ * structured signals first (a terminal APIError with status 429), with a
+ * message-pattern fallback for gateways that answer 5xx-with-limit-text.
+ * Auth and context-overflow failures are deliberately excluded: re-sending
+ * those can never succeed.
+ */
+export function isOpenCodeRateLimitError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const record = error as { readonly name?: unknown; readonly data?: unknown };
+  if (record.name !== "APIError") {
+    return false;
+  }
+  const data = record.data;
+  if (!data || typeof data !== "object") {
+    return false;
+  }
+  const { statusCode, message } = data as { statusCode?: unknown; message?: unknown };
+  if (statusCode === 429) {
+    return true;
+  }
+  return (
+    typeof message === "string" &&
+    /rate.?limit|usage.?limit|resource_exhausted|quota|overloaded/iu.test(message)
+  );
+}
+
+/**
+ * Parse the provider's reset hint out of a terminal APIError's response
+ * headers: `retry-after-ms` (milliseconds) wins, then `retry-after` (seconds
+ * or an HTTP-date). Returns undefined when nothing parseable is present —
+ * the caller falls back to a fixed delay ladder.
+ */
+export function openCodeRetryAfterMs(error: unknown, nowMs: number): number | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+  const headers = (error as { readonly data?: unknown }).data;
+  if (!headers || typeof headers !== "object") {
+    return undefined;
+  }
+  const map = (headers as { readonly responseHeaders?: unknown }).responseHeaders;
+  if (!map || typeof map !== "object") {
+    return undefined;
+  }
+  const lookup = (name: string): string | undefined => {
+    for (const [key, value] of Object.entries(map as Record<string, unknown>)) {
+      if (key.toLowerCase() === name && typeof value === "string" && value.trim().length > 0) {
+        return value.trim();
+      }
+    }
+    return undefined;
+  };
+  const retryAfterMs = lookup("retry-after-ms");
+  if (retryAfterMs !== undefined && /^\d+$/u.test(retryAfterMs)) {
+    return Number(retryAfterMs);
+  }
+  const retryAfter = lookup("retry-after");
+  if (retryAfter !== undefined) {
+    if (/^\d+$/u.test(retryAfter)) {
+      return Number(retryAfter) * 1_000;
+    }
+    const epochMs = Date.parse(retryAfter);
+    if (!Number.isNaN(epochMs)) {
+      return Math.max(0, epochMs - nowMs);
+    }
+  }
+  return undefined;
+}
+
 function updateProviderSession(
   context: OpenCodeSessionContext,
   patch: Partial<ProviderSession>,
@@ -797,6 +925,163 @@ export function makeOpenCodeAdapter(
           },
         });
       }
+    });
+
+    /**
+     * Cancels a pending rate-limit wait. "interrupt" and "stop" settle the
+     * held turn as the failure it already is — exactly what would have
+     * happened with no resend scheduled; "superseded" (a new user message)
+     * also settles it failed: OpenCode cannot merge the new prompt into the
+     * held turn (the session is idle server-side), so the held turn ends and
+     * the new message opens a fresh one.
+     */
+    const cancelRateLimitWait = Effect.fn("cancelRateLimitWait")(function* (
+      context: OpenCodeSessionContext,
+      reason: "interrupt" | "stop" | "superseded",
+    ) {
+      const wait = context.rateLimitWait;
+      if (!wait) {
+        return false;
+      }
+      context.rateLimitWait = undefined;
+      const fiber = wait.fiber;
+      wait.fiber = undefined;
+      if (fiber) {
+        yield* Fiber.interrupt(fiber).pipe(Effect.ignore);
+      }
+      if (reason === "stop") {
+        // The session is exiting; settling the turn would race session.exited.
+        return true;
+      }
+      context.activeTurnId = undefined;
+      yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId: wait.turnId,
+        })),
+        type: "turn.completed",
+        payload: {
+          state: "failed",
+          errorMessage: wait.failureMessage,
+        },
+      });
+      return true;
+    });
+
+    /**
+     * Holds a rate-limited turn open and re-sends its prompt once, after the
+     * provider's reset hint (or the fallback ladder) elapses. The wait is
+     * announced as a runtime warning so the thread shows why the turn is
+     * quiet and until when. The resend fiber lives in `sessionScope` — a
+     * session stop interrupts it automatically.
+     */
+    const scheduleRateLimitResend = Effect.fn("scheduleRateLimitResend")(function* (
+      context: OpenCodeSessionContext,
+      turnId: TurnId,
+      error: unknown,
+    ) {
+      const prompt = context.heldPrompt;
+      if (!prompt) {
+        return false;
+      }
+      const resends = context.rateLimitResends;
+      if (resends >= OPENCODE_RATE_LIMIT_MAX_RESENDS) {
+        return false;
+      }
+      const nowMs = yield* Clock.currentTimeMillis;
+      const hintMs = openCodeRetryAfterMs(error, nowMs);
+      const fallbackMs =
+        OPENCODE_RATE_LIMIT_FALLBACK_DELAYS_MS[
+          Math.min(resends, OPENCODE_RATE_LIMIT_FALLBACK_DELAYS_MS.length - 1)
+        ] ?? OPENCODE_RATE_LIMIT_FALLBACK_DELAYS_MS[0]!;
+      const delayMs = Math.min(
+        Math.max(hintMs ?? fallbackMs, OPENCODE_RATE_LIMIT_MIN_DELAY_MS),
+        OPENCODE_RATE_LIMIT_MAX_DELAY_MS,
+      );
+      const retryAtMs = nowMs + delayMs;
+      const wait: OpenCodeRateLimitWait = {
+        turnId,
+        retryAtMs,
+        failureMessage: sessionErrorMessage(error),
+        prompt,
+        fiber: undefined,
+      };
+      context.rateLimitWait = wait;
+      context.rateLimitResends = resends + 1;
+      const retryAtIso = DateTime.formatIso(DateTime.makeUnsafe(retryAtMs));
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+        })),
+        type: "runtime.warning",
+        payload: {
+          message: `OpenCode rate limit wait until ${retryAtIso}; the turn will be re-sent automatically.`,
+          detail: { retryAt: retryAtIso, resend: resends + 1 },
+        },
+      });
+      const resend = Effect.gen(function* () {
+        yield* Effect.sleep(Duration.millis(delayMs));
+        // The wait may have been cancelled or superseded while we slept;
+        // only the still-pending wait for the same held turn may re-send.
+        if ((yield* Ref.get(context.stopped)) || context.rateLimitWait !== wait) {
+          return;
+        }
+        if (context.activeTurnId !== wait.turnId) {
+          return;
+        }
+        context.rateLimitWait = undefined;
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId: wait.turnId,
+          })),
+          type: "runtime.warning",
+          payload: {
+            message: "OpenCode rate limit wait ended; re-sending the turn.",
+            detail: { resend: resends + 1 },
+          },
+        });
+        yield* runOpenCodeSdk("session.promptAsync", () =>
+          context.client.session.promptAsync({
+            sessionID: context.openCodeSessionId,
+            ...wait.prompt,
+          }),
+        ).pipe(
+          Effect.mapError(toRequestError),
+          // A failed re-send settles the held turn as the failure it is; the
+          // session flips to error exactly like a fresh-turn send failure.
+          Effect.tapError((requestError) =>
+            Effect.gen(function* () {
+              context.activeTurnId = undefined;
+              yield* updateProviderSession(
+                context,
+                {
+                  status: "error",
+                  lastError: requestError.detail,
+                },
+                { clearActiveTurnId: true },
+              );
+              yield* emit({
+                ...(yield* buildEventBase({
+                  threadId: context.session.threadId,
+                  turnId: wait.turnId,
+                })),
+                type: "turn.completed",
+                payload: {
+                  state: "failed",
+                  errorMessage: requestError.detail,
+                },
+              });
+            }),
+          ),
+          Effect.ignore,
+        );
+      }).pipe(Effect.ignore);
+      const fiber = yield* Effect.forkIn(resend, context.sessionScope);
+      wait.fiber = fiber;
+      return true;
     });
 
     const handleSubscribedEvent = Effect.fn("handleSubscribedEvent")(function* (
@@ -1075,6 +1360,7 @@ export function makeOpenCodeAdapter(
 
           if (event.properties.status.type === "idle" && turnId) {
             context.activeTurnId = undefined;
+            context.rateLimitResends = 0;
             yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
             yield* emit({
               ...(yield* buildEventBase({
@@ -1092,8 +1378,19 @@ export function makeOpenCodeAdapter(
         }
 
         case "session.error": {
-          const message = sessionErrorMessage(event.properties.error);
+          const error = event.properties.error;
+          const message = sessionErrorMessage(error);
           const activeTurnId = context.activeTurnId;
+          // A terminal rate-limit rejection on a live turn with a known
+          // prompt is recoverable: hold the turn open and re-send after the
+          // reset window. Everything else takes the failure path below.
+          if (
+            activeTurnId &&
+            isOpenCodeRateLimitError(error) &&
+            (yield* scheduleRateLimitResend(context, activeTurnId, error))
+          ) {
+            break;
+          }
           context.activeTurnId = undefined;
           yield* updateProviderSession(
             context,
@@ -1402,6 +1699,10 @@ export function makeOpenCodeAdapter(
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
+          agentPersona: input.agentPersona,
+          heldPrompt: undefined,
+          rateLimitWait: undefined,
+          rateLimitResends: 0,
           stopped: yield* Ref.make(false),
           sessionScope: started.sessionScope,
         };
@@ -1429,10 +1730,20 @@ export function makeOpenCodeAdapter(
 
     const sendTurn: OpenCodeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
       const context = yield* ensureSessionContext(sessions, input.threadId);
+      // A new user message while a rate-limit wait is pending supersedes it:
+      // the held turn settles as its failure and this message opens a fresh
+      // turn (the OpenCode session is idle server-side, so this is not a
+      // steer — the held turn's prompt was never processed to completion).
+      if (context.rateLimitWait) {
+        yield* cancelRateLimitWait(context, "superseded");
+      }
       // A sendTurn while a turn is active is a steer: OpenCode queues the
       // prompt into the busy session and the work continues as one turn, so
       // the active turn id is reused instead of opening a new turn.
       const steeringTurnId = context.activeTurnId;
+      if (steeringTurnId === undefined) {
+        context.rateLimitResends = 0;
+      }
       const turnId = steeringTurnId ?? TurnId.make(`opencode-turn-${yield* randomUUIDv4}`);
       const modelSelection =
         input.modelSelection ??
@@ -1499,13 +1810,20 @@ export function makeOpenCodeAdapter(
         });
       }
 
+      // Built as a named value so the rate-limit resend can replay the exact
+      // prompt (persona included) after the limit window resets.
+      const promptPayload: OpenCodePromptPayload = {
+        model: parsedModel,
+        ...(context.activeAgent ? { agent: context.activeAgent } : {}),
+        ...(context.activeVariant ? { variant: context.activeVariant } : {}),
+        ...(context.agentPersona ? { system: context.agentPersona } : {}),
+        parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
+      };
+      context.heldPrompt = promptPayload;
       yield* runOpenCodeSdk("session.promptAsync", () =>
         context.client.session.promptAsync({
           sessionID: context.openCodeSessionId,
-          model: parsedModel,
-          ...(context.activeAgent ? { agent: context.activeAgent } : {}),
-          ...(context.activeVariant ? { variant: context.activeVariant } : {}),
-          parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
+          ...promptPayload,
         }),
       ).pipe(
         Effect.mapError(toRequestError),
@@ -1558,6 +1876,13 @@ export function makeOpenCodeAdapter(
     const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
       function* (threadId, turnId) {
         const context = yield* ensureSessionContext(sessions, threadId);
+        // A pending rate-limit wait has no server-side work to abort — the
+        // session is idle. Cancelling settles the held turn as its failure
+        // (already emitted as turn.completed), so don't also emit
+        // turn.aborted for the same turn.
+        if (yield* cancelRateLimitWait(context, "interrupt")) {
+          return;
+        }
         yield* runOpenCodeSdk("session.abort", () =>
           context.client.session.abort({ sessionID: context.openCodeSessionId }),
         ).pipe(Effect.mapError(toRequestError));
@@ -1626,6 +1951,9 @@ export function makeOpenCodeAdapter(
             threadId,
           });
         }
+        // Tears down any pending rate-limit wait; its resend fiber is also
+        // interrupted by the scope close below, this just clears the state.
+        yield* cancelRateLimitWait(context, "stop");
         const stopped = yield* stopOpenCodeContext(context);
         sessions.delete(threadId);
         if (!stopped) {

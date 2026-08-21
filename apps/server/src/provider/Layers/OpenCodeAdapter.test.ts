@@ -1,4 +1,5 @@
 import * as NodeAssert from "node:assert/strict";
+import { scheduler } from "node:timers/promises";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -34,9 +35,11 @@ import {
 import {
   appendOpenCodeAssistantTextDelta,
   isOpenCodeNotFound,
+  isOpenCodeRateLimitError,
   isSameOpenCodeDirectory,
   makeOpenCodeAdapter,
   mergeOpenCodeAssistantText,
+  openCodeRetryAfterMs,
 } from "./OpenCodeAdapter.ts";
 
 // Test-local service tag so the rest of the file can keep using `yield* OpenCodeAdapter`.
@@ -68,12 +71,32 @@ const runtimeMock = {
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
+    // Events pushed after subscription started (rate-limit flow drives the
+    // pump live); the seeded list above still plays first, per-test.
+    pushedEvents: [] as Array<unknown>,
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
     sessionDirectoryById: new Map<string, string>(),
     sessionUpdateCalls: [] as Array<{ sessionID: string; permission: unknown }>,
     forkCalls: [] as Array<{ sessionID: string; directory?: string }>,
+  },
+  /**
+   * One entry per live subscription. pushEvent fans out to every queue —
+   * like the real server bus, each pump receives every event and drops the
+   * ones whose session id is not its own. A single shared queue would let a
+   * previous test's still-live pump steal this test's events.
+   */
+  subscriptions: [] as Array<{
+    queue: Array<unknown>;
+    waiter: (() => void) | undefined;
+    signal: AbortSignal | undefined;
+  }>,
+  pushEvent(event: unknown) {
+    for (const subscription of this.subscriptions) {
+      subscription.queue.push(event);
+      subscription.waiter?.();
+    }
   },
   reset() {
     this.state.startCalls.length = 0;
@@ -88,6 +111,8 @@ const runtimeMock = {
     this.state.closeError = null;
     this.state.messages = [];
     this.state.subscribedEvents = [];
+    this.state.pushedEvents.length = 0;
+    this.subscriptions.length = 0;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -204,13 +229,57 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
       },
       event: {
-        subscribe: async () => ({
-          stream: (async function* () {
-            for (const event of runtimeMock.state.subscribedEvents) {
-              yield event;
-            }
-          })(),
-        }),
+        // Seeded events replay per subscription, then a bounded live tail
+        // polls this subscription's own queue. The tail ends on its own
+        // after an idle window — Effect's channel calls iterator.return()
+        // on early close, which only resolves once the generator reaches a
+        // yield or finishes; a generator parked forever inside the poll
+        // await would deadlock scope close.
+        subscribe: async (_input: unknown, options?: { readonly signal?: AbortSignal }) => {
+          const subscription: {
+            queue: Array<unknown>;
+            waiter: (() => void) | undefined;
+            signal: AbortSignal | undefined;
+          } = { queue: [], waiter: undefined, signal: options?.signal };
+          runtimeMock.subscriptions.push(subscription);
+          return {
+            stream: (async function* () {
+              const signal = subscription.signal;
+              try {
+                for (const event of runtimeMock.state.subscribedEvents) {
+                  yield event;
+                }
+                let emptyPolls = 0;
+                while (true) {
+                  if (signal?.aborted) {
+                    return;
+                  }
+                  if (subscription.queue.length === 0) {
+                    if (emptyPolls >= 250) {
+                      return;
+                    }
+                    emptyPolls += 1;
+                    await Promise.race([
+                      scheduler.wait(2),
+                      new Promise<void>((resolve) => {
+                        subscription.waiter = resolve;
+                        signal?.addEventListener("abort", () => resolve(), { once: true });
+                      }),
+                    ]);
+                    subscription.waiter = undefined;
+                    continue;
+                  }
+                  emptyPolls = 0;
+                  yield subscription.queue.shift()!;
+                }
+              } finally {
+                runtimeMock.subscriptions = runtimeMock.subscriptions.filter(
+                  (entry) => entry !== subscription,
+                );
+              }
+            })(),
+          };
+        },
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -252,6 +321,30 @@ const openCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
   serverPassword: "secret-password",
 });
 
+/**
+ * A fresh adapter on its own (fake) server URL for the event-driven tests.
+ * Two isolation properties: a private sessions map (no cross-test state),
+ * and — because every session on this URL gets an openCodeSessionId no other
+ * test's pump shares — the pump's session-id filter drops events pushed for
+ * another test, exactly like distinct sessions on the real server bus. (The
+ * shared layer cannot give this: its leftover pumps keep running between
+ * tests and all share one session id.)
+ */
+const isolatedAdapterLayer = (port: number) => {
+  const settings = Schema.decodeSync(OpenCodeSettings)({
+    binaryPath: "fake-opencode",
+    serverUrl: `http://127.0.0.1:${port}`,
+    serverPassword: "secret-password",
+  });
+  return Layer.effect(OpenCodeAdapter, makeOpenCodeAdapter(settings)).pipe(
+    Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
+};
+
 const OpenCodeAdapterTestLayer = Layer.effect(
   OpenCodeAdapter,
   makeOpenCodeAdapter(openCodeAdapterTestSettings),
@@ -279,6 +372,10 @@ beforeEach(() => {
 
 const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
+
+// Pushed events ride a real-timer poll loop; advancing the TEST clock does
+// not move it. Wait a beat of real time so the pump has drained the queue.
+const settleEventPump = Effect.promise(() => scheduler.wait(15));
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
@@ -1341,7 +1438,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           threadId: asThreadId("thread-native-log"),
           runtimeMode: "full-access",
         });
-        yield* advanceTestClock(10);
+        yield* settleEventPump;
         return started;
       }).pipe(Effect.provide(adapterLayer));
 
@@ -1429,7 +1526,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           threadId: asThreadId("thread-native-log-failure"),
           runtimeMode: "full-access",
         });
-        yield* advanceTestClock(10);
+        yield* settleEventPump;
         return {
           sessions: yield* adapter.listSessions(),
           closeCallsDuringRun: [...runtimeMock.state.closeCalls],
@@ -1441,4 +1538,358 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.deepEqual(closeCallsDuringRun, []);
     }),
   );
+
+  // ── Rate-limit recovery + persona ────────────────────────────────
+
+  it.effect("detects rate-limit errors and parses retry-after hints", () =>
+    Effect.gen(function* () {
+      const limitError = (overrides?: Record<string, unknown>) => ({
+        name: "APIError",
+        data: {
+          message: "Usage limit reached. It will reset in 5h.",
+          statusCode: 429,
+          isRetryable: true,
+          ...overrides,
+        },
+      });
+      NodeAssert.equal(isOpenCodeRateLimitError(limitError()), true);
+      // 429 by status alone, no pattern needed.
+      NodeAssert.equal(
+        isOpenCodeRateLimitError({
+          name: "APIError",
+          data: { message: "x", statusCode: 429, isRetryable: true },
+        }),
+        true,
+      );
+      // Limit text without a status code still counts.
+      NodeAssert.equal(
+        isOpenCodeRateLimitError({
+          name: "APIError",
+          data: { message: "rate limit exceeded", isRetryable: false },
+        }),
+        true,
+      );
+      // Auth failures and other shapes never count — re-sending cannot help.
+      NodeAssert.equal(
+        isOpenCodeRateLimitError({ name: "ProviderAuthError", data: { message: "rate limit" } }),
+        false,
+      );
+      NodeAssert.equal(
+        isOpenCodeRateLimitError({
+          name: "APIError",
+          data: { message: "model not found", statusCode: 404 },
+        }),
+        false,
+      );
+      NodeAssert.equal(isOpenCodeRateLimitError(null), false);
+
+      // retry-after-ms wins; retry-after parses seconds and HTTP-dates.
+      NodeAssert.equal(
+        openCodeRetryAfterMs(limitError({ responseHeaders: { "retry-after-ms": "45000" } }), 1_000),
+        45_000,
+      );
+      NodeAssert.equal(
+        openCodeRetryAfterMs(limitError({ responseHeaders: { "Retry-After": "120" } }), 1_000),
+        120_000,
+      );
+      const resetAt = "Thu, 01 Jan 1970 00:00:30 GMT";
+      NodeAssert.equal(
+        openCodeRetryAfterMs(limitError({ responseHeaders: { "retry-after": resetAt } }), 10_000),
+        20_000,
+      );
+      NodeAssert.equal(openCodeRetryAfterMs(limitError(), 1_000), undefined);
+    }),
+  );
+
+  it.effect("appends the bound agent persona to every prompt as the system field", () => {
+    const threadId = asThreadId("thread-persona");
+    const bareThreadId = asThreadId("thread-persona-absent");
+    return Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        agentPersona: "You are the night-shift reviewer. Be terse.",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "review the diff",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        },
+      });
+
+      const prompt = runtimeMock.state.promptCalls.at(-1) as Record<string, unknown>;
+      NodeAssert.equal(prompt.system, "You are the night-shift reviewer. Be terse.");
+      // Without a persona the field stays absent, not empty — the persona is
+      // session-level, so the check needs a session started without one.
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId: bareThreadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: bareThreadId,
+        input: "again",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        },
+      });
+      const barePrompt = runtimeMock.state.promptCalls.at(-1) as Record<string, unknown>;
+      NodeAssert.equal(barePrompt.system, undefined);
+      NodeAssert.equal("system" in barePrompt, false);
+    }).pipe(Effect.provide(isolatedAdapterLayer(4321)));
+  });
+
+  it.effect("holds a rate-limited turn open and re-sends the prompt after the wait", () => {
+    const threadId = asThreadId("thread-rate-limit-resend");
+    return Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(6),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "run the suite",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        },
+      });
+      const firstPrompt = runtimeMock.state.promptCalls.at(-1);
+      yield* settleEventPump;
+
+      // Terminal APIError 429 with a 30s reset hint.
+      runtimeMock.pushEvent({
+        type: "session.error",
+        properties: {
+          sessionID: "http://127.0.0.1:4322/session",
+          error: {
+            name: "APIError",
+            data: {
+              message: "Usage limit reached. It will reset in 30s.",
+              statusCode: 429,
+              isRetryable: true,
+              responseHeaders: { "retry-after-ms": "30000" },
+            },
+          },
+        },
+      });
+      yield* settleEventPump;
+
+      // The turn is held open, not settled as failed.
+      let session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      NodeAssert.equal(session?.status, "running");
+      NodeAssert.equal(String(session?.activeTurnId), String(turn.turnId));
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+
+      // The wait elapses; the same prompt is re-sent once.
+      yield* advanceTestClock(31_000);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 2);
+      const resent = runtimeMock.state.promptCalls.at(-1) as Record<string, unknown>;
+      NodeAssert.deepEqual(resent, firstPrompt);
+
+      // The re-sent turn completes through the normal idle path.
+      runtimeMock.pushEvent({
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:4322/session",
+          status: { type: "idle" },
+        },
+      });
+      yield* settleEventPump;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      NodeAssert.equal(session?.status, "ready");
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const turnEvents = events.filter(
+        (event) => "turnId" in event && String(event.turnId) === String(turn.turnId),
+      );
+      NodeAssert.ok(
+        turnEvents.some(
+          (event) =>
+            event.type === "runtime.warning" &&
+            event.payload.message.includes("rate limit wait until"),
+        ),
+        "expected a rate-limit wait warning",
+      );
+      NodeAssert.ok(turnEvents.some((event) => event.type === "turn.completed"));
+      NodeAssert.ok(
+        !turnEvents.some(
+          (event) => event.type === "turn.completed" && event.payload.state === "failed",
+        ),
+        "the held turn must not settle as failed",
+      );
+    }).pipe(Effect.provide(isolatedAdapterLayer(4322)));
+  });
+
+  it.effect("interrupt settles the held rate-limit turn as its failure", () => {
+    const threadId = asThreadId("thread-rate-limit-interrupt");
+    return Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(5),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "run the suite",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        },
+      });
+      yield* settleEventPump;
+      runtimeMock.pushEvent({
+        type: "session.error",
+        properties: {
+          sessionID: "http://127.0.0.1:4323/session",
+          error: {
+            name: "APIError",
+            data: { message: "rate limited", statusCode: 429, isRetryable: true },
+          },
+        },
+      });
+      yield* settleEventPump;
+
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+      yield* settleEventPump;
+      const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      NodeAssert.equal(session?.status, "ready");
+
+      // No resend after the wait elapses — the wait was cancelled.
+      yield* advanceTestClock(6 * 60 * 60_000);
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const settled = events.find(
+        (event) =>
+          event.type === "turn.completed" &&
+          "turnId" in event &&
+          String(event.turnId) === String(turn.turnId),
+      );
+      const settledPayload = settled?.payload as { state?: string; errorMessage?: string };
+      NodeAssert.equal(settledPayload?.state, "failed");
+      NodeAssert.equal(settledPayload?.errorMessage, "rate limited");
+    }).pipe(Effect.provide(isolatedAdapterLayer(4323)));
+  });
+
+  it.effect("a new user message supersedes the held rate-limit turn", () => {
+    const threadId = asThreadId("thread-rate-limit-supersede");
+    return Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const held = yield* adapter.sendTurn({
+        threadId,
+        input: "first task",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        },
+      });
+      yield* settleEventPump;
+      runtimeMock.pushEvent({
+        type: "session.error",
+        properties: {
+          sessionID: "http://127.0.0.1:4324/session",
+          error: {
+            name: "APIError",
+            data: { message: "rate limited", statusCode: 429, isRetryable: true },
+          },
+        },
+      });
+      yield* settleEventPump;
+
+      // The new message opens a FRESH turn — the OpenCode session is idle
+      // server-side, so this is not a steer.
+      const fresh = yield* adapter.sendTurn({ threadId, input: "second task" });
+      NodeAssert.notEqual(String(fresh.turnId), String(held.turnId));
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 2);
+      const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      NodeAssert.equal(String(session?.activeTurnId), String(fresh.turnId));
+
+      // No third promptAsync once the cancelled wait's delay elapses.
+      yield* advanceTestClock(6 * 60 * 60_000);
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 2);
+    }).pipe(Effect.provide(isolatedAdapterLayer(4324)));
+  });
+
+  it.effect("settles non-limit session errors immediately without a resend", () => {
+    const threadId = asThreadId("thread-error-no-resend");
+    return Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(5),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "run the suite",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("opencode"),
+          model: "openai/gpt-5",
+        },
+      });
+      yield* settleEventPump;
+      runtimeMock.pushEvent({
+        type: "session.error",
+        properties: {
+          sessionID: "http://127.0.0.1:4325/session",
+          error: { name: "ProviderAuthError", data: { message: "expired token" } },
+        },
+      });
+      yield* settleEventPump;
+
+      const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      NodeAssert.equal(session?.status, "error");
+      NodeAssert.equal(session?.lastError, "expired token");
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const settled = events.find(
+        (event) =>
+          event.type === "turn.completed" &&
+          "turnId" in event &&
+          String(event.turnId) === String(turn.turnId),
+      );
+      NodeAssert.equal((settled?.payload as { state?: string }).state, "failed");
+    }).pipe(Effect.provide(isolatedAdapterLayer(4325)));
+  });
 });
