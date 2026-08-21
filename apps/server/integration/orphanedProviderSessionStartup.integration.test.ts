@@ -35,6 +35,7 @@ import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSes
 import * as ProviderService from "../src/provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../src/provider/Services/ProviderSessionDirectory.ts";
 import * as ProviderSessionReaper from "../src/provider/Services/ProviderSessionReaper.ts";
+import { ProjectConsumerRuntimeService } from "../src/projectService/ProjectConsumerRuntimeService.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
 import * as ServerLifecycleEvents from "../src/serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "../src/serverRuntimeStartup.ts";
@@ -74,6 +75,19 @@ const startupDependencies = Layer.mergeAll(
   }),
   Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
     start: () => Effect.void,
+  }),
+  // Fork-only dependency of ServerRuntimeStartup (the Project Service
+  // consumer runtime). Disabled stub: this test exercises orphan provider
+  // session reconciliation, not PS integration, and the real layer would
+  // drag in secret stores and the work client.
+  Layer.succeed(ProjectConsumerRuntimeService, {
+    start: () => Effect.void,
+    getStatus: Effect.succeed({ state: "disabled" } as const),
+    router: {
+      routeWake: () => Effect.die("unused"),
+      onThreadEvent: () => Effect.void,
+      snapshotSessions: Effect.succeed([]),
+    },
   }),
   ServerLifecycleEvents.layer,
   Layer.succeed(ServerEnvironment.ServerEnvironment, {

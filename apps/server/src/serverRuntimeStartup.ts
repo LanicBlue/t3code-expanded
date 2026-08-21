@@ -439,11 +439,21 @@ export const make = (options?: StartupOptions) =>
         Effect.gen(function* () {
           yield* orchestrationReactor.start().pipe(Scope.provide(reactorScope));
           yield* providerSessionReaper.start().pipe(Scope.provide(reactorScope));
-          yield* projectConsumerRuntime.start().pipe(Scope.provide(reactorScope));
         }),
       );
 
+      // Orphan reconciliation snapshots live provider sessions and settles
+      // the ones whose threads are gone. The Project Service consumer runtime
+      // must not be delivering work wakes yet: a backlog-redelivered notice
+      // can create a session of its own, and a session born while the
+      // snapshot is in flight would be reconciled (error-settled) as an
+      // orphan it is not. Start it only after reconciliation completes.
       yield* runStartupPhase("provider-sessions.reconcile", reconcileProviderSessions);
+
+      yield* runStartupPhase(
+        "project-consumer.start",
+        projectConsumerRuntime.start().pipe(Scope.provide(reactorScope)),
+      );
 
       const welcomeBase = yield* resolveWelcomeBase;
       const environment = yield* serverEnvironment.getDescriptor;
