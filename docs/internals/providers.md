@@ -75,12 +75,34 @@ spills the whole accumulated text as one delta. The buffer also flushes at inter
 when a request opens (approval) or user input is requested, via
 `flushBufferedAssistantMessagesForTurn`.
 
+## Claude five-hour usage-limit retry
+
+The Claude adapter ([`ClaudeAdapter.ts`][claudeadapter]) does not settle a turn that fails under
+Claude's five-hour subscription usage limit. It holds the turn open and re-sends the same input once
+the limit resets:
+
+- **Detection**: only a failed `error_during_execution` result on a non-synthetic turn counts, and
+  only when this turn saw a structured `rate_limit_event` rejection (`rateLimitType: "five_hour"`
+  with `resetsAt`), or, as a fallback, when the result's error text matches the localized five-hour
+  reset message, parsed in the daemon's local timezone. Every other failure settles the turn exactly
+  as before.
+- **The wait**: one re-send at `max(resetsAt + 5s, now + 30s)`, on the same session, with the turn's
+  user messages (the original prompt plus any steers) offered verbatim. While waiting, the turn is
+  not settled and the thread shows a `runtime.warning` activity ("Claude usage limit wait until
+  ...") so the quiet turn is explained. Each new limit failure re-arms the mechanism.
+- **Cancellation**: interrupt or stop settles the held turn as the failure it already was — what
+  would have happened with no retry scheduled. A new user message cancels the retry and leaves the
+  turn open for the incoming input.
+- **Scope**: the wait lives in adapter memory. A server restart loses a pending retry without
+  corrupting thread or turn state; there is no persisted scheduler.
+
 [drivers]: ../../apps/server/src/provider/builtInDrivers.ts
 [codex]: ../../apps/server/src/provider/Drivers/CodexDriver.ts
 [claude]: ../../apps/server/src/provider/Drivers/ClaudeDriver.ts
 [cursor]: ../../apps/server/src/provider/Drivers/CursorDriver.ts
 [grok]: ../../apps/server/src/provider/Drivers/GrokDriver.ts
 [opencode]: ../../apps/server/src/provider/Drivers/OpenCodeDriver.ts
+[claudeadapter]: ../../apps/server/src/provider/Layers/ClaudeAdapter.ts
 [adapter]: ../../apps/server/src/provider/Services/ProviderAdapter.ts
 [instances]: ../../apps/server/src/provider/Services/ProviderInstanceRegistry.ts
 [registry]: ../../apps/server/src/provider/Services/ProviderAdapterRegistry.ts

@@ -58,9 +58,11 @@ import {
   resolvePromptInjectedEffort,
 } from "@t3tools/shared/model";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -100,6 +102,10 @@ const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonStri
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
+/** Grace after a five-hour usage limit resets before the turn is re-sent. */
+const USAGE_LIMIT_RETRY_GRACE_MS = 5_000;
+/** Floor on the usage-limit retry delay so a bad resetsAt can never hot-loop. */
+const USAGE_LIMIT_MIN_RETRY_DELAY_MS = 30_000;
 type ClaudeTextStreamKind = Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
 type ClaudeToolResultStreamKind = Extract<
   RuntimeContentStreamKind,
@@ -143,6 +149,18 @@ interface ClaudeTurnState {
   readonly assistantTextBlockOrder: Array<AssistantTextBlockState>;
   readonly capturedProposedPlanKeys: Set<string>;
   nextSyntheticAssistantBlockIndex: number;
+  /**
+   * User prompts offered into this turn (the original plus any steers); the
+   * usage-limit retry re-sends them verbatim. Empty for synthetic turns,
+   * which have no user input to retry.
+   */
+  promptMessages: Array<SDKUserMessage>;
+  /**
+   * resetsAt (epoch ms) of the last five-hour rejection seen during this
+   * turn. Consumed by the usage-limit retry so a later failure needs a fresh
+   * signal instead of reusing a stale resetsAt.
+   */
+  usageLimitResetAt: number | undefined;
 }
 
 interface AssistantTextBlockState {
@@ -242,10 +260,30 @@ interface ClaudeTaskAgentState {
   effort: string | undefined;
 }
 
+/**
+ * In-memory wait between a five-hour usage-limit failure and the automatic
+ * re-send of the same turn input. The failed turn is held open (not settled)
+ * so the session stays alive and the retry continues the same turn; an
+ * interrupt, a stop, or a new user message cancels the wait. Interrupt and
+ * stop settle the held turn as the failure it already is — exactly what would
+ * have happened with no retry scheduled. Lost on restart by design.
+ */
+interface UsageLimitWait {
+  readonly turnId: TurnId;
+  readonly retryAtMs: number;
+  readonly messages: ReadonlyArray<SDKUserMessage>;
+  readonly failure: {
+    readonly errorMessage: string | undefined;
+    readonly result: SDKResultMessage;
+  };
+  fiber: Fiber.Fiber<void> | undefined;
+}
+
 interface ClaudeSessionContext {
   session: ProviderSession;
   readonly promptQueue: Queue.Queue<PromptQueueItem>;
   readonly query: ClaudeQueryRuntime;
+  usageLimitWait: UsageLimitWait | undefined;
   streamFiber: Fiber.Fiber<void, Error> | undefined;
   readonly startedAt: string;
   readonly basePermissionMode: PermissionMode | undefined;
@@ -381,6 +419,74 @@ function resultErrorsText(result: SDKResultMessage): string {
   return "errors" in result && Array.isArray(result.errors)
     ? result.errors.join(" ").toLowerCase()
     : "";
+}
+
+/**
+ * Parses Claude's localized five-hour usage-limit reset time out of a failed
+ * result's error text. This is the fallback path — the structured
+ * rate_limit_event resetsAt is preferred whenever the turn saw one. The
+ * provider timestamp has no offset, so it is intentionally interpreted in the
+ * daemon's local timezone (the timezone the CLI renders the message in on
+ * local setups; remote deployments lean on the structured signal instead).
+ */
+function parseFiveHourUsageLimitResetMs(text: string): number | undefined {
+  if (!/(?:5\s*(?:hours?|小时)|five[-\s]?hour)/iu.test(text)) return undefined;
+  if (!/(?:重置|reset)/iu.test(text)) return undefined;
+  const match = /(20\d{2})[-/]([01]?\d)[-/]([0-3]?\d)[ T]([0-2]?\d):([0-5]\d):([0-5]\d)/u.exec(
+    text,
+  );
+  if (!match) return undefined;
+  const [, year, month, day, hour, minute, second] = match;
+  // adjustForTimeZone reads the parts as local wall-clock time; the
+  // toParts round trip rejects rolled-over dates like month 13.
+  const parsed = DateTime.makeZoned(
+    {
+      year: Number(year),
+      month: Number(month),
+      day: Number(day),
+      hour: Number(hour),
+      minute: Number(minute),
+      second: Number(second),
+    },
+    { adjustForTimeZone: true },
+  );
+  if (Option.isNone(parsed)) return undefined;
+  const parts = DateTime.toParts(parsed.value);
+  if (
+    parts.year !== Number(year) ||
+    parts.month !== Number(month) ||
+    parts.day !== Number(day) ||
+    parts.hour !== Number(hour) ||
+    parts.minute !== Number(minute) ||
+    parts.second !== Number(second)
+  ) {
+    return undefined;
+  }
+  return parsed.value.epochMilliseconds;
+}
+
+/**
+ * Five-hour usage-limit reset (epoch ms) behind a failed result: this turn's
+ * structured rate_limit_event rejection first, the localized error text as a
+ * fallback. Undefined means the failure was not a five-hour limit rejection.
+ */
+function usageLimitResetMs(
+  turnState: ClaudeTurnState,
+  result: SDKResultMessage,
+): number | undefined {
+  if (turnState.usageLimitResetAt !== undefined) {
+    return turnState.usageLimitResetAt;
+  }
+  if (!("errors" in result) || !Array.isArray(result.errors)) {
+    return undefined;
+  }
+  for (const error of result.errors) {
+    const parsed = parseFiveHourUsageLimitResetMs(error);
+    if (parsed !== undefined) {
+      return parsed;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -2389,6 +2495,88 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     yield* updateResumeCursor(context);
   });
 
+  /**
+   * Cancels a pending usage-limit wait. "interrupt" and "stop" settle the held
+   * turn exactly as the failure would have settled with no retry scheduled;
+   * "superseded" (a new user message) leaves the turn open and hands it to
+   * the incoming steer.
+   */
+  const cancelUsageLimitWait = Effect.fn("cancelUsageLimitWait")(function* (
+    context: ClaudeSessionContext,
+    reason: "interrupt" | "stop" | "superseded",
+  ) {
+    const wait = context.usageLimitWait;
+    if (!wait) {
+      return;
+    }
+    context.usageLimitWait = undefined;
+    const fiber = wait.fiber;
+    wait.fiber = undefined;
+    if (fiber) {
+      yield* Fiber.interrupt(fiber);
+    }
+    if (reason === "superseded") {
+      return;
+    }
+    const turnState = context.turnState;
+    if (!turnState || turnState.turnId !== wait.turnId) {
+      return;
+    }
+    yield* completeTurn(context, "failed", wait.failure.errorMessage, wait.failure.result);
+  });
+
+  /**
+   * Holds a five-hour-limited turn open and re-sends its input once, after
+   * max(resetsAt + grace, now + floor). The wait is announced as a runtime
+   * warning so the thread shows why the turn is quiet and until when.
+   */
+  const scheduleUsageLimitWait = Effect.fn("scheduleUsageLimitWait")(function* (
+    context: ClaudeSessionContext,
+    turnState: ClaudeTurnState,
+    resetsAtMs: number,
+    failure: {
+      readonly errorMessage: string | undefined;
+      readonly result: SDKResultMessage;
+    },
+  ) {
+    const nowMs = yield* Clock.currentTimeMillis;
+    const retryAtMs = Math.max(
+      resetsAtMs + USAGE_LIMIT_RETRY_GRACE_MS,
+      nowMs + USAGE_LIMIT_MIN_RETRY_DELAY_MS,
+    );
+    const wait: UsageLimitWait = {
+      turnId: turnState.turnId,
+      retryAtMs,
+      messages: [...turnState.promptMessages],
+      failure,
+      fiber: undefined,
+    };
+    context.usageLimitWait = wait;
+    yield* emitRuntimeWarning(
+      context,
+      `Claude usage limit wait until ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))}; the turn will be retried automatically.`,
+    );
+    const retryTurn = Effect.gen(function* () {
+      yield* Effect.sleep(Duration.millis(retryAtMs - nowMs));
+      // The wait may have been cancelled (interrupt/stop) or superseded (a new
+      // user message) while we slept; only a still-pending wait for the same
+      // held turn may re-send.
+      if (context.stopped || context.usageLimitWait !== wait) {
+        return;
+      }
+      const heldTurn = context.turnState;
+      if (!heldTurn || heldTurn.turnId !== wait.turnId) {
+        return;
+      }
+      context.usageLimitWait = undefined;
+      yield* emitRuntimeWarning(context, "Claude usage limit wait ended; retrying the turn.");
+      for (const message of wait.messages) {
+        yield* Queue.offer(context.promptQueue, { type: "message", message });
+      }
+    }).pipe(Effect.ignore);
+    wait.fiber = yield* Effect.forkChild(retryTurn);
+  });
+
   const handleStreamEvent = Effect.fn("handleStreamEvent")(function* (
     context: ClaudeSessionContext,
     message: SDKMessage,
@@ -2901,6 +3089,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         assistantTextBlockOrder: [],
         capturedProposedPlanKeys: new Set(),
         nextSyntheticAssistantBlockIndex: -1,
+        promptMessages: [],
+        usageLimitResetAt: undefined,
       };
       context.session = {
         ...context.session,
@@ -2977,6 +3167,28 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     const status = turnStatusFromResult(message);
     const errorMessage = resultUserFacingError(message);
+
+    // A five-hour usage-limit failure keeps the turn open and re-sends the
+    // same input once the limit resets; every other failure settles here
+    // unchanged. Synthetic turns have no user input to retry.
+    const turnState = context.turnState;
+    if (
+      status === "failed" &&
+      turnState &&
+      !turnState.synthetic &&
+      message.subtype === "error_during_execution" &&
+      turnState.promptMessages.length > 0
+    ) {
+      const resetsAtMs = usageLimitResetMs(turnState, message);
+      if (resetsAtMs !== undefined) {
+        turnState.usageLimitResetAt = undefined;
+        yield* scheduleUsageLimitWait(context, turnState, resetsAtMs, {
+          errorMessage: errorMessage ?? "Claude turn failed.",
+          result: message,
+        });
+        return;
+      }
+    }
 
     if (status === "failed") {
       yield* emitRuntimeError(context, errorMessage ?? "Claude turn failed.");
@@ -3506,6 +3718,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     if (message.type === "rate_limit_event") {
+      // Record this turn's five-hour rejection so a failing result can
+      // schedule the usage-limit retry from the structured signal (preferred
+      // over parsing the localized error text). A later non-rejected
+      // five-hour event clears it: the limit lifted.
+      const turnState = context.turnState;
+      const rateLimitInfo = message.rate_limit_info;
+      if (turnState && rateLimitInfo.rateLimitType === "five_hour") {
+        const resetsAt = rateLimitInfo.resetsAt;
+        turnState.usageLimitResetAt =
+          rateLimitInfo.status === "rejected" && typeof resetsAt === "number" && resetsAt > 0
+            ? resetsAt
+            : undefined;
+      }
       yield* offerRuntimeEvent({
         ...base,
         type: "account.rate-limits.updated",
@@ -3636,6 +3861,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     options?: { readonly emitExitEvent?: boolean },
   ) {
     if (context.stopped) return;
+
+    // Stopping during a usage-limit wait cancels the retry; the held turn
+    // settles as the failure it already was before the session closes.
+    yield* cancelUsageLimitWait(context, "stop");
 
     context.stopped = true;
 
@@ -4288,6 +4517,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         session,
         promptQueue,
         query: queryRuntime,
+        usageLimitWait: undefined,
         streamFiber: undefined,
         startedAt,
         basePermissionMode: permissionMode,
@@ -4389,6 +4619,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
   const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
+    // A user message supersedes any pending usage-limit retry: the turn
+    // continues with the new input instead of re-sending the old one.
+    yield* cancelUsageLimitWait(context, "superseded");
     const boundTurnModelSelection =
       input.modelSelection !== undefined && input.modelSelection.instanceId === boundInstanceId
         ? input.modelSelection
@@ -4459,6 +4692,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         assistantTextBlockOrder: [],
         capturedProposedPlanKeys: new Set(),
         nextSyntheticAssistantBlockIndex: -1,
+        promptMessages: [],
+        usageLimitResetAt: undefined,
       };
 
       const updatedAt = yield* nowIso;
@@ -4489,6 +4724,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       boundInstanceId,
     });
 
+    // Remember the turn's input so a usage-limit retry can re-send it.
+    context.turnState?.promptMessages.push(message);
+
     yield* Queue.offer(context.promptQueue, {
       type: "message",
       message,
@@ -4506,6 +4744,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const interruptTurn: ClaudeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
     function* (threadId, _turnId) {
       const context = yield* requireSession(threadId);
+      // Interrupting during a usage-limit wait cancels the automatic retry and
+      // settles the held turn as the failure it already is.
+      yield* cancelUsageLimitWait(context, "interrupt");
       // Stop-everything semantics: users reach for Stop precisely when a
       // fleet ran away. interrupt() alone only ends the parent turn —
       // background subagents/shells keep running and keep burning tokens.

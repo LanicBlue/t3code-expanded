@@ -201,6 +201,25 @@ CLAUDE_CONFIG_DIR path: ~/.claude_router_home
 Follow the upstream project's README for the router's own install, startup, and configuration
 steps: <https://github.com/musistudio/claude-code-router>.
 
+## What Happens When Claude Hits Its Usage Limit?
+
+Claude subscriptions include a five-hour usage limit. When a turn fails because your account hit
+that limit, T3 Code does not end the turn. Instead:
+
+- The thread shows a note with the time the limit resets, and the turn stays open.
+- A few seconds after that time, T3 Code re-sends your message automatically and the turn continues
+  on the same session.
+- If the retried turn hits the limit again, T3 Code waits again the same way.
+
+You can cancel the wait:
+
+- Stop the turn during the wait and it ends as failed, with the usage-limit error.
+- Send a new message during the wait and the retry is dropped; the turn continues with your new
+  message instead.
+
+The wait is kept in memory. If T3 Code restarts while a turn is waiting, the automatic retry is
+lost — send the message again once the limit has reset.
+
 ## I Want Different Claude Settings, Not A Different Account
 
 Create another Claude provider with the same account if you want a named preset.

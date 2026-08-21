@@ -24,6 +24,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -268,6 +269,59 @@ async function readFirstPromptMessage(
   }
   return next.value;
 }
+
+function emitFiveHourRejection(query: FakeClaudeQuery, resetsAtMs: number, uuid: string): void {
+  query.emit({
+    type: "rate_limit_event",
+    rate_limit_info: {
+      status: "rejected",
+      resetsAt: resetsAtMs,
+      rateLimitType: "five_hour",
+    },
+    uuid,
+    session_id: "sdk-session-1",
+  } as unknown as SDKMessage);
+}
+
+function emitUsageLimitResult(query: FakeClaudeQuery, errors: Array<string>, uuid: string): void {
+  query.emit({
+    type: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    errors,
+    session_id: "sdk-session-1",
+    uuid,
+  } as unknown as SDKMessage);
+}
+
+function emitSuccessResult(query: FakeClaudeQuery, uuid: string): void {
+  query.emit({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    errors: [],
+    session_id: "sdk-session-1",
+    uuid,
+  } as unknown as SDKMessage);
+}
+
+/**
+ * Renders epoch ms the way the CLI renders local wall-clock time (no offset,
+ * zero-padded), so the usage-limit text fallback parses it back to the same
+ * instant on any machine.
+ */
+function localWallClockTimestamp(epochMs: number): string {
+  const parts = DateTime.toParts(DateTime.makeZonedUnsafe(epochMs));
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)} ${pad(parts.hour)}:${pad(parts.minute)}:${pad(parts.second)}`;
+}
+
+/** Lets the stream fiber and the runtime-event collector fiber run to park. */
+const drainRuntimeEvents = Effect.gen(function* () {
+  for (let hop = 0; hop < 8; hop += 1) {
+    yield* Effect.yieldNow;
+  }
+});
 
 const THREAD_ID = ThreadId.make("thread-claude-1");
 const RESUME_THREAD_ID = ThreadId.make("thread-claude-resume");
@@ -4727,6 +4781,526 @@ describe("ClaudeAdapterLive", () => {
         nativeThreadIds.every((threadId) => threadId === String(THREAD_ID)),
         true,
       );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("re-sends the turn once a five-hour usage limit wait elapses", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+      const firstPrompt = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+
+      emitFiveHourRejection(harness.query, 60_000, "rate-limit-1");
+      emitUsageLimitResult(
+        harness.query,
+        ["Five hour usage limit reached. Your limit will reset later."],
+        "result-limit-1",
+      );
+      yield* drainRuntimeEvents;
+
+      // The turn is held open — no settlement, no error banner — and the wait
+      // is announced with its deadline (resetsAt 60s + 5s grace).
+      assert.isUndefined(runtimeEvents.find((event) => event.type === "turn.completed"));
+      assert.isUndefined(runtimeEvents.find((event) => event.type === "runtime.error"));
+      const waitWarning = runtimeEvents.find(
+        (event) =>
+          event.type === "runtime.warning" &&
+          event.payload.message.startsWith("Claude usage limit wait until "),
+      );
+      assert.equal(waitWarning?.type, "runtime.warning");
+      if (waitWarning?.type === "runtime.warning") {
+        assert.equal(
+          waitWarning.payload.message,
+          "Claude usage limit wait until 1970-01-01T00:01:05.000Z; the turn will be retried automatically.",
+        );
+        assert.equal(String(waitWarning.turnId), String(turn.turnId));
+      }
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+
+      // Past the 30s floor but before resetsAt + grace: still waiting.
+      yield* TestClock.adjust("30 seconds");
+      yield* drainRuntimeEvents;
+      assert.isUndefined(
+        runtimeEvents.find(
+          (event) =>
+            event.type === "runtime.warning" && event.payload.message.includes("retrying the turn"),
+        ),
+      );
+
+      // Past resetsAt + grace: the same input is re-sent on the same session.
+      yield* TestClock.adjust("35 seconds");
+      yield* drainRuntimeEvents;
+      assert.isDefined(
+        runtimeEvents.find(
+          (event) =>
+            event.type === "runtime.warning" &&
+            event.payload.message === "Claude usage limit wait ended; retrying the turn.",
+        ),
+      );
+      const retriedPrompt = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      assert.deepEqual(retriedPrompt, firstPrompt);
+
+      emitSuccessResult(harness.query, "result-limit-2");
+      yield* drainRuntimeEvents;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(turnCompletions, 1);
+      const turnCompleted = turnCompletions[0];
+      assert.equal(turnCompleted?.type, "turn.completed");
+      if (turnCompleted?.type === "turn.completed") {
+        assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+        assert.equal(turnCompleted.payload.state, "completed");
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("schedules the usage-limit retry from the localized error text fallback", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      // The fallback parser only accepts 20xx timestamps, so the clock starts
+      // at a realistic instant instead of the TestClock epoch.
+      const startMs = DateTime.makeUnsafe("2026-08-20T00:00:00Z").epochMilliseconds;
+      yield* TestClock.setTime(startMs);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+      const firstPrompt = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+
+      // No structured rate_limit_event: the reset time only exists in the
+      // localized error text, rendered in the daemon's local timezone.
+      emitUsageLimitResult(
+        harness.query,
+        [
+          `5 hour usage limit reached. Your limit will reset at ${localWallClockTimestamp(startMs + 60_000)}.`,
+        ],
+        "result-limit-text",
+      );
+      yield* drainRuntimeEvents;
+
+      const waitWarning = runtimeEvents.find(
+        (event) =>
+          event.type === "runtime.warning" &&
+          event.payload.message.startsWith("Claude usage limit wait until "),
+      );
+      // resetsAt parsed from local wall-clock text (60s) + 5s grace, not the
+      // 30s floor.
+      assert.equal(waitWarning?.type, "runtime.warning");
+      if (waitWarning?.type === "runtime.warning") {
+        assert.equal(
+          waitWarning.payload.message,
+          "Claude usage limit wait until 2026-08-20T00:01:05.000Z; the turn will be retried automatically.",
+        );
+      }
+
+      yield* TestClock.adjust("30 seconds");
+      yield* drainRuntimeEvents;
+      yield* TestClock.adjust("35 seconds");
+      yield* drainRuntimeEvents;
+
+      const retriedPrompt = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      assert.deepEqual(retriedPrompt, firstPrompt);
+
+      emitSuccessResult(harness.query, "result-limit-text-2");
+      yield* drainRuntimeEvents;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(turnCompletions, 1);
+      assert.equal(turnCompletions[0]?.payload.state, "completed");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("settles the held turn as failed when interrupted during the wait", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+
+      emitFiveHourRejection(harness.query, 60_000, "rate-limit-interrupt");
+      emitUsageLimitResult(
+        harness.query,
+        ["Five hour usage limit reached. Your limit will reset later."],
+        "result-limit-interrupt",
+      );
+      yield* drainRuntimeEvents;
+      assert.isUndefined(runtimeEvents.find((event) => event.type === "turn.completed"));
+
+      yield* adapter.interruptTurn(THREAD_ID, turn.turnId);
+      yield* drainRuntimeEvents;
+
+      // Past the retry deadline: the wait was cancelled, nothing re-sends.
+      yield* TestClock.adjust("65 seconds");
+      yield* drainRuntimeEvents;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(turnCompletions, 1);
+      const turnCompleted = turnCompletions[0];
+      assert.equal(turnCompleted?.type, "turn.completed");
+      if (turnCompleted?.type === "turn.completed") {
+        assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+        assert.equal(turnCompleted.payload.state, "failed");
+        assert.equal(
+          turnCompleted.payload.errorMessage,
+          "Five hour usage limit reached. Your limit will reset later.",
+        );
+      }
+      assert.isUndefined(
+        runtimeEvents.find(
+          (event) =>
+            event.type === "runtime.warning" && event.payload.message.includes("retrying the turn"),
+        ),
+      );
+      // The session survives the interrupt; only the retry is gone.
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("settles the held turn as failed when the session stops during the wait", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+
+      emitFiveHourRejection(harness.query, 60_000, "rate-limit-stop");
+      emitUsageLimitResult(
+        harness.query,
+        ["Five hour usage limit reached. Your limit will reset later."],
+        "result-limit-stop",
+      );
+      yield* drainRuntimeEvents;
+
+      yield* adapter.stopSession(THREAD_ID);
+      yield* drainRuntimeEvents;
+      yield* TestClock.adjust("65 seconds");
+      yield* drainRuntimeEvents;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(turnCompletions, 1);
+      const turnCompleted = turnCompletions[0];
+      assert.equal(turnCompleted?.type, "turn.completed");
+      if (turnCompleted?.type === "turn.completed") {
+        assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+        assert.equal(turnCompleted.payload.state, "failed");
+      }
+      assert.isDefined(runtimeEvents.find((event) => event.type === "session.exited"));
+      assert.isUndefined(
+        runtimeEvents.find(
+          (event) =>
+            event.type === "runtime.warning" && event.payload.message.includes("retrying the turn"),
+        ),
+      );
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("supersedes the usage-limit retry when a new message steers the turn", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+
+      emitFiveHourRejection(harness.query, 60_000, "rate-limit-steer");
+      emitUsageLimitResult(
+        harness.query,
+        ["Five hour usage limit reached. Your limit will reset later."],
+        "result-limit-steer",
+      );
+      yield* drainRuntimeEvents;
+
+      // The user talks again while the wait is pending: the steer takes over
+      // the held turn and the automatic retry is dropped.
+      yield* TestClock.adjust("10 seconds");
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "actually, keep going",
+        attachments: [],
+      });
+      yield* drainRuntimeEvents;
+      yield* TestClock.adjust("60 seconds");
+      yield* drainRuntimeEvents;
+
+      assert.isUndefined(
+        runtimeEvents.find(
+          (event) =>
+            event.type === "runtime.warning" && event.payload.message.includes("retrying the turn"),
+        ),
+      );
+      assert.isUndefined(
+        runtimeEvents.find(
+          (event) => event.type === "turn.started" && String(event.turnId) !== String(turn.turnId),
+        ),
+      );
+
+      emitSuccessResult(harness.query, "result-steer");
+      yield* drainRuntimeEvents;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(turnCompletions, 1);
+      assert.equal(turnCompletions[0]?.payload.state, "completed");
+      if (turnCompletions[0]?.type === "turn.completed") {
+        assert.equal(String(turnCompletions[0].turnId), String(turn.turnId));
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("re-arms the usage-limit wait when the retry is rejected again", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+      const firstPrompt = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+
+      emitFiveHourRejection(harness.query, 60_000, "rate-limit-rearm-1");
+      emitUsageLimitResult(
+        harness.query,
+        ["Five hour usage limit reached. Your limit will reset later."],
+        "result-limit-rearm-1",
+      );
+      yield* drainRuntimeEvents;
+      yield* TestClock.adjust("65 seconds");
+      yield* drainRuntimeEvents;
+      const firstRetry = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      assert.deepEqual(firstRetry, firstPrompt);
+
+      // The retry lands while the limit is still in force: a fresh rejection
+      // re-arms the wait against the new resetsAt (130s + 5s grace).
+      emitFiveHourRejection(harness.query, 130_000, "rate-limit-rearm-2");
+      emitUsageLimitResult(
+        harness.query,
+        ["Five hour usage limit reached. Your limit will reset later."],
+        "result-limit-rearm-2",
+      );
+      yield* drainRuntimeEvents;
+
+      const waitWarnings = runtimeEvents.filter(
+        (event) =>
+          event.type === "runtime.warning" &&
+          event.payload.message.startsWith("Claude usage limit wait until "),
+      );
+      assert.lengthOf(waitWarnings, 2);
+      assert.equal(waitWarnings[1]?.type, "runtime.warning");
+      if (waitWarnings[1]?.type === "runtime.warning") {
+        assert.equal(
+          waitWarnings[1].payload.message,
+          "Claude usage limit wait until 1970-01-01T00:02:15.000Z; the turn will be retried automatically.",
+        );
+      }
+      assert.isUndefined(runtimeEvents.find((event) => event.type === "turn.completed"));
+
+      yield* TestClock.adjust("70 seconds");
+      yield* drainRuntimeEvents;
+
+      assert.lengthOf(
+        runtimeEvents.filter(
+          (event) =>
+            event.type === "runtime.warning" &&
+            event.payload.message === "Claude usage limit wait ended; retrying the turn.",
+        ),
+        2,
+      );
+      const secondRetry = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      assert.deepEqual(secondRetry, firstPrompt);
+
+      emitSuccessResult(harness.query, "result-limit-rearm-3");
+      yield* drainRuntimeEvents;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(turnCompletions, 1);
+      assert.equal(turnCompletions[0]?.payload.state, "completed");
+      if (turnCompletions[0]?.type === "turn.completed") {
+        assert.equal(String(turnCompletions[0].turnId), String(turn.turnId));
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("leaves non-usage-limit failures untouched", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+
+      // A seven-day rejection is not a five-hour limit: no retry signal.
+      harness.query.emit({
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "rejected",
+          resetsAt: 60_000,
+          rateLimitType: "seven_day",
+        },
+        uuid: "rate-limit-seven-day",
+        session_id: "sdk-session-1",
+      } as unknown as SDKMessage);
+      emitUsageLimitResult(harness.query, ["API Error: 500 internal server error"], "result-500");
+      yield* drainRuntimeEvents;
+      yield* TestClock.adjust("65 seconds");
+      yield* drainRuntimeEvents;
+      runtimeEventsFiber.interruptUnsafe();
+
+      const turnCompletions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.lengthOf(turnCompletions, 1);
+      const turnCompleted = turnCompletions[0];
+      assert.equal(turnCompleted?.type, "turn.completed");
+      if (turnCompleted?.type === "turn.completed") {
+        assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+        assert.equal(turnCompleted.payload.state, "failed");
+        assert.equal(turnCompleted.payload.errorMessage, "API Error: 500 internal server error");
+      }
+      const runtimeError = runtimeEvents.find((event) => event.type === "runtime.error");
+      assert.isDefined(runtimeError);
+      assert.isUndefined(runtimeEvents.find((event) => event.type === "runtime.warning"));
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
