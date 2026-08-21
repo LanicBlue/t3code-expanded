@@ -183,13 +183,5 @@ it.layer(layer)("ProviderAdapterRegistryLive", (it) => {
         defaultInstanceIdForDriver(OPENCODE_DRIVER),
         defaultInstanceIdForDriver(CURSOR_DRIVER),
       ]);
-
-      const providers = yield* registry.listProviders();
-      assert.deepStrictEqual(providers, [
-        CODEX_DRIVER,
-        CLAUDE_AGENT_DRIVER,
-        OPENCODE_DRIVER,
-        CURSOR_DRIVER,
-      ]);
     }));
 });

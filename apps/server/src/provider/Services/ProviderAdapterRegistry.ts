@@ -65,15 +65,6 @@ export interface ProviderAdapterRegistryShape {
   readonly listInstances: () => Effect.Effect<ReadonlyArray<ProviderInstanceId>>;
 
   /**
-   * Legacy: list provider kinds whose default instance is currently
-   * registered.
-   *
-   * @deprecated Prefer `listInstances`. Retained for migration-era call
-   * sites that iterate providers to build UI/metrics.
-   */
-  readonly listProviders: () => Effect.Effect<ReadonlyArray<ProviderDriverKind>>;
-
-  /**
    * Change notification stream mirroring `ProviderInstanceRegistry.streamChanges`.
    * Emits one `void` tick whenever the set of live instances changes
    * (instance added, removed, or rebuilt after a settings edit). Consumers

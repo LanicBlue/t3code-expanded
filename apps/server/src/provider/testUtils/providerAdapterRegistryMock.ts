@@ -80,14 +80,6 @@ export const makeAdapterRegistryMock = (adapters: KindAdapterMap): ProviderAdapt
       });
     },
     listInstances: () => Effect.succeed(Array.from(byInstanceId.keys())),
-    listProviders: () =>
-      Effect.succeed(
-        Record.keys(
-          Record.filterMap(adapters, (adapter, kind) =>
-            adapter !== undefined ? Result.succeed(kind) : Result.failVoid,
-          ),
-        ),
-      ),
     // Static test fixtures don't reload; an empty stream is enough to
     // satisfy the shape. Tests exercising hot-reload build their own
     // stream via the real `ProviderInstanceRegistry`.

@@ -1216,7 +1216,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             const registry = yield* ProviderRegistry.ProviderRegistry;
 
             assert.deepStrictEqual(yield* registry.getProviders, [cachedProvider]);
-            assert.deepStrictEqual(yield* registry.refresh(codexDriver), [cachedProvider]);
+            assert.deepStrictEqual(yield* registry.refreshAll, [cachedProvider]);
             assert.deepStrictEqual(yield* registry.refreshInstance(codexInstanceId), [
               cachedProvider,
             ]);

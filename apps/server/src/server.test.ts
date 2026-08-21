@@ -629,7 +629,7 @@ const buildAppUnderTest = (options?: {
       Layer.provide(
         Layer.mock(ProviderRegistry.ProviderRegistry)({
           getProviders: Effect.succeed([]),
-          refresh: () => Effect.succeed([]),
+          refreshAll: Effect.succeed([]),
           refreshInstance: () => Effect.succeed([]),
           getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
             Effect.succeed(

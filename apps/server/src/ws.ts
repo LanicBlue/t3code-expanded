@@ -143,19 +143,6 @@ function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
 }
 
-/** Preserve the setup runner's broader pre-refactor message normalization. */
-function legacySetupFailureDescription(cause: unknown): string {
-  if (
-    typeof cause === "object" &&
-    cause !== null &&
-    "message" in cause &&
-    typeof cause.message === "string"
-  ) {
-    return cause.message;
-  }
-  return String(cause);
-}
-
 function projectEntriesFailureContext(error: WorkspaceEntries.WorkspaceEntriesError): {
   readonly failure: ProjectEntriesFailure;
   readonly normalizedCwd?: string;
@@ -265,7 +252,13 @@ function projectSetupScriptCompatibilityDetail(
 ): string {
   switch (error._tag) {
     case "ProjectSetupScriptOperationError":
-      return legacySetupFailureDescription(error.cause);
+      const cause = error.cause;
+      return typeof cause === "object" &&
+        cause !== null &&
+        "message" in cause &&
+        typeof cause.message === "string"
+        ? cause.message
+        : String(cause);
     case "ProjectSetupScriptProjectNotFoundError":
       return "Project was not found for setup script execution.";
     default:
@@ -1454,7 +1447,7 @@ const makeWsRpcLayer = (
             WS_METHODS.serverRefreshProviders,
             (input.instanceId !== undefined
               ? providerRegistry.refreshInstance(input.instanceId)
-              : providerRegistry.refresh()
+              : providerRegistry.refreshAll
             ).pipe(Effect.map((providers) => ({ providers }))),
             { "rpc.aggregate": "server" },
           ),
@@ -2219,9 +2212,10 @@ const makeWsRpcLayer = (
                 })),
               );
 
-              yield* providerRegistry
-                .refresh()
-                .pipe(Effect.ignoreCause({ log: true }), Effect.forkScoped);
+              yield* providerRegistry.refreshAll.pipe(
+                Effect.ignoreCause({ log: true }),
+                Effect.forkScoped,
+              );
 
               const liveUpdates = Stream.merge(
                 keybindingsUpdates,

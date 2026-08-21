@@ -27,16 +27,8 @@ export interface ProviderRegistryShape {
    */
   readonly getProviders: Effect.Effect<ReadonlyArray<ServerProvider>>;
 
-  /**
-   * Refresh all providers, or the default instance of the specified
-   * kind when supplied.
-   *
-   * Retained for back-compat with legacy call sites (WS refresh RPC,
-   * orchestration metrics). New code should prefer `refreshInstance`.
-   *
-   * @deprecated prefer `refreshInstance` for new call sites.
-   */
-  readonly refresh: (provider?: ProviderDriverKind) => Effect.Effect<ReadonlyArray<ServerProvider>>;
+  /** Refresh every configured instance; returns the updated snapshot list. */
+  readonly refreshAll: Effect.Effect<ReadonlyArray<ServerProvider>>;
 
   /**
    * Refresh the specific configured instance. Returns the updated snapshot

@@ -116,9 +116,6 @@ export class TextGeneration extends Context.Service<
   }
 >()("t3/textGeneration/TextGeneration") {}
 
-/** @deprecated Use `TextGeneration["Service"]`. */
-export type TextGenerationShape = TextGeneration["Service"];
-
 type TextGenerationOp =
   | "generateCommitMessage"
   | "generatePrContent"
