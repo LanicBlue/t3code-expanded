@@ -167,6 +167,23 @@ export const ProjectFlowSpawnRecord = Schema.Struct({
 });
 export type ProjectFlowSpawnRecord = typeof ProjectFlowSpawnRecord.Type;
 
+/** A read flow document: content arrives base64; revision is the durable CAS token. */
+export const ProjectFlowDocumentRecord = Schema.Struct({
+  data: Schema.String,
+  revision: Schema.String,
+  displayPath: Schema.String,
+  size: Schema.Int,
+});
+export type ProjectFlowDocumentRecord = typeof ProjectFlowDocumentRecord.Type;
+
+/** A notarized write: the receipt submit's documentReceiptIds validation accepts. */
+export const ProjectFlowDocumentWriteRecord = Schema.Struct({
+  documentReceiptId: Schema.String,
+  revision: Schema.String,
+  displayPath: Schema.String,
+});
+export type ProjectFlowDocumentWriteRecord = typeof ProjectFlowDocumentWriteRecord.Type;
+
 export const ProjectWorkOperationRecord = Schema.Union([
   Schema.Struct({
     status: Schema.Literals(["pending"]),
@@ -316,6 +333,30 @@ export class ProjectServiceWorkClient extends Context.Service<
       readonly name: string;
       readonly promptOverrides?: Readonly<Record<string, string>>;
     }) => Effect.Effect<ProjectFlowSpawnRecord, ProjectServiceWorkClientError>;
+    /**
+     * Flow-document notary (by-run addressing): read a document through one of
+     * the agent's open runs — the run's slot rights decide readability.
+     */
+    readonly readFlowDocument: (input: {
+      readonly projectId: string;
+      readonly runId: string;
+      readonly agentId: string;
+      readonly path: string;
+    }) => Effect.Effect<ProjectFlowDocumentRecord, ProjectServiceWorkClientError>;
+    /**
+     * Notarized document write: returns the durable documentReceiptId to hand
+     * to project_work_submit's result (documentReceiptIds) — the completion
+     * validates it against the run's slot rights; only this path can mint one.
+     */
+    readonly writeFlowDocument: (input: {
+      readonly projectId: string;
+      readonly runId: string;
+      readonly agentId: string;
+      readonly idempotencyKey: string;
+      readonly path: string;
+      readonly operation: "create" | "update" | "delete";
+      readonly data?: string;
+    }) => Effect.Effect<ProjectFlowDocumentWriteRecord, ProjectServiceWorkClientError>;
   }
 >()("t3/projectService/ProjectServiceWorkClient") {}
 
@@ -617,6 +658,36 @@ export const make = Effect.gen(function* () {
       name: input.name,
       ...(input.promptOverrides === undefined ? {} : { promptOverrides: input.promptOverrides }),
     }) as Parameters<ProjectConsumerWorkClient["startFlow"]>[0];
+  const readFlowDocumentArgs = (input: {
+    readonly projectId: string;
+    readonly runId: string;
+    readonly agentId: string;
+    readonly path: string;
+  }) =>
+    ({
+      projectId: input.projectId,
+      runId: input.runId,
+      agentId: input.agentId,
+      path: input.path,
+    }) as Parameters<ProjectConsumerWorkClient["readFlowDocument"]>[0];
+  const writeFlowDocumentArgs = (input: {
+    readonly projectId: string;
+    readonly runId: string;
+    readonly agentId: string;
+    readonly idempotencyKey: string;
+    readonly path: string;
+    readonly operation: "create" | "update" | "delete";
+    readonly data?: string;
+  }) =>
+    ({
+      projectId: input.projectId,
+      runId: input.runId,
+      agentId: input.agentId,
+      idempotencyKey: input.idempotencyKey,
+      path: input.path,
+      operation: input.operation,
+      ...(input.data === undefined ? {} : { data: input.data }),
+    }) as Parameters<ProjectConsumerWorkClient["writeFlowDocument"]>[0];
 
   return ProjectServiceWorkClient.of({
     listProjects,
@@ -666,6 +737,18 @@ export const make = Effect.gen(function* () {
         undefined,
         (client) => client.startFlow(startFlowArgs(input)),
         (value) => decodeOrIncompatible(ProjectFlowSpawnRecord, value),
+      ),
+    readFlowDocument: (input) =>
+      withClient(
+        undefined,
+        (client) => client.readFlowDocument(readFlowDocumentArgs(input)),
+        (value) => decodeOrIncompatible(ProjectFlowDocumentRecord, value),
+      ),
+    writeFlowDocument: (input) =>
+      withClient(
+        undefined,
+        (client) => client.writeFlowDocument(writeFlowDocumentArgs(input)),
+        (value) => decodeOrIncompatible(ProjectFlowDocumentWriteRecord, value),
       ),
   });
 });

@@ -117,6 +117,20 @@ export class ProjectFlowSpawnRefusedError extends Schema.TaggedErrorClass<Projec
   }
 }
 
+/**
+ * The addressed run's slot rights do not cover the document operation — a
+ * rights question, not a credential one (the 403 bucket stays reserved for
+ * credential problems).
+ */
+export class ProjectFlowDocumentDeniedError extends Schema.TaggedErrorClass<ProjectFlowDocumentDeniedError>()(
+  "ProjectFlowDocumentDeniedError",
+  { code: Schema.String, serviceMessage: Schema.String },
+) {
+  override get message(): string {
+    return `${this.serviceMessage} The run's slot rights do not cover this document operation.`;
+  }
+}
+
 export const ProjectWorkError = Schema.Union([
   ProjectWorkUnavailableError,
   ProjectWorkAuthenticationError,
@@ -125,6 +139,7 @@ export const ProjectWorkError = Schema.Union([
   ProjectWorkNotFoundError,
   ProjectWorkIncompatibleError,
   ProjectFlowSpawnRefusedError,
+  ProjectFlowDocumentDeniedError,
   ProjectWorkRejectedError,
 ]);
 export type ProjectWorkError = typeof ProjectWorkError.Type;
@@ -277,10 +292,66 @@ export const ProjectFlowStartTool = Tool.make("project_flow_start", {
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
 
+export const ProjectDocReadInput = Schema.Struct({
+  runId: Schema.String.annotate({
+    description:
+      "One of your OPEN work runs (from project_work_list) whose slot grants read rights over the document.",
+  }),
+  path: Schema.String.annotate({
+    description:
+      'The instance-relative document path shown as flow://project/<instance>/<path>, e.g. "decision.md".',
+  }),
+});
+
+export const ProjectDocWriteInput = Schema.Struct({
+  runId: Schema.String.annotate({
+    description:
+      "One of your OPEN work runs (from project_work_list) whose slot grants WRITE rights over the document.",
+  }),
+  path: Schema.String.annotate({
+    description:
+      'The instance-relative document path, e.g. "decision.md". Must be a document the flow definition declares.',
+  }),
+  operation: Schema.Literals(["create", "update", "delete"]).annotate({
+    description: "create requires the file to be absent; update/delete require it to exist.",
+  }),
+  content: Schema.String.annotate({
+    description: "The full document content as UTF-8 text (operation create/update).",
+  }),
+});
+
+export const ProjectDocReadTool = Tool.make("project_doc_read", {
+  description:
+    "Read a flow document of the session project through one of your open work runs — the run's slot rights decide readability (a read-only slot cannot write, a write-only slot cannot read). Documents are the handoff channel between works: read what an earlier work recorded, e.g. the triage decision. Editing the file on disk directly does NOT count — only the notarized path mints receipts.",
+  parameters: ProjectDocReadInput,
+  success: ProjectServiceWorkClient.ProjectFlowDocumentRecord,
+  failure: ProjectWorkError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Read a Project flow document")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+export const ProjectDocWriteTool = Tool.make("project_doc_write", {
+  description:
+    "Write a flow document of the session project through one of your open work runs (notarized): returns a documentReceiptId you then pass in project_work_submit's result as documentReceiptIds — the submit validates it against the run's slot rights. This is how work hands its output to later works (e.g. the triage decision the dispatcher reads). Write the FULL content; the operation is create (file absent) or update. The disk file itself is not the contract — without the receipt the completion does not count.",
+  parameters: ProjectDocWriteInput,
+  success: ProjectServiceWorkClient.ProjectFlowDocumentWriteRecord,
+  failure: ProjectWorkError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Write a Project flow document (notarized)")
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true);
+
 export const ProjectWorkToolkit = Toolkit.make(
   ProjectWorkListTool,
   ProjectWorkGetTool,
   ProjectWorkSubmitTool,
   ProjectOperationGetTool,
   ProjectFlowStartTool,
+  ProjectDocReadTool,
+  ProjectDocWriteTool,
 );

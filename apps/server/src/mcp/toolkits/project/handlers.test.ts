@@ -159,15 +159,21 @@ interface CapturedSpawn {
   readonly promptOverrides?: Readonly<Record<string, string>>;
 }
 
+const docWritesRef: { path: string; operation: string }[] = [];
+let docWriteError: ProjectServiceWorkClient.ProjectServiceWorkClientError | undefined;
+
 const makeWorkClientLayer = (overrides?: {
   readonly runs?: readonly ProjectServiceWorkClient.ProjectWorkRunRecord[];
   readonly positions?: readonly ProjectServiceWorkClient.ProjectWorkPositionRecord[];
   readonly run?: ProjectServiceWorkClient.ProjectWorkRunRecord | null;
   readonly serviceProjects?: readonly ProjectServiceWorkClient.ProjectServiceProjectRecord[];
   readonly spawnError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
+  readonly documentWriteError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
 }) => {
+  docWriteError = overrides?.documentWriteError;
   const submitted: CapturedSubmit[] = [];
   const spawned: CapturedSpawn[] = [];
+  const docWrites = docWritesRef;
   const service = ProjectServiceWorkClient.ProjectServiceWorkClient.of({
     // The directory-keyed mapping: one service project registered at the
     // thread project's workspace root.
@@ -204,6 +210,24 @@ const makeWorkClientLayer = (overrides?: {
       );
     },
     getOperation: () => Effect.succeed(COMMITTED_OPERATION),
+    readFlowDocument: (input: { readonly path: string }) =>
+      Effect.succeed({
+        data: Buffer.from("decision: ship it", "utf8").toString("base64"),
+        revision: "doc:1",
+        displayPath: `flow://project/fi_1/${input.path}`,
+        size: 16,
+      }),
+    writeFlowDocument: (input: { readonly path: string; readonly operation: string }) => {
+      docWrites.push({ ...input });
+      if (docWriteError !== undefined) {
+        return Effect.fail(docWriteError);
+      }
+      return Effect.succeed({
+        documentReceiptId: "document:" + "a".repeat(64),
+        revision: "doc:2",
+        displayPath: `flow://project/fi_1/${input.path}`,
+      });
+    },
     startFlow: (input) => {
       spawned.push({ ...input });
       if (overrides?.spawnError !== undefined) {
@@ -218,6 +242,7 @@ const makeWorkClientLayer = (overrides?: {
   return {
     submitted,
     spawned,
+    docWrites,
     layer: Layer.succeed(ProjectServiceWorkClient.ProjectServiceWorkClient, service),
   };
 };
@@ -372,6 +397,64 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       });
     },
   );
+
+  it.effect("project_doc_read returns the document through the derived identity", () => {
+    const { layer } = makeWorkClientLayer();
+
+    return Effect.gen(function* () {
+      const document = yield* ProjectWorkToolkitHandlers.project_doc_read({
+        runId: "run_9",
+        path: "decision.md",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }));
+
+      assert.include(Buffer.from(document.data, "base64").toString("utf8"), "ship it");
+      assert.include(document.displayPath, "decision.md");
+    });
+  });
+
+  it.effect(
+    "project_doc_write notarizes content and maps slot-right denial to the document error",
+    () => {
+      const denied = new ProjectServiceWorkClient.ProjectServiceWorkServiceRejectedError({
+        code: "FLOW_DOCUMENT_PERMISSION_DENIED",
+        status: 403,
+        message: "slot rights do not cover this document",
+      });
+      const { docWrites, layer } = makeWorkClientLayer({ documentWriteError: denied });
+
+      return Effect.gen(function* () {
+        const failure = yield* ProjectWorkToolkitHandlers.project_doc_write({
+          runId: "run_9",
+          path: "decision.md",
+          operation: "update",
+          content: "# decision\nship it\n",
+        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+
+        // The 403 stays reserved for credential problems; this denial is about
+        // the run's slot rights.
+        assert.deepEqual(plainError(failure), {
+          _tag: "ProjectFlowDocumentDeniedError",
+          code: "FLOW_DOCUMENT_PERMISSION_DENIED",
+          serviceMessage: "slot rights do not cover this document",
+        });
+      });
+    },
+  );
+
+  it.effect("project_doc_write base64-carries the content through the derived identity", () => {
+    const { docWrites, layer } = makeWorkClientLayer();
+
+    return Effect.gen(function* () {
+      const receipt = yield* ProjectWorkToolkitHandlers.project_doc_write({
+        runId: "run_9",
+        path: "decision.md",
+        operation: "create",
+        content: "# decision\nship it\n",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }));
+
+      assert.match(receipt.documentReceiptId, /^document:[0-9a-f]{64}$/);
+    });
+  });
 
   it.effect("project_work_get answers a structured not-found when the service returns null", () => {
     const { layer } = makeWorkClientLayer({ run: null });

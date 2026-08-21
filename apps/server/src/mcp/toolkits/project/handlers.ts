@@ -65,6 +65,10 @@ export const mapProjectServiceError = (
       if (code === "PROJECT_CONSUMER_SPAWN_NOT_AUTHORIZED") {
         return new Tools.ProjectFlowSpawnRefusedError({ code, serviceMessage: message });
       }
+      // Document denial is about the run's SLOT RIGHTS, not the credential.
+      if (code === "FLOW_DOCUMENT_PERMISSION_DENIED") {
+        return new Tools.ProjectFlowDocumentDeniedError({ code, serviceMessage: message });
+      }
       if (isAuthenticationStatus(status)) {
         return new Tools.ProjectWorkAuthenticationError({ code, status });
       }
@@ -300,6 +304,46 @@ const handlers = {
           ...(input.promptOverrides === undefined
             ? {}
             : { promptOverrides: input.promptOverrides }),
+        })
+        .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+    }),
+  project_doc_read: (input: { readonly runId: string; readonly path: string }) =>
+    Effect.gen(function* () {
+      const context = yield* resolveContext("project.work.read");
+      const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+      return yield* client
+        .readFlowDocument({
+          projectId: context.projectServiceProjectId,
+          runId: input.runId,
+          agentId: context.logicalAgentId,
+          path: input.path,
+        })
+        .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+    }),
+  project_doc_write: (input: {
+    readonly runId: string;
+    readonly path: string;
+    readonly operation: "create" | "update" | "delete";
+    readonly content: string;
+  }) =>
+    Effect.gen(function* () {
+      const context = yield* resolveContext("project.work.write");
+      const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+      const crypto = yield* Crypto.Crypto;
+      // Fresh key per call: a retried write is a new notarized write (the
+      // receipt layer replays only same-key+same-digest), never a silent replay.
+      const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      return yield* client
+        .writeFlowDocument({
+          projectId: context.projectServiceProjectId,
+          runId: input.runId,
+          agentId: context.logicalAgentId,
+          idempotencyKey,
+          path: input.path,
+          operation: input.operation,
+          ...(input.operation === "delete"
+            ? {}
+            : { data: Buffer.from(input.content, "utf8").toString("base64") }),
         })
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
     }),
