@@ -26,6 +26,7 @@ import {
   ProjectWorkRoutingError,
   resolveProjectWorkRouting,
   workSessionThreadTitle,
+  worktreeBindingFor,
   type ProjectWorkSessionRouterDeps,
   type ProjectWorkWakeInput,
 } from "./ProjectWorkNoticeRouting.ts";
@@ -130,6 +131,8 @@ interface Harness {
   readonly putThread: (shell: OrchestrationThreadShell) => void;
   readonly removeThread: (threadId: string) => void;
   readonly setOpenWorkCount: (count: number) => void;
+  /** Replace the synthetic runs entirely (workspace facts, ordering, ids). */
+  readonly setOpenRuns: (runs: AssignedWorkQueueEntry[] | null) => void;
   readonly failWorkCount: (shouldFail: boolean) => void;
   readonly countCalls: () => number;
   readonly failDispatch: (shouldFail: boolean) => void;
@@ -179,6 +182,9 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
       [PROVIDER_INSTANCE, ProviderDriverKind.make("codex")],
     ]);
     let openWorkCount = 2;
+    // When set, the authoritative Work query answers these runs instead of
+    // the synthetic count fixture (workspace-facts and drain scenarios).
+    let openRunsOverride: AssignedWorkQueueEntry[] | null = null;
     // Deterministic fake runs for the queue: oldest-first by construction.
     const syntheticOpenRuns = (count: number): Array<AssignedWorkQueueEntry> =>
       Array.from({ length: count }, (_, index) => ({
@@ -338,7 +344,7 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
                 detail: "authoritative Work query failed",
               }),
             )
-          : Effect.succeed(syntheticOpenRuns(openWorkCount));
+          : Effect.succeed(openRunsOverride ?? syntheticOpenRuns(openWorkCount));
         return workCountDelayMs > 0
           ? Effect.sleep(workCountDelayMs).pipe(Effect.flatMap(() => outcome))
           : outcome;
@@ -366,6 +372,9 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
       },
       setOpenWorkCount: (count) => {
         openWorkCount = count;
+      },
+      setOpenRuns: (runs) => {
+        openRunsOverride = runs;
       },
       failWorkCount: (shouldFail) => {
         workCountShouldFail = shouldFail;
@@ -1334,6 +1343,268 @@ it.effect("a deferred event after the resolved project vanished never re-creates
     assert.isTrue(sessions[0]?.pendingWork);
   }),
 );
+
+// ── Step ②: execution-workspace binding (session cwd follows the queue head) ──
+
+const WT_A = "/tmp/registry/.project/worktrees/ew_aaa";
+const WT_B = "/tmp/registry/.project/worktrees/ew_bbb";
+
+/** A run carrying execution-workspace facts, oldest-first by construction. */
+const workspaceRun = (overrides: Partial<AssignedWorkQueueEntry>): AssignedWorkQueueEntry => ({
+  runId: "run_wt",
+  positionId: "position_wt",
+  runRevision: "run:1",
+  state: "open",
+  agentId: AGENT_ID,
+  task: { prompt: "do the thing" },
+  createdAt: "2026-08-21T00:00:10.000Z",
+  ...overrides,
+});
+
+const threadMetaUpdates = (commands: OrchestrationCommand[]) =>
+  commands.filter((command) => command.type === "thread.meta.update");
+
+/** Engage the aggregate turn (running) and then finish it (ready). */
+const runAggregateTurn = (
+  harness: Harness,
+  threadId: string,
+  projectId: string,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    harness.putThread(
+      makeThreadShell(threadId, projectId, (shell) => ({
+        ...shell,
+        session: runningSession(threadId),
+      })),
+    );
+    yield* harness.router.onThreadEvent(threadId as never);
+    harness.putThread(
+      makeThreadShell(threadId, projectId, (shell) => ({
+        ...shell,
+        session: readySession(threadId),
+      })),
+    );
+    yield* harness.router.onThreadEvent(threadId as never);
+  });
+
+describe("execution-workspace binding", () => {
+  it("worktreeBindingFor binds only managed-worktree paths", () => {
+    assert.strictEqual(
+      worktreeBindingFor(
+        workspaceRun({ workspacePolicy: "managed-worktree", workspacePath: WT_A }),
+      ),
+      WT_A,
+    );
+    // Unknown is never project-root: absent facts, non-managed policies, and
+    // blank paths all stay unbound.
+    assert.strictEqual(worktreeBindingFor(workspaceRun({})), null);
+    assert.strictEqual(
+      worktreeBindingFor(
+        workspaceRun({ workspacePolicy: "project-root", workspacePath: "/tmp/registry" }),
+      ),
+      null,
+    );
+    assert.strictEqual(
+      worktreeBindingFor(
+        workspaceRun({ workspacePolicy: "managed-worktree", workspacePath: "   " }),
+      ),
+      null,
+    );
+    assert.strictEqual(worktreeBindingFor(null), null);
+  });
+
+  it.effect("a created session binds the queue HEAD's managed worktree", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_a",
+          createdAt: "2026-08-21T00:00:10.000Z",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+        workspaceRun({
+          runId: "run_b",
+          createdAt: "2026-08-21T00:00:11.000Z",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_B,
+        }),
+      ]);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      assert.strictEqual(created?.type === "thread.create" && created.worktreePath, WT_A);
+      const sessions = yield* harness.router.snapshotSessions;
+      assert.strictEqual(sessions[0]?.boundWorktreePath, WT_A);
+    }),
+  );
+
+  it.effect("runs without workspace facts stay unbound (project root)", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      assert.strictEqual(created?.type === "thread.create" && created.worktreePath, null);
+      const sessions = yield* harness.router.snapshotSessions;
+      assert.strictEqual(sessions[0]?.boundWorktreePath, null);
+    }),
+  );
+
+  it.effect("a head moving to another worktree REBINDS the session in place", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_a",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+      ]);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      const threadId = created?.type === "thread.create" ? created.threadId : undefined;
+      const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
+      assert.isDefined(threadId);
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+
+      // The next work runs in a different managed worktree: a subsequent
+      // wake rebinds the SAME thread (thread.meta.update), never a second
+      // session.
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_c",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_B,
+        }),
+      ]);
+      yield* wake(harness.router);
+
+      assert.lengthOf(threadCreates(harness.commands), 1);
+      const rebinding = threadMetaUpdates(harness.commands);
+      assert.lengthOf(rebinding, 1);
+      assert.strictEqual(
+        rebinding[0]?.type === "thread.meta.update" && rebinding[0].worktreePath,
+        WT_B,
+      );
+      assert.strictEqual(
+        rebinding[0]?.type === "thread.meta.update" && String(rebinding[0].threadId),
+        threadId,
+      );
+      const sessions = yield* harness.router.snapshotSessions;
+      assert.strictEqual(sessions[0]?.boundWorktreePath, WT_B);
+      assert.lengthOf(turnStarts(harness.commands), 2);
+    }),
+  );
+
+  it.effect("the same worktree does not rebind", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_a",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+        workspaceRun({
+          runId: "run_b",
+          createdAt: "2026-08-21T00:00:11.000Z",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+      ]);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      const threadId = created?.type === "thread.create" ? created.threadId : undefined;
+      const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+
+      // Head advanced within the same instance's worktree: the session stays
+      // bound where it is.
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_b",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+      ]);
+      yield* wake(harness.router);
+
+      assert.isEmpty(threadMetaUpdates(harness.commands));
+      assert.lengthOf(threadCreates(harness.commands), 1);
+    }),
+  );
+
+  it.effect("turn end ADVANCES the queue when the head moved on (drain)", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_a",
+          task: { prompt: "第一件工作" },
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+      ]);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      const threadId = created?.type === "thread.create" ? created.threadId : undefined;
+      const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
+
+      // The agent submitted run_a; the head rotated to another instance's
+      // worktree. No new notice arrives (notices are per-run), so the drain
+      // must deliver the next head itself — and rebind to its worktree.
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_z",
+          task: { prompt: "第二件工作" },
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_B,
+        }),
+      ]);
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+
+      assert.lengthOf(turnStarts(harness.commands), 2);
+      const secondMessage =
+        turnStarts(harness.commands)[1]?.type === "thread.turn.start"
+          ? turnStarts(harness.commands)[1]?.message.text
+          : null;
+      assert.include(secondMessage, "第二件工作");
+      const rebinding = threadMetaUpdates(harness.commands);
+      assert.lengthOf(rebinding, 1);
+      assert.strictEqual(
+        rebinding[0]?.type === "thread.meta.update" && rebinding[0].worktreePath,
+        WT_B,
+      );
+      const sessions = yield* harness.router.snapshotSessions;
+      assert.strictEqual(sessions[0]?.phase, "notifying");
+    }),
+  );
+
+  it.effect("turn end with an UNCHANGED head does not re-deliver", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_a",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+      ]);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      const threadId = created?.type === "thread.create" ? created.threadId : undefined;
+      const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
+
+      // The agent finished its turn without submitting: the head is still
+      // the one it was told about — no nagging, no second aggregate.
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+
+      assert.lengthOf(turnStarts(harness.commands), 1);
+      assert.isEmpty(threadMetaUpdates(harness.commands));
+      const sessions = yield* harness.router.snapshotSessions;
+      assert.strictEqual(sessions[0]?.phase, "idle");
+    }),
+  );
+});
 
 describe("applyThinkLevelToOptions", () => {
   it("maps the driver's effort option id and leaves explicit selections alone", () => {

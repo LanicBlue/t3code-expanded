@@ -51,6 +51,23 @@ import {
 const DEFAULT_ROUTING_RUNTIME_MODE = "full-access" as const;
 const DEFAULT_ROUTING_INTERACTION_MODE = "default" as const;
 
+// ── Session worktree binding ────────────────────────────────────
+
+/**
+ * The execution workspace a work session should run in for this queue head:
+ * the Project Service's managed worktree path when one is bound to the run,
+ * else null (the session then runs in the project root — the same fallback
+ * `resolveThreadWorkspaceCwd` applies to unbound threads). Absent facts are
+ * UNKNOWN, never project-root: a run whose policy is not
+ * `managed-worktree` (older server, degraded registry read, or standalone
+ * work) stays unbound rather than pinning a guessed path.
+ */
+export const worktreeBindingFor = (current: AssignedWorkQueueEntry | null): string | null => {
+  if (current === null || current.workspacePolicy !== "managed-worktree") return null;
+  const path = current.workspacePath?.trim() ?? "";
+  return path.length > 0 ? path : null;
+};
+
 // ── Errors ───────────────────────────────────────────────────────
 
 /** Routing failures carry the Consumer wire's failure-code vocabulary. */
@@ -298,6 +315,8 @@ export interface ProjectWorkSessionSnapshot {
   readonly threadId: ThreadId;
   readonly phase: "idle" | "notifying";
   readonly pendingWork: boolean;
+  /** The worktree the session's thread is bound to (null = project root). */
+  readonly boundWorktreePath: string | null;
 }
 
 export interface ProjectWorkSessionRouter {
@@ -336,6 +355,22 @@ interface RoutedSession {
    * notification dispatch on top of the queued first one.
    */
   seenBusy: boolean;
+  /**
+   * The worktree the session's thread is bound to (null = project root).
+   * The binding follows the queue head's execution workspace: when the
+   * current work moves to a different managed worktree, the thread is
+   * re-bound in place and its session restarts in the new cwd next turn.
+   */
+  boundWorktreePath: string | null;
+  /**
+   * The head run the last DELIVERED aggregate named (null before the first
+   * delivery). Drives the post-turn drain: notices are per-run and never
+   * re-fire when the head rotates, so the router itself advances the queue
+   * once the head the agent was last told about has moved on. A head equal
+   * to this value is never re-delivered — an agent that has not submitted
+   * its current work is not nagged.
+   */
+  lastDeliveredHeadRunId: string | null;
 }
 
 const routingKeyOf = (agentId: string, projectId: string): string => `${agentId}::${projectId}`;
@@ -639,6 +674,8 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         // No session is needed for work that no longer exists.
         return;
       }
+      const ordered = orderAssignedWorkQueue(openRuns);
+      const binding = worktreeBindingFor(ordered[0] ?? null);
       const modelSelection = yield* resolveModelSelection(target, project.value);
       const threadId = ThreadId.make(yield* deps.newId);
       const createdAt = yield* deps.nowIso;
@@ -653,7 +690,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,
         interactionMode: DEFAULT_ROUTING_INTERACTION_MODE,
         branch: null,
-        worktreePath: null,
+        worktreePath: binding,
         createdAt,
       });
       // The created session is current from the moment the thread exists;
@@ -665,63 +702,114 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         phase: "idle",
         pendingWork: false,
         seenBusy: false,
+        boundWorktreePath: binding,
+        lastDeliveredHeadRunId: null,
       });
-      const delivered = yield* deliverAggregate(target, threadId, openRuns);
+      const delivered = yield* deliverAggregate(target, threadId, ordered);
       yield* mutateSession(key, (session) => ({
         ...session,
         phase: delivered ? "notifying" : "idle",
         seenBusy: false,
+        lastDeliveredHeadRunId:
+          delivered && ordered[0] !== undefined ? ordered[0].runId : session.lastDeliveredHeadRunId,
       }));
     },
   );
 
   // Deliver at most one aggregate for recorded work. Called with the
   // pending flag already set; the deferred variant (after a turn) has no
-  // ACK path, so its failures are contained here.
+  // ACK path, so its failures are contained here. Also re-binds the
+  // session's thread when the current work's execution workspace moved
+  // (same managed worktree keeps the session; a different one follows it
+  // in place — thread.meta.update restarts the session in the new cwd).
   const flushRecordedWork = Effect.fn("ProjectWorkSessionRouter.flushRecordedWork")(function* (
     key: string,
     target: ProjectWorkRoutingTarget,
     deferred: boolean,
+    knownRuns?: ReadonlyArray<AssignedWorkQueueEntry>,
   ): Effect.fn.Return<void, ProjectWorkRoutingError> {
     const session = yield* getSession(key);
     if (session === undefined) {
       return;
     }
-    if (!deferred) {
-      // Synchronous wake path: a delivery failure must reach the wire
-      // ACK so Project Service can repair and redeliver.
-      const dispatched = yield* deliverAggregate(target, session.threadId);
-      yield* mutateSession(key, (current) => ({
-        ...current,
+    const runs =
+      knownRuns ??
+      (yield* deps.listOpenAssignedWork({
+        agentId: target.logicalAgentId,
+        projectId: target.projectServiceProjectId,
+      }));
+    const ordered = orderAssignedWorkQueue(runs);
+    const current = ordered[0] ?? null;
+    // Rebind first: the aggregate delivered on the rebound thread names the
+    // work the next turn does, so the turn must already run in that cwd.
+    const binding = worktreeBindingFor(current);
+    if (current !== null && binding !== session.boundWorktreePath) {
+      const rebindCommand = {
+        type: "thread.meta.update",
+        commandId: CommandId.make(yield* deps.newId),
+        threadId: session.threadId,
+        worktreePath: binding,
+      } as const;
+      if (deferred) {
+        const rebind = yield* deps.dispatchCommand(rebindCommand).pipe(Effect.result);
+        if (rebind._tag === "Failure") {
+          // Contained like a delivery failure: the work stays recorded for
+          // the next event.
+          yield* mutateSession(key, (s) => ({ ...s, phase: "idle", seenBusy: false }));
+          yield* Effect.logWarning(
+            "deferred Project Work rebind could not be dispatched; the work stays pending for the next event",
+            {
+              agentId: target.logicalAgentId,
+              projectId: target.projectServiceProjectId,
+              code: rebind.failure.code,
+            },
+          );
+          return;
+        }
+      } else {
+        // Synchronous wake path: the failure reaches the wire ACK so
+        // Project Service repairs and redelivers the notice.
+        yield* deps.dispatchCommand(rebindCommand);
+      }
+      yield* mutateSession(key, (s) => ({ ...s, boundWorktreePath: binding }));
+    }
+    if (deferred) {
+      const delivered = yield* deliverAggregate(target, session.threadId, ordered).pipe(
+        Effect.result,
+      );
+      if (delivered._tag === "Failure") {
+        // No ACK exists, and the notices behind this pending flag were
+        // already ACKed — Project Service will not redeliver them, so the
+        // work KEEPS being recorded (the next thread event or wake
+        // retries); clearing it would lose the only notification the
+        // agent would ever get.
+        yield* mutateSession(key, (s) => ({ ...s, phase: "idle", seenBusy: false }));
+        yield* Effect.logWarning(
+          "deferred Project Work notification could not be delivered; it stays pending for the next event",
+          {
+            agentId: target.logicalAgentId,
+            projectId: target.projectServiceProjectId,
+            code: delivered.failure.code,
+          },
+        );
+        return;
+      }
+      yield* mutateSession(key, (s) => ({
+        ...s,
         pendingWork: false,
-        phase: dispatched ? "notifying" : "idle",
+        phase: delivered.success ? "notifying" : "idle",
         seenBusy: false,
+        ...(delivered.success && current !== null ? { lastDeliveredHeadRunId: current.runId } : {}),
       }));
       return;
     }
-    // Deferred post-turn path: no ACK exists, and the notices behind this
-    // pending flag were already ACKed — Project Service will not redeliver
-    // them. A delivery failure therefore KEEPS the work recorded (the next
-    // thread event or wake retries); clearing it would lose the only
-    // notification the agent would ever get.
-    const delivered = yield* deliverAggregate(target, session.threadId).pipe(Effect.result);
-    if (delivered._tag === "Failure") {
-      yield* mutateSession(key, (current) => ({ ...current, phase: "idle", seenBusy: false }));
-      yield* Effect.logWarning(
-        "deferred Project Work notification could not be delivered; it stays pending for the next event",
-        {
-          agentId: target.logicalAgentId,
-          projectId: target.projectServiceProjectId,
-          code: delivered.failure.code,
-        },
-      );
-      return;
-    }
-    yield* mutateSession(key, (current) => ({
-      ...current,
+    const dispatched = yield* deliverAggregate(target, session.threadId, ordered);
+    yield* mutateSession(key, (s) => ({
+      ...s,
       pendingWork: false,
-      phase: delivered.success ? "notifying" : "idle",
+      phase: dispatched ? "notifying" : "idle",
       seenBusy: false,
+      ...(dispatched && current !== null ? { lastDeliveredHeadRunId: current.runId } : {}),
     }));
   });
 
@@ -808,6 +896,25 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     if (session.pendingWork) {
       yield* flushRecordedWork(key, target.success, true).pipe(Effect.ignore);
     } else {
+      // Drain: this is the end of the aggregate turn. Notices are per-run
+      // and never re-fire when the queue head rotates (the Project Service
+      // records the next run's notice as already delivered), so the router
+      // itself advances the queue when the head moved past the one the
+      // agent was last told about. An unchanged head is never re-delivered
+      // — an agent that has not submitted its current work is not nagged.
+      const runs = yield* deps
+        .listOpenAssignedWork({
+          agentId: target.success.logicalAgentId,
+          projectId: target.success.projectServiceProjectId,
+        })
+        .pipe(Effect.result);
+      if (runs._tag === "Success") {
+        const nextHead = orderAssignedWorkQueue(runs.success)[0];
+        if (nextHead !== undefined && nextHead.runId !== session.lastDeliveredHeadRunId) {
+          yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
+          return;
+        }
+      }
       yield* mutateSession(key, (current) => ({ ...current, phase: "idle" }));
     }
   });
@@ -834,6 +941,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         threadId: session.threadId,
         phase: session.phase,
         pendingWork: session.pendingWork,
+        boundWorktreePath: session.boundWorktreePath,
       })),
     ),
   );
