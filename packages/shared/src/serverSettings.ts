@@ -1,6 +1,7 @@
 import {
   isProviderDriverKind,
   isProviderAvailable,
+  resolveProviderInstanceEnabled,
   type ModelSelection,
   type ProviderDriverKind,
   type ProviderInstanceId,
@@ -37,7 +38,7 @@ export function isModelSelectionProviderEnabled(
 ): boolean {
   const instanceConfig = settings.providerInstances[selection.instanceId];
   if (instanceConfig !== undefined) {
-    return instanceConfig.enabled ?? true;
+    return resolveProviderInstanceEnabled(instanceConfig);
   }
 
   return (
