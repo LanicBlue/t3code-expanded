@@ -229,6 +229,9 @@ const ProjectWorkListItem = Schema.Struct({
   state: Schema.Literals(["open", "completed", "superseded", "cancelled"]),
   task: Schema.Record(Schema.String, Schema.Unknown),
   createdAt: Schema.String,
+  /** Where this run's work happens (managed worktree path / project root). */
+  workspacePolicy: Schema.optional(Schema.String),
+  workspacePath: Schema.optional(Schema.String),
 });
 
 const ProjectWorkPositionItem = Schema.Struct({

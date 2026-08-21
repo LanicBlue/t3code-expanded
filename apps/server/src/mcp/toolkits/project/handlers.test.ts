@@ -341,6 +341,15 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       assert.isUndefined(result.runs[1]);
       assert.equal(result.queuedWorkCount, 1);
       assert.deepEqual(result.positions, [POSITION_VIEW]);
+      // Workspace facts ride the current-work item verbatim (PS 0.8.0).
+      const { layer: wsLayer } = makeWorkClientLayer({
+        runs: [{ ...RUN_VIEW, workspacePolicy: "managed-worktree", workspacePath: "/tmp/wt-1" }],
+      });
+      const wsResult = yield* ProjectWorkToolkitHandlers.project_work_list().pipe(
+        withHandlerLayers({ workClientLayer: wsLayer, capabilities: new Set(["preview"]) }),
+      );
+      assert.equal(wsResult.runs[0]?.workspacePolicy, "managed-worktree");
+      assert.equal(wsResult.runs[0]?.workspacePath, "/tmp/wt-1");
     });
   });
 

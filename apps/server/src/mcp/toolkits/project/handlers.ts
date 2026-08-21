@@ -271,6 +271,12 @@ const handlers = {
                   state: current.state,
                   task: current.task,
                   createdAt: current.createdAt,
+                  ...(current.workspacePolicy === undefined
+                    ? {}
+                    : { workspacePolicy: current.workspacePolicy }),
+                  ...(current.workspacePath === undefined
+                    ? {}
+                    : { workspacePath: current.workspacePath }),
                 },
               ],
         queuedWorkCount: Math.max(0, queue.length - 1),

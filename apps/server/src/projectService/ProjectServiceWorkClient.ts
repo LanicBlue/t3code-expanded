@@ -116,6 +116,14 @@ export const ProjectWorkRunRecord = Schema.Struct({
   task: Schema.Record(Schema.String, Schema.Unknown),
   createdAt: Schema.String,
   resolvedAt: Schema.optional(Schema.NullOr(Schema.String)),
+  /**
+   * Execution-workspace facts (PS 0.8.0): where this run's work happens —
+   * a managed worktree path for flow-instance work, the project root for
+   * standalone work. Absent on older servers or when the registry read
+   * degraded; "absent" means unknown, never project-root.
+   */
+  workspacePolicy: Schema.optional(Schema.String),
+  workspacePath: Schema.optional(Schema.String),
 });
 export type ProjectWorkRunRecord = typeof ProjectWorkRunRecord.Type;
 
@@ -243,6 +251,8 @@ const projectRunRecord = (run: ProjectWorkRunRecord): ProjectWorkRunRecord => ({
   task: run.task,
   createdAt: run.createdAt,
   ...(run.resolvedAt === undefined ? {} : { resolvedAt: run.resolvedAt }),
+  ...(run.workspacePolicy === undefined ? {} : { workspacePolicy: run.workspacePolicy }),
+  ...(run.workspacePath === undefined ? {} : { workspacePath: run.workspacePath }),
 });
 
 const projectPositionRecord = (position: ProjectWorkPositionRecord): ProjectWorkPositionRecord => ({
