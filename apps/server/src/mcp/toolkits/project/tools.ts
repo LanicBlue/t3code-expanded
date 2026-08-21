@@ -131,6 +131,24 @@ export class ProjectFlowDocumentDeniedError extends Schema.TaggedErrorClass<Proj
   }
 }
 
+/**
+ * The addressed run is not the CURRENT work (the head of the agent's queue):
+ * work is obtained and submitted strictly in arrival order, so this is a
+ * sequencing rejection, not a credential or conflict one. Re-list to see the
+ * current work.
+ */
+export class ProjectWorkNotCurrentError extends Schema.TaggedErrorClass<ProjectWorkNotCurrentError>()(
+  "ProjectWorkNotCurrentError",
+  {
+    runId: Schema.String,
+    hint: Schema.Literals(["project_work_list"]),
+  },
+) {
+  override get message(): string {
+    return `Run '${this.runId}' is not the current work. Work is handled strictly in order; call project_work_list for the current one.`;
+  }
+}
+
 export const ProjectWorkError = Schema.Union([
   ProjectWorkUnavailableError,
   ProjectWorkAuthenticationError,
@@ -140,6 +158,7 @@ export const ProjectWorkError = Schema.Union([
   ProjectWorkIncompatibleError,
   ProjectFlowSpawnRefusedError,
   ProjectFlowDocumentDeniedError,
+  ProjectWorkNotCurrentError,
   ProjectWorkRejectedError,
 ]);
 export type ProjectWorkError = typeof ProjectWorkError.Type;
@@ -220,7 +239,10 @@ const ProjectWorkPositionItem = Schema.Struct({
 
 export const ProjectWorkListResult = Schema.Struct({
   projectGeneration: PositiveInt,
+  /** Only the CURRENT work (oldest open run) — the queue is worked in order. */
   runs: Schema.Array(ProjectWorkListItem),
+  /** Open works waiting behind the current one (they are not listed yet). */
+  queuedWorkCount: Schema.Number,
   positions: Schema.Array(ProjectWorkPositionItem),
 });
 
@@ -228,7 +250,7 @@ export const ProjectWorkListResult = Schema.Struct({
 
 export const ProjectWorkListTool = Tool.make("project_work_list", {
   description:
-    "List this agent's assigned Work runs in the session project's Project Service project (matched by the project's workspace directory), together with the project's positions and each position's current assignment revision. The revision pair on every item is what project_work_submit expects; no identity is required or accepted.",
+    "List this agent's assigned Work in the session project's Project Service project (matched by the project's workspace directory). Work is delivered strictly in arrival order: the result carries ONLY the current work (the oldest open run, with the revision pair project_work_submit expects); queuedWorkCount says how many wait behind it and those are not visible until the current one is submitted. No identity is required or accepted.",
   parameters: ProjectWorkListInput,
   success: ProjectWorkListResult,
   failure: ProjectWorkError,
@@ -242,7 +264,7 @@ export const ProjectWorkListTool = Tool.make("project_work_list", {
 
 export const ProjectWorkGetTool = Tool.make("project_work_get", {
   description:
-    "Fetch one Work run by its identifier. Returns only runs the Project Service can see for this agent's client; a run that is not yours or not open answers a structured not-found error.",
+    "Fetch one Work run by its identifier — must be the CURRENT work from project_work_list (work is handled strictly in order). A run that is not yours or not current answers a structured error.",
   parameters: ProjectWorkGetInput,
   success: ProjectServiceWorkClient.ProjectWorkRunRecord,
   failure: ProjectWorkError,
@@ -256,7 +278,7 @@ export const ProjectWorkGetTool = Tool.make("project_work_get", {
 
 export const ProjectWorkSubmitTool = Tool.make("project_work_submit", {
   description:
-    "Complete a Work run with the result payload, guarded by the run and assignment revisions from project_work_list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list the work. If the outcome is uncertain, the error carries an operationId for project_operation_get.",
+    "Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.",
   parameters: ProjectWorkSubmitInput,
   success: ProjectServiceWorkClient.ProjectWorkOperationRecord,
   failure: ProjectWorkError,
@@ -295,7 +317,7 @@ export const ProjectFlowStartTool = Tool.make("project_flow_start", {
 export const ProjectDocReadInput = Schema.Struct({
   runId: Schema.String.annotate({
     description:
-      "One of your OPEN work runs (from project_work_list) whose slot grants read rights over the document.",
+      "The CURRENT work run from project_work_list (work is handled strictly in order) — its slot grants the rights for this read.",
   }),
   path: Schema.String.annotate({
     description:
@@ -306,7 +328,7 @@ export const ProjectDocReadInput = Schema.Struct({
 export const ProjectDocWriteInput = Schema.Struct({
   runId: Schema.String.annotate({
     description:
-      "One of your OPEN work runs (from project_work_list) whose slot grants WRITE rights over the document.",
+      "The CURRENT work run from project_work_list (work is handled strictly in order) — its slot grants the WRITE rights for this operation.",
   }),
   path: Schema.String.annotate({
     description:

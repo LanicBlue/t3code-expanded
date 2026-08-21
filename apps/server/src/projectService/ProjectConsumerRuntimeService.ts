@@ -168,7 +168,7 @@ const internal = (detail: string) =>
 const dispatchFailure = (error: OrchestrationDispatchError): ProjectWorkRoutingError =>
   internal(`orchestration dispatch rejected the routing command (${error._tag})`);
 
-const workCountFailure = (
+const workQueryFailure = (
   error: ProjectServiceWorkClient.ProjectServiceWorkClientError,
 ): ProjectWorkRoutingError => internal(`authoritative Work query failed (${error._tag})`);
 
@@ -397,7 +397,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
           Effect.mapError(() => internal("project projection could not be read")),
         ),
       createdProjectDefaultModelSelection: getAutoBootstrapDefaultModelSelection(),
-      countOpenAssignedWork: (input) =>
+      listOpenAssignedWork: (input) =>
         Effect.gen(function* () {
           const projectGeneration = yield* workClient.getProjectGeneration(input.projectId);
           const runs = yield* workClient.listMy({
@@ -405,8 +405,8 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
             projectGeneration,
             agentId: input.agentId,
           });
-          return runs.filter((run) => run.state === "open").length;
-        }).pipe(Effect.tapError(noteWorkPathCredentialError), Effect.mapError(workCountFailure)),
+          return runs.filter((run) => run.state === "open");
+        }).pipe(Effect.tapError(noteWorkPathCredentialError), Effect.mapError(workQueryFailure)),
       nowIso: Effect.map(DateTime.now, DateTime.formatIso),
       newId: crypto.randomUUIDv4.pipe(Effect.orDie),
     });

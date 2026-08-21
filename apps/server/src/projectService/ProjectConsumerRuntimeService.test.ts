@@ -439,8 +439,8 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
                 positionId: "pos_1",
                 runRevision: 1,
                 state: "open",
-                task: {},
-                createdAt: ISO,
+                task: { prompt: `work item ${index + 1}` },
+                createdAt: `2026-08-21T00:00:${String(10 + index).padStart(2, "0")}Z`,
               })),
             ),
       getRun: () => Effect.succeed(null),
@@ -612,7 +612,7 @@ describe("ProjectConsumerRuntimeService", () => {
         const turn = turnStartCommands(fakes.commands)[0];
         assert.strictEqual(
           turn?.type === "thread.turn.start" && turn.message.text,
-          "There are 2 assigned Work items waiting. Use the Project tools to inspect them.",
+          "Your current work: work item 1. 1 more item waiting behind it. Use the Project tools to inspect and complete the current work first.",
         );
 
         // ACK means routed: exactly one, after the wake settled.
@@ -988,7 +988,9 @@ describe("ProjectConsumerRuntimeService", () => {
         assert.lengthOf(turns, 2);
         assert.strictEqual(
           turns[1]?.type === "thread.turn.start" && turns[1]?.message.text,
-          `There are ${fakes.openRunCount()} assigned Work items waiting. Use the Project tools to inspect them.`,
+          `Your current work: work item 1. ${
+            fakes.openRunCount() - 1
+          } more item${fakes.openRunCount() - 1 === 1 ? "" : "s"} waiting behind it. Use the Project tools to inspect and complete the current work first.`,
         );
         assert.isEmpty(gateway.recording.failures);
       }).pipe(Effect.provide(fakes.layer), Effect.scoped);

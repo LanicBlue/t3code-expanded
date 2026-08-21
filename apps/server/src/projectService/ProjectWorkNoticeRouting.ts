@@ -3,8 +3,8 @@
  *
  * Routing policy plus an in-memory per-(agentId, projectId) session state
  * machine. A notice is a TRIGGER, never a verbatim payload: every delivered
- * message is derived from an authoritative Work query at delivery time (see
- * `aggregateWorkNotificationMessage`). The local pending set is debounce/dedup
+ * message is derived from an authoritative Work query at delivery time (the
+ * queue-head wake message from `AssignedWorkQueue.ts`). The local pending set is debounce/dedup
  * state only — Work lifecycle is never mirrored into T3.
  *
  * The routing key is `logicalAgentId + Project Service projectId`; names in
@@ -40,6 +40,13 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+
+import {
+  type AssignedWorkQueueEntry,
+  assignedWorkWakeMessage,
+  currentAssignedWork,
+  orderAssignedWorkQueue,
+} from "./AssignedWorkQueue.ts";
 
 const DEFAULT_ROUTING_RUNTIME_MODE = "full-access" as const;
 const DEFAULT_ROUTING_INTERACTION_MODE = "default" as const;
@@ -171,12 +178,6 @@ export const isWorkThreadCurrent = (shell: OrchestrationThreadShell): boolean =>
 
 // ── Aggregate notification ───────────────────────────────────────
 
-/** The single compact notification, with a count refreshed at delivery time. */
-export const aggregateWorkNotificationMessage = (openWorkCount: number): string =>
-  openWorkCount === 1
-    ? "There is 1 assigned Work item waiting. Use the Project tools to inspect it."
-    : `There are ${openWorkCount} assigned Work items waiting. Use the Project tools to inspect them.`;
-
 /**
  * The provider-option id each driver reads for reasoning effort. Drivers
  * without a known effort option (grok, opencode) get none — thinkLevel then
@@ -279,10 +280,14 @@ export interface ProjectWorkSessionRouterDeps {
   >;
   /** Default model selection for auto-created projects (bootstrap precedent). */
   readonly createdProjectDefaultModelSelection: ModelSelection;
-  /** Authoritative assigned/open Work count for the agent+project, queried now. */
-  readonly countOpenAssignedWork: (
+  /**
+   * Authoritative assigned Work runs for the agent+project, queried now. The
+   * wake message derives the queue head (and depth) from this answer at
+   * delivery time — a notice is still a trigger, never a payload.
+   */
+  readonly listOpenAssignedWork: (
     input: ProjectWorkWakeInput,
-  ) => Effect.Effect<number, ProjectWorkRoutingError>;
+  ) => Effect.Effect<ReadonlyArray<AssignedWorkQueueEntry>, ProjectWorkRoutingError>;
   readonly nowIso: Effect.Effect<string>;
   readonly newId: Effect.Effect<string>;
 }
@@ -573,20 +578,22 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
 
   // Deliver the aggregate. The open-work count always comes from the
   // authoritative query at delivery time; a synchronous create path may
-  // pass the count it just queried as `knownCount`. Resolves to whether a
+  // pass the runs it just queried as `knownRuns`. Resolves to whether a
   // notification turn was actually dispatched.
   const deliverAggregate = Effect.fn("ProjectWorkSessionRouter.deliverAggregate")(function* (
     target: ProjectWorkRoutingTarget,
     threadId: ThreadId,
-    knownCount?: number,
+    knownRuns?: ReadonlyArray<AssignedWorkQueueEntry>,
   ): Effect.fn.Return<boolean, ProjectWorkRoutingError> {
-    const count =
-      knownCount ??
-      (yield* deps.countOpenAssignedWork({
+    const runs =
+      knownRuns ??
+      (yield* deps.listOpenAssignedWork({
         agentId: target.logicalAgentId,
         projectId: target.projectServiceProjectId,
       }));
-    if (count === 0) {
+    const ordered = orderAssignedWorkQueue(runs);
+    const current = ordered.at(0);
+    if (current === undefined) {
       // The authoritative query no longer shows open work: nothing to
       // say. Accept silently instead of notifying about zero items.
       return false;
@@ -598,7 +605,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       message: {
         messageId: MessageId.make(yield* deps.newId),
         role: "user",
-        text: aggregateWorkNotificationMessage(count),
+        text: assignedWorkWakeMessage({ current, queued: ordered.length - 1 }),
         attachments: [],
       },
       runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,
@@ -624,11 +631,11 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           detail: `T3 project ${target.t3ProjectId} resolved for Project Service project ${target.projectServiceProjectId} does not exist`,
         });
       }
-      const count = yield* deps.countOpenAssignedWork({
+      const openRuns = yield* deps.listOpenAssignedWork({
         agentId: target.logicalAgentId,
         projectId: target.projectServiceProjectId,
       });
-      if (count === 0) {
+      if (currentAssignedWork(openRuns) === null) {
         // No session is needed for work that no longer exists.
         return;
       }
@@ -659,7 +666,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         pendingWork: false,
         seenBusy: false,
       });
-      const delivered = yield* deliverAggregate(target, threadId, count);
+      const delivered = yield* deliverAggregate(target, threadId, openRuns);
       yield* mutateSession(key, (session) => ({
         ...session,
         phase: delivered ? "notifying" : "idle",

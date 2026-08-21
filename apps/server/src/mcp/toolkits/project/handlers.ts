@@ -7,6 +7,10 @@ import * as Path from "effect/Path";
 import * as ProjectionSnapshotQuery from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectServiceWorkClient from "../../../projectService/ProjectServiceWorkClient.ts";
 import { canonicalWorkspaceDirectory } from "../../../projectService/ProjectDirectoryKey.ts";
+import {
+  currentAssignedWork,
+  orderAssignedWorkQueue,
+} from "../../../projectService/AssignedWorkQueue.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as Tools from "./tools.ts";
@@ -174,6 +178,62 @@ const resolveContext = Effect.fn("ProjectWorkToolkit.resolveContext")(function* 
   return resolution.context;
 });
 
+/**
+ * The queue-head rule, enforced: every run-addressing tool may only touch the
+ * CURRENT work (oldest open run). Derived fresh per call from the service's
+ * authoritative answer — T3 stores no queue state. Returns the resolved
+ * current work, or fails with a structured error the agent can act on
+ * (not-current / no-open-work), so a wrong target can never reach the service.
+ */
+const resolveCurrentWorkRun = Effect.fn("ProjectWorkToolkit.resolveCurrentWorkRun")(function* (
+  context: ProjectToolExecutionContext,
+): Effect.fn.Return<
+  ProjectServiceWorkClient.ProjectWorkRunRecord | null,
+  ProjectWorkToolError,
+  CallRequirements
+> {
+  const runs = yield* fetchCurrentRuns(context);
+  return currentAssignedWork(runs);
+});
+
+/** The agent's runs as the service sees them right now (all states). */
+const fetchCurrentRuns = Effect.fn("ProjectWorkToolkit.fetchCurrentRuns")(function* (
+  context: ProjectToolExecutionContext,
+): Effect.fn.Return<
+  ReadonlyArray<ProjectServiceWorkClient.ProjectWorkRunRecord>,
+  ProjectWorkToolError,
+  CallRequirements
+> {
+  const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+  const generation = yield* client
+    .getProjectGeneration(context.projectServiceProjectId)
+    .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+  return yield* client
+    .listMy({
+      projectId: context.projectServiceProjectId,
+      projectGeneration: generation,
+      agentId: context.logicalAgentId,
+    })
+    .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+});
+
+/**
+ * Reject a run-addressing argument that is not the current work. When the
+ * queue is EMPTY the gate stays silent and the service renders its own
+ * verdict: an empty list is not proof the run is gone (the vendored SDK
+ * silently coerces a shape-drifted list to empty), and "not found" is the
+ * service's taxonomy to hand out, not the gate's.
+ */
+const requireCurrentRun = (
+  current: ProjectServiceWorkClient.ProjectWorkRunRecord | null,
+  inputRunId: string,
+): Effect.Effect<void, Tools.ProjectWorkNotCurrentError> =>
+  current !== null && current.runId !== inputRunId
+    ? Effect.fail(
+        new Tools.ProjectWorkNotCurrentError({ runId: inputRunId, hint: "project_work_list" }),
+      )
+    : Effect.void;
+
 const handlers = {
   project_work_list: () =>
     Effect.gen(function* () {
@@ -193,28 +253,44 @@ const handlers = {
       const assignmentByPosition = new Map(
         positions.map((position) => [position.positionId, position.assignmentRevision]),
       );
+      // Queue projection: only the current work is visible; the rest wait.
+      const queue = orderAssignedWorkQueue(runs);
+      const current = queue.at(0);
       return {
         projectGeneration: generation,
-        runs: runs.map((run) => ({
-          runId: run.runId,
-          positionId: run.positionId,
-          runRevision: run.runRevision,
-          assignmentRevision: assignmentByPosition.get(run.positionId) ?? null,
-          agentId: run.agentId ?? context.logicalAgentId,
-          state: run.state,
-          task: run.task,
-          createdAt: run.createdAt,
-        })),
-        positions: positions.map((position) => ({
-          positionId: position.positionId,
-          displayName: position.displayName,
-          assignmentRevision: position.assignmentRevision,
-        })),
+        runs:
+          current === undefined
+            ? []
+            : [
+                {
+                  runId: current.runId,
+                  positionId: current.positionId,
+                  runRevision: current.runRevision,
+                  assignmentRevision: assignmentByPosition.get(current.positionId) ?? null,
+                  agentId: current.agentId ?? context.logicalAgentId,
+                  state: current.state,
+                  task: current.task,
+                  createdAt: current.createdAt,
+                },
+              ],
+        queuedWorkCount: Math.max(0, queue.length - 1),
+        positions:
+          current === undefined
+            ? []
+            : positions
+                .filter((position) => position.positionId === current.positionId)
+                .map((position) => ({
+                  positionId: position.positionId,
+                  displayName: position.displayName,
+                  assignmentRevision: position.assignmentRevision,
+                })),
       };
     }),
   project_work_get: (input: { readonly runId: string }) =>
     Effect.gen(function* () {
       const context = yield* resolveContext("project.work.read");
+      const current = yield* resolveCurrentWorkRun(context);
+      yield* requireCurrentRun(current, input.runId);
       const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
       const generation = yield* client
         .getProjectGeneration(context.projectServiceProjectId)
@@ -243,6 +319,8 @@ const handlers = {
   }) =>
     Effect.gen(function* () {
       const context = yield* resolveContext("project.work.write");
+      const current = yield* resolveCurrentWorkRun(context);
+      yield* requireCurrentRun(current, input.runId);
       const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
       const crypto = yield* Crypto.Crypto;
       const operation = {
@@ -310,6 +388,8 @@ const handlers = {
   project_doc_read: (input: { readonly runId: string; readonly path: string }) =>
     Effect.gen(function* () {
       const context = yield* resolveContext("project.work.read");
+      const current = yield* resolveCurrentWorkRun(context);
+      yield* requireCurrentRun(current, input.runId);
       const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
       return yield* client
         .readFlowDocument({
@@ -344,6 +424,8 @@ const handlers = {
         });
       }
       const context = yield* resolveContext("project.work.write");
+      const current = yield* resolveCurrentWorkRun(context);
+      yield* requireCurrentRun(current, input.runId);
       const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
       const crypto = yield* Crypto.Crypto;
       // Fresh key per call: a retried write is a new notarized write (the

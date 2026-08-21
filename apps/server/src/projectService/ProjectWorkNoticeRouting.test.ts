@@ -20,7 +20,6 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import {
-  aggregateWorkNotificationMessage,
   applyThinkLevelToOptions,
   makeProjectWorkSessionRouter,
   type ProjectWorkSessionRouter,
@@ -30,6 +29,7 @@ import {
   type ProjectWorkSessionRouterDeps,
   type ProjectWorkWakeInput,
 } from "./ProjectWorkNoticeRouting.ts";
+import { type AssignedWorkQueueEntry, assignedWorkWakeMessage } from "./AssignedWorkQueue.ts";
 
 const AGENT_ID = "ag_primary";
 const OTHER_AGENT_ID = "ag_secondary";
@@ -179,6 +179,17 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
       [PROVIDER_INSTANCE, ProviderDriverKind.make("codex")],
     ]);
     let openWorkCount = 2;
+    // Deterministic fake runs for the queue: oldest-first by construction.
+    const syntheticOpenRuns = (count: number): Array<AssignedWorkQueueEntry> =>
+      Array.from({ length: count }, (_, index) => ({
+        runId: `run-${count - index}`,
+        positionId: `position-${count - index}`,
+        runRevision: `run:${index + 1}`,
+        state: "open",
+        agentId: AGENT_ID,
+        task: { prompt: `工作 ${count - index}: do the thing` },
+        createdAt: `2026-08-21T00:00:${String(10 + index).padStart(2, "0")}Z`,
+      }));
     let workCountShouldFail = false;
     let dispatchShouldFail = false;
     let createRaceArmed = false;
@@ -318,7 +329,7 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
           ? Effect.sleep(dispatchDelayMs).pipe(Effect.flatMap(attempt))
           : attempt();
       },
-      countOpenAssignedWork: () => {
+      listOpenAssignedWork: () => {
         countCalls += 1;
         const outcome = workCountShouldFail
           ? Effect.fail(
@@ -327,7 +338,7 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
                 detail: "authoritative Work query failed",
               }),
             )
-          : Effect.succeed(openWorkCount);
+          : Effect.succeed(syntheticOpenRuns(openWorkCount));
         return workCountDelayMs > 0
           ? Effect.sleep(workCountDelayMs).pipe(Effect.flatMap(() => outcome))
           : outcome;
@@ -480,13 +491,23 @@ it("routing resolution is id-based and structural", () => {
 });
 
 it("notification message and session title formats", () => {
+  const head = (prompt: string, createdAt: string): AssignedWorkQueueEntry => ({
+    runId: `run-${createdAt}`,
+    positionId: "position-1",
+    runRevision: "run:1",
+    state: "open",
+    task: { prompt },
+    createdAt,
+  });
+  // The wake message leads with the CURRENT work's task summary and says how
+  // deep the queue is behind it — the agent wakes already knowing its work.
   assert.strictEqual(
-    aggregateWorkNotificationMessage(3),
-    "There are 3 assigned Work items waiting. Use the Project tools to inspect them.",
+    assignedWorkWakeMessage({ current: head("分诊：修复登录", "2026-08-21T00:00:01Z"), queued: 2 }),
+    "Your current work: 分诊：修复登录. 2 more items waiting behind it. Use the Project tools to inspect and complete the current work first.",
   );
   assert.strictEqual(
-    aggregateWorkNotificationMessage(1),
-    "There is 1 assigned Work item waiting. Use the Project tools to inspect it.",
+    assignedWorkWakeMessage({ current: head("分诊：修复登录", "2026-08-21T00:00:01Z"), queued: 0 }),
+    "Your current work: 分诊：修复登录. Use the Project tools to inspect and complete the current work first.",
   );
   // The agent name alone titles the session — the UI already groups sessions
   // by project, so same-project sessions stay distinguishable by agent.
@@ -514,7 +535,18 @@ describe("wake message and agent-level model parameters", () => {
       assert.strictEqual(
         turnStarts(harness.commands)[0]?.type === "thread.turn.start" &&
           turnStarts(harness.commands)[0]?.message.text,
-        aggregateWorkNotificationMessage(2),
+        assignedWorkWakeMessage({
+          current: {
+            runId: "run-2",
+            positionId: "position-2",
+            runRevision: "run:1",
+            state: "open",
+            agentId: AGENT_ID,
+            task: { prompt: "工作 2: do the thing" },
+            createdAt: "2026-08-21T00:00:10Z",
+          },
+          queued: 1,
+        }),
       );
     }));
 
@@ -633,7 +665,18 @@ it.effect("missing project: the wake creates it under the notice's directory", (
     assert.strictEqual(
       turnStarts(harness.commands)[0]?.type === "thread.turn.start" &&
         turnStarts(harness.commands)[0]?.message.text,
-      aggregateWorkNotificationMessage(2),
+      assignedWorkWakeMessage({
+        current: {
+          runId: "run-2",
+          positionId: "position-2",
+          runRevision: "run:1",
+          state: "open",
+          agentId: AGENT_ID,
+          task: { prompt: "工作 2: do the thing" },
+          createdAt: "2026-08-21T00:00:10Z",
+        },
+        queued: 1,
+      }),
     );
 
     const sessions = yield* harness.router.snapshotSessions;
@@ -851,7 +894,18 @@ it.effect("busy session: work is recorded, never interrupted, then coalesced aft
     assert.strictEqual(
       turnStarts(harness.commands)[1]?.type === "thread.turn.start" &&
         turnStarts(harness.commands)[1]?.message.text,
-      aggregateWorkNotificationMessage(2),
+      assignedWorkWakeMessage({
+        current: {
+          runId: "run-2",
+          positionId: "position-2",
+          runRevision: "run:1",
+          state: "open",
+          agentId: AGENT_ID,
+          task: { prompt: "工作 2: do the thing" },
+          createdAt: "2026-08-21T00:00:10Z",
+        },
+        queued: 1,
+      }),
     );
 
     sessions = yield* harness.router.snapshotSessions;

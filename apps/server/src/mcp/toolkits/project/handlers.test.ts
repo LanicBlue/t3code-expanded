@@ -326,6 +326,8 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       );
 
       assert.equal(result.projectGeneration, 7);
+      // Queue projection: only the current work is visible (run_9 sorts
+      // first — same createdAt, runId tie-break); the second run waits.
       assert.deepEqual(result.runs[0], {
         runId: "run_9",
         positionId: "pos_1",
@@ -336,7 +338,8 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         task: { prompt: "Summarize" },
         createdAt: "2026-08-01T00:00:00.000Z",
       });
-      assert.isNull(result.runs[1]?.assignmentRevision);
+      assert.isUndefined(result.runs[1]);
+      assert.equal(result.queuedWorkCount, 1);
       assert.deepEqual(result.positions, [POSITION_VIEW]);
     });
   });
@@ -551,6 +554,145 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       });
     },
   );
+
+  // ── FIFO queue discipline ────────────────────────────────────────
+
+  const FIFO_RUNS = [
+    { ...RUN_VIEW, runId: "run_newest", createdAt: "2026-08-01T00:00:09.000Z" },
+    {
+      ...RUN_VIEW,
+      runId: "run_tie_b",
+      runRevision: "run:1",
+      createdAt: "2026-08-01T00:00:02.000Z",
+    },
+    {
+      ...RUN_VIEW,
+      runId: "run_tie_a",
+      runRevision: "run:1",
+      createdAt: "2026-08-01T00:00:02.000Z",
+    },
+    {
+      ...RUN_VIEW,
+      runId: "run_completed",
+      state: "completed" as const,
+      createdAt: "2026-08-01T00:00:01.000Z",
+    },
+  ] as const;
+
+  it.effect("project_work_list surfaces only the oldest open run (queue head)", () => {
+    const { layer } = makeWorkClientLayer({ runs: [...FIFO_RUNS] });
+    return Effect.gen(function* () {
+      const result = yield* ProjectWorkToolkitHandlers.project_work_list().pipe(
+        withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }),
+      );
+      // run_tie_a wins the createdAt tie over run_tie_b by runId order;
+      // the completed run is never in the queue.
+      assert.equal(result.runs.length, 1);
+      assert.equal(result.runs[0]?.runId, "run_tie_a");
+      assert.equal(result.queuedWorkCount, 2);
+    });
+  });
+
+  it.effect("project_work_submit rejects a run that is not the current work", () => {
+    const { layer, submitted } = makeWorkClientLayer({ runs: [...FIFO_RUNS] });
+    return Effect.gen(function* () {
+      const failure = yield* Effect.flip(
+        ProjectWorkToolkitHandlers.project_work_submit({
+          runId: "run_newest",
+          runRevision: "run:3",
+          assignmentRevision: "position:5",
+          result: { kind: "after", message: "done" },
+        }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
+      );
+      assert.equal(failure._tag, "ProjectWorkNotCurrentError");
+      // Nothing was minted or sent to the service.
+      assert.equal(submitted.length, 0);
+    });
+  });
+
+  it.effect("project_work_submit accepts the queue head and advances nothing else", () => {
+    const { layer, submitted } = makeWorkClientLayer({ runs: [...FIFO_RUNS] });
+    return Effect.gen(function* () {
+      const operation = yield* ProjectWorkToolkitHandlers.project_work_submit({
+        runId: "run_tie_a",
+        runRevision: "run:1",
+        assignmentRevision: "position:5",
+        result: { kind: "after", message: "done" },
+      }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }));
+      assert.equal(operation.status, "committed");
+      assert.equal(submitted[0]?.runId, "run_tie_a");
+    });
+  });
+
+  it.effect("project_work_get and the doc tools enforce the queue head", () => {
+    const { layer } = makeWorkClientLayer({ runs: [...FIFO_RUNS] });
+    return Effect.gen(function* () {
+      const getFailure = yield* Effect.flip(
+        ProjectWorkToolkitHandlers.project_work_get({ runId: "run_tie_b" }).pipe(
+          withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }),
+        ),
+      );
+      assert.equal(getFailure._tag, "ProjectWorkNotCurrentError");
+
+      const readFailure = yield* Effect.flip(
+        ProjectWorkToolkitHandlers.project_doc_read({
+          runId: "run_tie_b",
+          path: "decision.md",
+        }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
+      );
+      assert.equal(readFailure._tag, "ProjectWorkNotCurrentError");
+
+      const writeFailure = yield* Effect.flip(
+        ProjectWorkToolkitHandlers.project_doc_write({
+          runId: "run_tie_b",
+          path: "decision.md",
+          operation: "update",
+          content: "text",
+        }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
+      );
+      assert.equal(writeFailure._tag, "ProjectWorkNotCurrentError");
+
+      // The head flows through every tool unchanged.
+      const document = yield* ProjectWorkToolkitHandlers.project_doc_read({
+        runId: "run_tie_a",
+        path: "decision.md",
+      }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }));
+      assert.equal(document.content, "decision: ship it");
+    });
+  });
+
+  it.effect("an empty queue leaves the verdict to the service (gate stays silent)", () => {
+    // An empty list is not proof a run is gone — the vendored SDK silently
+    // coerces a shape-drifted list to empty — so "not found" stays the
+    // SERVICE's taxonomy: the call passes the gate and the service answers.
+    const { layer, submitted } = makeWorkClientLayer({
+      runs: [{ ...RUN_VIEW, state: "completed" as const }],
+    });
+    return Effect.gen(function* () {
+      const operation = yield* ProjectWorkToolkitHandlers.project_work_submit({
+        runId: "run_9",
+        runRevision: "run:3",
+        assignmentRevision: "position:5",
+        result: { kind: "after", message: "done" },
+      }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }));
+      assert.equal(operation.status, "committed");
+      assert.equal(submitted.length, 1);
+    });
+  });
+
+  it.effect("project_work_list with no open work answers the empty-queue shape", () => {
+    const { layer } = makeWorkClientLayer({
+      runs: [{ ...RUN_VIEW, state: "completed" as const }],
+    });
+    return Effect.gen(function* () {
+      const result = yield* ProjectWorkToolkitHandlers.project_work_list().pipe(
+        withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }),
+      );
+      assert.deepEqual(result.runs, []);
+      assert.equal(result.queuedWorkCount, 0);
+      assert.deepEqual(result.positions, []);
+    });
+  });
 });
 
 describe("mapProjectServiceError", () => {
