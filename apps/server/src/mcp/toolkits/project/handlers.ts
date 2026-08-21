@@ -324,9 +324,25 @@ const handlers = {
     readonly runId: string;
     readonly path: string;
     readonly operation: "create" | "update" | "delete";
-    readonly content: string;
+    readonly content?: string | undefined;
   }) =>
     Effect.gen(function* () {
+      // The notary's own contract: data for create/update, none for delete —
+      // reject the mismatch HERE with a typed error, before any key is minted.
+      if (
+        input.operation === "delete"
+          ? input.content !== undefined
+          : typeof input.content !== "string" || input.content.length === 0
+      ) {
+        return yield* new Tools.ProjectWorkRejectedError({
+          code: "PROJECT_DOC_CONTENT_INVALID",
+          status: 0,
+          serviceMessage:
+            input.operation === "delete"
+              ? "delete must not carry content"
+              : "content (non-empty UTF-8 text) is required for create/update",
+        });
+      }
       const context = yield* resolveContext("project.work.write");
       const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
       const crypto = yield* Crypto.Crypto;
@@ -343,7 +359,7 @@ const handlers = {
           operation: input.operation,
           ...(input.operation === "delete"
             ? {}
-            : { data: Buffer.from(input.content, "utf8").toString("base64") }),
+            : { data: Buffer.from(input.content ?? "", "utf8").toString("base64") }),
         })
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
     }),

@@ -167,19 +167,32 @@ export const ProjectFlowSpawnRecord = Schema.Struct({
 });
 export type ProjectFlowSpawnRecord = typeof ProjectFlowSpawnRecord.Type;
 
-/** A read flow document: content arrives base64; revision is the durable CAS token. */
-export const ProjectFlowDocumentRecord = Schema.Struct({
+/** The wire shape the SDK delivers (base64 data); decoded before the tool sees it. */
+const WIRE_FLOW_DOCUMENT_RECORD = Schema.Struct({
   data: Schema.String,
+  revision: Schema.String,
+  displayPath: Schema.String,
+  size: Schema.Int,
+});
+
+/**
+ * A read flow document: `content` is the decoded UTF-8 text (the wire carries
+ * base64; the MCP boundary never hands the model raw base64). Revision is the
+ * durable CAS token.
+ */
+export const ProjectFlowDocumentRecord = Schema.Struct({
+  content: Schema.String,
   revision: Schema.String,
   displayPath: Schema.String,
   size: Schema.Int,
 });
 export type ProjectFlowDocumentRecord = typeof ProjectFlowDocumentRecord.Type;
 
-/** A notarized write: the receipt submit's documentReceiptIds validation accepts. */
+/** A notarized write: the receipt submit's documentReceiptIds validation
+ * accepts. Revision is null after delete (no successor revision). */
 export const ProjectFlowDocumentWriteRecord = Schema.Struct({
   documentReceiptId: Schema.String,
-  revision: Schema.String,
+  revision: Schema.NullOr(Schema.String),
   displayPath: Schema.String,
 });
 export type ProjectFlowDocumentWriteRecord = typeof ProjectFlowDocumentWriteRecord.Type;
@@ -742,7 +755,15 @@ export const make = Effect.gen(function* () {
       withClient(
         undefined,
         (client) => client.readFlowDocument(readFlowDocumentArgs(input)),
-        (value) => decodeOrIncompatible(ProjectFlowDocumentRecord, value),
+        (value) => {
+          const wire = decodeOrIncompatible(WIRE_FLOW_DOCUMENT_RECORD, value);
+          return {
+            content: Buffer.from(wire.data, "base64").toString("utf8"),
+            revision: wire.revision,
+            displayPath: wire.displayPath,
+            size: wire.size,
+          };
+        },
       ),
     writeFlowDocument: (input) =>
       withClient(

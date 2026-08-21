@@ -212,7 +212,7 @@ const makeWorkClientLayer = (overrides?: {
     getOperation: () => Effect.succeed(COMMITTED_OPERATION),
     readFlowDocument: (input: { readonly path: string }) =>
       Effect.succeed({
-        data: Buffer.from("decision: ship it", "utf8").toString("base64"),
+        content: "decision: ship it",
         revision: "doc:1",
         displayPath: `flow://project/fi_1/${input.path}`,
         size: 16,
@@ -407,7 +407,7 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         path: "decision.md",
       }).pipe(withHandlerLayers({ workClientLayer: layer }));
 
-      assert.include(Buffer.from(document.data, "base64").toString("utf8"), "ship it");
+      assert.include(document.content, "ship it");
       assert.include(document.displayPath, "decision.md");
     });
   });
@@ -437,6 +437,38 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
           code: "FLOW_DOCUMENT_PERMISSION_DENIED",
           serviceMessage: "slot rights do not cover this document",
         });
+      });
+    },
+  );
+
+  it.effect(
+    "project_doc_write rejects a delete that carries content and a create without it",
+    () => {
+      const { layer } = makeWorkClientLayer();
+
+      return Effect.gen(function* () {
+        const withContent = yield* ProjectWorkToolkitHandlers.project_doc_write({
+          runId: "run_9",
+          path: "decision.md",
+          operation: "delete",
+          content: "stale",
+        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+        assert.deepEqual(plainError(withContent), {
+          _tag: "ProjectWorkRejectedError",
+          code: "PROJECT_DOC_CONTENT_INVALID",
+          status: 0,
+          serviceMessage: "delete must not carry content",
+        });
+
+        const withoutContent = yield* ProjectWorkToolkitHandlers.project_doc_write({
+          runId: "run_9",
+          path: "decision.md",
+          operation: "create",
+        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+        assert.equal(
+          (plainError(withoutContent) as { serviceMessage?: string }).serviceMessage,
+          "content (non-empty UTF-8 text) is required for create/update",
+        );
       });
     },
   );

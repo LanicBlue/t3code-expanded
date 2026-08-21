@@ -315,9 +315,12 @@ export const ProjectDocWriteInput = Schema.Struct({
   operation: Schema.Literals(["create", "update", "delete"]).annotate({
     description: "create requires the file to be absent; update/delete require it to exist.",
   }),
-  content: Schema.String.annotate({
-    description: "The full document content as UTF-8 text (operation create/update).",
-  }),
+  content: Schema.optional(
+    Schema.String.annotate({
+      description:
+        "The full document content as UTF-8 text — REQUIRED for create/update, must be ABSENT for delete.",
+    }),
+  ),
 });
 
 export const ProjectDocReadTool = Tool.make("project_doc_read", {

@@ -2979,7 +2979,7 @@ packages:
     engines: {node: '>=12'}
 
   '@lanicblue/project-consumer@file:vendor/consumer-sdk/project-consumer-sdk-0.7.0.tgz':
-    resolution: {integrity: sha512-SFJ174kKeg312Csl64+ER2oXtbDSSSAVqC/fTLE0JzUPNfZ0LJ9p1nhOOc8y/+Tk5EykCOAlhClhg7RcAUUO7g==, tarball: file:vendor/consumer-sdk/project-consumer-sdk-0.7.0.tgz}
+    resolution: {integrity: sha512-8jzpYlZMyS8HFZUrPcBLqoetjU+M1Kyl3QO50SfKRwp7KdvOykW2KYBckFkWCLpz/Xzx0uSCB2CqFh/Zu/15ZQ==, tarball: file:vendor/consumer-sdk/project-consumer-sdk-0.7.0.tgz}
     version: 0.7.0
     engines: {node: '>=22.0.0'}
 
