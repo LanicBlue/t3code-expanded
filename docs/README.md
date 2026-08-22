@@ -44,3 +44,7 @@ policy in [CONTRIBUTING.md](../CONTRIBUTING.md); agent rules in [AGENTS.md](../A
 - [Observability](./operations/observability.md)
 - [Relay observability](./operations/relay-observability.md)
 - [Mobile app store screenshots](./operations/mobile-app-store-screenshots.md)
+
+### Audits
+
+- [Optimization audit (2026-08-22)](./audits/2026-08-22-optimization-audit.md)
