@@ -366,11 +366,7 @@ const handlers = {
       }
       return operation;
     }),
-  project_flow_start: (input: {
-    readonly definitionId: string;
-    readonly name: string;
-    readonly promptOverrides?: Readonly<Record<string, string>> | undefined;
-  }) =>
+  project_flow_start: (input: { readonly definitionId: string; readonly name: string }) =>
     Effect.gen(function* () {
       const context = yield* resolveContext("project.work.write");
       const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
@@ -380,7 +376,8 @@ const handlers = {
       // never a silent replay of a possibly-unwanted child. That is exactly why
       // a PENDING outcome (ruling ②': construction still in flight server-side)
       // must be answered by polling project_operation_get with the returned
-      // operationId — never by re-invoking this tool.
+      // operationId — never by re-invoking this tool. v2 (D3): name-only —
+      // the instance name is the single injected task pointer.
       const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
       return yield* client
         .startFlow({
@@ -388,9 +385,6 @@ const handlers = {
           idempotencyKey,
           definitionId: input.definitionId,
           name: input.name,
-          ...(input.promptOverrides === undefined
-            ? {}
-            : { promptOverrides: input.promptOverrides }),
         })
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
     }),

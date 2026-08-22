@@ -367,9 +367,10 @@ export class ProjectServiceWorkClient extends Context.Service<
     /**
      * Tree-branch spawn (POST /:id/flow/instances): start a flow instance of a
      * definition whose active version opted in via `consumerStartable`. The
-     * ordinary credential is the authorization; promptOverrides inject task
-     * prompts into the definition's works before the create (definition-level:
-     * same-definition parallel children clobber — spawn sequentially).
+     * ordinary credential is the authorization. v2 (D3): the payload is
+     * name-only — the instance name is the single injected context; the
+     * child's start work prompt interpolates {instance.name} and the run view
+     * carries instance:{instanceId,name}. No prompt injection surface.
      * Ruling ②': the server ACKs (202 + operationId) and constructs in the
      * background; the client polls bounded — the outcome is committed, or
      * pending with the operationId to poll. Never re-spawn on pending.
@@ -379,7 +380,6 @@ export class ProjectServiceWorkClient extends Context.Service<
       readonly idempotencyKey: string;
       readonly definitionId: string;
       readonly name: string;
-      readonly promptOverrides?: Readonly<Record<string, string>>;
     }) => Effect.Effect<ProjectFlowSpawnOutcome, ProjectServiceWorkClientError>;
     /**
      * Flow-document notary (by-run addressing): read a document through one of
@@ -697,14 +697,12 @@ export const make = Effect.gen(function* () {
     readonly idempotencyKey: string;
     readonly definitionId: string;
     readonly name: string;
-    readonly promptOverrides?: Readonly<Record<string, string>>;
   }) =>
     ({
       projectId: input.projectId,
       idempotencyKey: input.idempotencyKey,
       definitionId: input.definitionId,
       name: input.name,
-      ...(input.promptOverrides === undefined ? {} : { promptOverrides: input.promptOverrides }),
     }) as Parameters<ProjectConsumerWorkClient["startFlow"]>[0];
   const readFlowDocumentArgs = (input: {
     readonly projectId: string;

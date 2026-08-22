@@ -208,14 +208,9 @@ export const ProjectFlowStartInput = Schema.Struct({
       'The flow definition to start, e.g. "spike-probe". Only definitions whose active version opted in to consumer spawning answer; others refuse with a structured error.',
   }),
   name: Schema.String.annotate({
-    description: "A short human-readable name for the new flow instance.",
+    description:
+      'The instance name — THE task pointer: the child\'s start work prompt interpolates {instance.name}, so put the concrete task here (e.g. "fix login bug in auth.ts"). This is the only context you can inject; there is no prompt-override surface.',
   }),
-  promptOverrides: Schema.optional(
-    Schema.Record(Schema.String, Schema.String).annotate({
-      description:
-        'Task injection: workDefinitionId → prompt, applied to the definition\'s works BEFORE the instance is created (e.g. { "spike-probe.perform-work": "TASK: fix login bug in auth.ts" }). Prompts are definition-level, so spawn the same definition sequentially, never in parallel.',
-    }),
-  ),
 });
 
 // ── Result schemas ───────────────────────────────────────────────
@@ -307,7 +302,7 @@ export const ProjectOperationGetTool = Tool.make("project_operation_get", {
 
 export const ProjectFlowStartTool = Tool.make("project_flow_start", {
   description:
-    "Start a new flow instance in the session project (tree branching): a one-way fork into a child flow — the parent flow does not wait for it or observe its completion. Use it to hand follow-up work to a differently-shaped process instead of looping back (e.g. after triage, start the spike/bounded/architectural delivery flow). Optionally inject task prompts into the child's works before it is created. Same-definition spawns are sequential (prompts are definition-level). The server constructs the child in the background: the result is either committed (the child instanceId) or pending — construction still in flight under the returned operationId. On pending, POLL project_operation_get with that operationId; NEVER call project_flow_start again for the same logical child (a fresh call mints a fresh idempotency key and would duplicate the child).",
+    "Start a new flow instance in the session project (tree branching): a one-way fork into a child flow — the parent flow does not wait for it or observe its completion. Use it to hand follow-up work to a differently-shaped process instead of looping back (e.g. after triage, start the spike/bounded/architectural delivery flow). The instance NAME is the one and only piece of context you inject: the child's authored start-work prompt interpolates {instance.name} and teaches itself the task from it (the run view also carries instance:{instanceId,name}). Richer hand-off context? Write a project document first and reference it by path in the name — never expect to inject prompts. The server constructs the child in the background: the result is either committed (the child instanceId) or pending — construction still in flight under the returned operationId. On pending, POLL project_operation_get with that operationId; NEVER call project_flow_start again for the same logical child (a fresh call mints a fresh idempotency key and would duplicate the child).",
   parameters: ProjectFlowStartInput,
   success: ProjectServiceWorkClient.ProjectFlowSpawnOutcome,
   failure: ProjectWorkError,

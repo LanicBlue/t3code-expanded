@@ -156,7 +156,6 @@ interface CapturedSpawn {
   readonly idempotencyKey: string;
   readonly definitionId: string;
   readonly name: string;
-  readonly promptOverrides?: Readonly<Record<string, string>>;
 }
 
 const docWritesRef: { path: string; operation: string }[] = [];
@@ -362,7 +361,7 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
   });
 
   it.effect(
-    "project_flow_start spawns through the derived identity, injecting the task prompts",
+    "project_flow_start spawns through the derived identity with the name as the only task pointer",
     () => {
       const { spawned, layer } = makeWorkClientLayer();
 
@@ -370,7 +369,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         const child = yield* ProjectWorkToolkitHandlers.project_flow_start({
           definitionId: "bounded-delivery",
           name: "login bug fix",
-          promptOverrides: { "bounded-delivery.implement-work": "TASK: fix the login loop" },
         }).pipe(withHandlerLayers({ workClientLayer: layer }));
 
         assert.equal(child.status, "committed");
@@ -381,10 +379,13 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         // The project comes from the directory-keyed mapping, never the arguments.
         assert.equal(call?.projectId, "proj_ps_1");
         assert.equal(call?.definitionId, "bounded-delivery");
+        // v2 (D3): name-only dispatch — the child's authored start-work prompt
+        // interpolates {instance.name}; there is no prompt-override surface.
         assert.equal(call?.name, "login bug fix");
-        assert.deepEqual(call?.promptOverrides, {
-          "bounded-delivery.implement-work": "TASK: fix the login loop",
-        });
+        assert.deepEqual(
+          Object.keys(call ?? {}).filter((key) => key === "promptOverrides"),
+          [],
+        );
         // Fresh idempotency key per invocation: a retry after failure is a NEW
         // spawn, never a silent replay of the original arguments.
         assert.match(call?.idempotencyKey ?? "", /^[0-9a-f-]{36}$/);
