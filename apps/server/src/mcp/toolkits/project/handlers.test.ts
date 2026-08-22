@@ -168,6 +168,7 @@ const makeWorkClientLayer = (overrides?: {
   readonly run?: ProjectServiceWorkClient.ProjectWorkRunRecord | null;
   readonly serviceProjects?: readonly ProjectServiceWorkClient.ProjectServiceProjectRecord[];
   readonly spawnError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
+  readonly spawnPending?: boolean;
   readonly documentWriteError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
 }) => {
   docWriteError = overrides?.documentWriteError;
@@ -233,7 +234,14 @@ const makeWorkClientLayer = (overrides?: {
       if (overrides?.spawnError !== undefined) {
         return Effect.fail(overrides.spawnError);
       }
-      return Effect.succeed<ProjectServiceWorkClient.ProjectFlowSpawnRecord>({
+      if (overrides?.spawnPending === true) {
+        return Effect.succeed<ProjectServiceWorkClient.ProjectFlowSpawnOutcome>({
+          status: "pending",
+          operationId: "rest-flow-spawn-pending",
+        });
+      }
+      return Effect.succeed<ProjectServiceWorkClient.ProjectFlowSpawnOutcome>({
+        status: "committed",
         instanceId: "fin_spawn_1",
         eventId: "evt_spawn_1",
       });
@@ -365,6 +373,8 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
           promptOverrides: { "bounded-delivery.implement-work": "TASK: fix the login loop" },
         }).pipe(withHandlerLayers({ workClientLayer: layer }));
 
+        assert.equal(child.status, "committed");
+        if (child.status !== "committed") throw new Error("unreachable");
         assert.equal(child.instanceId, "fin_spawn_1");
         assert.equal(spawned.length, 1);
         const call = spawned[0];
@@ -378,6 +388,28 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         // Fresh idempotency key per invocation: a retry after failure is a NEW
         // spawn, never a silent replay of the original arguments.
         assert.match(call?.idempotencyKey ?? "", /^[0-9a-f-]{36}$/);
+      });
+    },
+  );
+
+  it.effect(
+    "project_flow_start passes a still-pending construction through as a pollable state, never an error",
+    () => {
+      const { layer } = makeWorkClientLayer({ spawnPending: true });
+
+      return Effect.gen(function* () {
+        const outcome = yield* ProjectWorkToolkitHandlers.project_flow_start({
+          definitionId: "architectural-delivery",
+          name: "rfc child",
+        }).pipe(withHandlerLayers({ workClientLayer: layer }));
+
+        // Ruling ②': pending is a STATUS with the operationId to poll — the
+        // agent polls project_operation_get; a re-invocation with a fresh key
+        // would mint a duplicate child.
+        assert.deepEqual(outcome, {
+          status: "pending",
+          operationId: "rest-flow-spawn-pending",
+        });
       });
     },
   );

@@ -377,7 +377,10 @@ const handlers = {
       const crypto = yield* Crypto.Crypto;
       // Fresh key per call: the receipt idempotency replays the ORIGINAL spawn
       // arguments, so re-invoking this tool after a failure is a NEW spawn,
-      // never a silent replay of a possibly-unwanted child.
+      // never a silent replay of a possibly-unwanted child. That is exactly why
+      // a PENDING outcome (ruling ②': construction still in flight server-side)
+      // must be answered by polling project_operation_get with the returned
+      // operationId — never by re-invoking this tool.
       const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
       return yield* client
         .startFlow({

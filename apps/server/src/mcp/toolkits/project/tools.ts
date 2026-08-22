@@ -307,9 +307,9 @@ export const ProjectOperationGetTool = Tool.make("project_operation_get", {
 
 export const ProjectFlowStartTool = Tool.make("project_flow_start", {
   description:
-    "Start a new flow instance in the session project (tree branching): a one-way fork into a child flow — the parent flow does not wait for it or observe its completion. Use it to hand follow-up work to a differently-shaped process instead of looping back (e.g. after triage, start the spike/bounded/architectural delivery flow). Optionally inject task prompts into the child's works before it is created. Same-definition spawns are sequential (prompts are definition-level).",
+    "Start a new flow instance in the session project (tree branching): a one-way fork into a child flow — the parent flow does not wait for it or observe its completion. Use it to hand follow-up work to a differently-shaped process instead of looping back (e.g. after triage, start the spike/bounded/architectural delivery flow). Optionally inject task prompts into the child's works before it is created. Same-definition spawns are sequential (prompts are definition-level). The server constructs the child in the background: the result is either committed (the child instanceId) or pending — construction still in flight under the returned operationId. On pending, POLL project_operation_get with that operationId; NEVER call project_flow_start again for the same logical child (a fresh call mints a fresh idempotency key and would duplicate the child).",
   parameters: ProjectFlowStartInput,
-  success: ProjectServiceWorkClient.ProjectFlowSpawnRecord,
+  success: ProjectServiceWorkClient.ProjectFlowSpawnOutcome,
   failure: ProjectWorkError,
   dependencies,
 })

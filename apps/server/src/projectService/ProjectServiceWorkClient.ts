@@ -175,6 +175,28 @@ export const ProjectFlowSpawnRecord = Schema.Struct({
 });
 export type ProjectFlowSpawnRecord = typeof ProjectFlowSpawnRecord.Type;
 
+/**
+ * Ruling ②' spawn outcome. `committed` — the child instance exists. `pending` —
+ * the server ACKed (202 + operationId) and construction continues in the
+ * background: poll `project_operation_get` with the operationId. A pending
+ * outcome is NOT a failure — re-invoking project_flow_start with a fresh key
+ * would mint a DUPLICATE child; the bounded client-side wait simply closed
+ * before the server finished constructing.
+ */
+export const ProjectFlowSpawnOutcome = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literals(["committed"]),
+    instanceId: Schema.String,
+    eventId: Schema.String,
+    operationId: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    status: Schema.Literals(["pending"]),
+    operationId: Schema.String,
+  }),
+]);
+export type ProjectFlowSpawnOutcome = typeof ProjectFlowSpawnOutcome.Type;
+
 /** The wire shape the SDK delivers (base64 data); decoded before the tool sees it. */
 const WIRE_FLOW_DOCUMENT_RECORD = Schema.Struct({
   data: Schema.String,
@@ -348,6 +370,9 @@ export class ProjectServiceWorkClient extends Context.Service<
      * ordinary credential is the authorization; promptOverrides inject task
      * prompts into the definition's works before the create (definition-level:
      * same-definition parallel children clobber — spawn sequentially).
+     * Ruling ②': the server ACKs (202 + operationId) and constructs in the
+     * background; the client polls bounded — the outcome is committed, or
+     * pending with the operationId to poll. Never re-spawn on pending.
      */
     readonly startFlow: (input: {
       readonly projectId: string;
@@ -355,7 +380,7 @@ export class ProjectServiceWorkClient extends Context.Service<
       readonly definitionId: string;
       readonly name: string;
       readonly promptOverrides?: Readonly<Record<string, string>>;
-    }) => Effect.Effect<ProjectFlowSpawnRecord, ProjectServiceWorkClientError>;
+    }) => Effect.Effect<ProjectFlowSpawnOutcome, ProjectServiceWorkClientError>;
     /**
      * Flow-document notary (by-run addressing): read a document through one of
      * the agent's open runs — the run's slot rights decide readability.
@@ -759,7 +784,7 @@ export const make = Effect.gen(function* () {
       withClient(
         undefined,
         (client) => client.startFlow(startFlowArgs(input)),
-        (value) => decodeOrIncompatible(ProjectFlowSpawnRecord, value),
+        (value) => decodeOrIncompatible(ProjectFlowSpawnOutcome, value),
       ),
     readFlowDocument: (input) =>
       withClient(
