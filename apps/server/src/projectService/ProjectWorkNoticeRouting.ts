@@ -17,6 +17,17 @@
  * coalesces at the routing-key level only: many distinct notices for one key
  * collapse into at most one aggregate notification per busy period.
  *
+ * Flow liveness: a notice is ACKed the moment it routes, so the router itself
+ * repairs what the event-driven path can strand. The turn-end drain reminds
+ * an agent exactly ONCE when it finished the aggregate turn without
+ * submitting the still-open head (the "finished and stopped" case), and the
+ * reconcile sweep (`reconcileOpenWork`) re-delivers open work that no live
+ * session covers — a restart that emptied the registry, a dead session
+ * thread, or a turn-end event the drain never saw. Both preserve the no-nag
+ * invariant through `lastDeliveredHeadRunId`: a head the session already
+ * delivered is never re-delivered (a restart's fresh state is the one
+ * deliberate re-delivery, because the ACKed notice will never re-fire).
+ *
  * @module ProjectWorkNoticeRouting
  */
 import {
@@ -189,6 +200,38 @@ export const isWorkThreadBusy = (shell: OrchestrationThreadShell): boolean =>
 /** Session statuses that mean a notification turn can never still engage. */
 const TERMINAL_SESSION_STATUSES: ReadonlySet<string> = new Set(["stopped", "error", "interrupted"]);
 
+/**
+ * Whether the thread's latest turn PROVABLY ran and settled AFTER the last
+ * aggregate this session delivered — the shell-fact form of the event-driven
+ * `seenBusy` observation. The projector writes `latestTurn` only when a
+ * session starts running a turn (a queued request leaves the PREVIOUS turn
+ * in place), so a settled latestTurn alone cannot mean "our turn finished":
+ * only one that settled strictly after our dispatch timestamp can. This is
+ * what survives a coalesced event burst that never let the router observe
+ * the busy window — the busy-coalesce stranding — and lets the next event
+ * (or the reconcile sweep) perform the missed drain.
+ */
+const workThreadTurnSettledAfterDelivery = (
+  shell: OrchestrationThreadShell,
+  deliveredAtIso: string | null,
+): boolean => {
+  if (deliveredAtIso === null) {
+    return false;
+  }
+  const latest = shell.latestTurn;
+  if (
+    latest === null ||
+    latest.startedAt === null ||
+    latest.state === "running" ||
+    latest.completedAt === null
+  ) {
+    return false;
+  }
+  const settledAt = Date.parse(latest.completedAt);
+  const deliveredAt = Date.parse(deliveredAtIso);
+  return !Number.isNaN(settledAt) && !Number.isNaN(deliveredAt) && settledAt > deliveredAt;
+};
+
 /** Archived sessions are no longer current (deleted ones read as absent). */
 export const isWorkThreadCurrent = (shell: OrchestrationThreadShell): boolean =>
   shell.archivedAt === null;
@@ -331,6 +374,17 @@ export interface ProjectWorkSessionRouter {
    * recorded work delivers at most one aggregate notification. Never fails.
    */
   readonly onThreadEvent: (threadId: ThreadId) => Effect.Effect<void>;
+  /**
+   * One reconcile pass for a (agentId, projectId) routing key (flow liveness
+   * A1): re-derive coverage from the authoritative open work and repair what
+   * the event-driven path can strand — no session at all (a restart emptied
+   * the registry while the notice was already ACKed upstream), a dead or
+   * archived session thread, a missed turn-end drain, or a queue head that
+   * advanced past the last delivered aggregate. Serialized exactly like
+   * `routeWake` and never fails; a head the session already delivered is
+   * never re-delivered (the no-nag invariant).
+   */
+  readonly reconcileOpenWork: (input: ProjectWorkWakeInput) => Effect.Effect<void>;
   /** Test/observability view of the current-session registry. */
   readonly snapshotSessions: Effect.Effect<ReadonlyArray<ProjectWorkSessionSnapshot>>;
 }
@@ -367,10 +421,26 @@ interface RoutedSession {
    * delivery). Drives the post-turn drain: notices are per-run and never
    * re-fire when the head rotates, so the router itself advances the queue
    * once the head the agent was last told about has moved on. A head equal
-   * to this value is never re-delivered — an agent that has not submitted
-   * its current work is not nagged.
+   * to this value is never re-delivered by a notice or by the reconcile
+   * sweep — an agent that has not submitted its current work is reminded at
+   * most once instead (`remindedHeadRunId`).
    */
   lastDeliveredHeadRunId: string | null;
+  /**
+   * When the last DELIVERED aggregate was dispatched (null before the first
+   * delivery). The queued-turn guard's shell-fact escape: a latestTurn that
+   * settled strictly after this timestamp proves OUR turn ran and finished
+   * even when the busy window was never observed (coalesced event burst).
+   */
+  lastDeliveredAtIso: string | null;
+  /**
+   * The head run the ONE turn-end reminder already named (null = no reminder
+   * spent for the current head). When the aggregate turn finishes with the
+   * same head still open, the agent ended its turn without submitting: the
+   * drain delivers exactly one reminder for that run. A head change resets
+   * the budget — the new head gets its own single reminder.
+   */
+  remindedHeadRunId: string | null;
 }
 
 const routingKeyOf = (agentId: string, projectId: string): string => `${agentId}::${projectId}`;
@@ -613,13 +683,15 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
 
   // Deliver the aggregate. The open-work count always comes from the
   // authoritative query at delivery time; a synchronous create path may
-  // pass the runs it just queried as `knownRuns`. Resolves to whether a
-  // notification turn was actually dispatched.
+  // pass the runs it just queried as `knownRuns`. Resolves to the dispatch
+  // timestamp when a notification turn was actually dispatched (null when
+  // there was nothing to say) — callers record it so the queued-turn guard
+  // can tell OUR turn's settlement from a previous turn's.
   const deliverAggregate = Effect.fn("ProjectWorkSessionRouter.deliverAggregate")(function* (
     target: ProjectWorkRoutingTarget,
     threadId: ThreadId,
     knownRuns?: ReadonlyArray<AssignedWorkQueueEntry>,
-  ): Effect.fn.Return<boolean, ProjectWorkRoutingError> {
+  ): Effect.fn.Return<string | null, ProjectWorkRoutingError> {
     const runs =
       knownRuns ??
       (yield* deps.listOpenAssignedWork({
@@ -631,8 +703,9 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     if (current === undefined) {
       // The authoritative query no longer shows open work: nothing to
       // say. Accept silently instead of notifying about zero items.
-      return false;
+      return null;
     }
+    const createdAt = yield* deps.nowIso;
     yield* deps.dispatchCommand({
       type: "thread.turn.start",
       commandId: CommandId.make(yield* deps.newId),
@@ -645,9 +718,9 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       },
       runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,
       interactionMode: DEFAULT_ROUTING_INTERACTION_MODE,
-      createdAt: yield* deps.nowIso,
+      createdAt,
     });
-    return true;
+    return createdAt;
   });
 
   // Creates the next current session and delivers the aggregate as its
@@ -704,14 +777,19 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         seenBusy: false,
         boundWorktreePath: binding,
         lastDeliveredHeadRunId: null,
+        lastDeliveredAtIso: null,
+        remindedHeadRunId: null,
       });
-      const delivered = yield* deliverAggregate(target, threadId, ordered);
+      const deliveredAt = yield* deliverAggregate(target, threadId, ordered);
       yield* mutateSession(key, (session) => ({
         ...session,
-        phase: delivered ? "notifying" : "idle",
+        phase: deliveredAt !== null ? "notifying" : "idle",
         seenBusy: false,
+        lastDeliveredAtIso: deliveredAt,
         lastDeliveredHeadRunId:
-          delivered && ordered[0] !== undefined ? ordered[0].runId : session.lastDeliveredHeadRunId,
+          deliveredAt !== null && ordered[0] !== undefined
+            ? ordered[0].runId
+            : session.lastDeliveredHeadRunId,
       }));
     },
   );
@@ -797,20 +875,89 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       yield* mutateSession(key, (s) => ({
         ...s,
         pendingWork: false,
-        phase: delivered.success ? "notifying" : "idle",
+        phase: delivered.success !== null ? "notifying" : "idle",
         seenBusy: false,
-        ...(delivered.success && current !== null ? { lastDeliveredHeadRunId: current.runId } : {}),
+        ...(delivered.success !== null && current !== null
+          ? {
+              lastDeliveredAtIso: delivered.success,
+              // A head change spends the old run's reminder budget and arms
+              // the new head's (the same head re-delivered by a fresh notice
+              // keeps the marker — one reminder per run, never per notice).
+              ...(current.runId !== s.lastDeliveredHeadRunId
+                ? { lastDeliveredHeadRunId: current.runId, remindedHeadRunId: null }
+                : {}),
+            }
+          : {}),
       }));
       return;
     }
-    const dispatched = yield* deliverAggregate(target, session.threadId, ordered);
+    const dispatchedAt = yield* deliverAggregate(target, session.threadId, ordered);
     yield* mutateSession(key, (s) => ({
       ...s,
       pendingWork: false,
-      phase: dispatched ? "notifying" : "idle",
+      phase: dispatchedAt !== null ? "notifying" : "idle",
       seenBusy: false,
-      ...(dispatched && current !== null ? { lastDeliveredHeadRunId: current.runId } : {}),
+      ...(dispatchedAt !== null && current !== null
+        ? {
+            lastDeliveredAtIso: dispatchedAt,
+            ...(current.runId !== s.lastDeliveredHeadRunId
+              ? { lastDeliveredHeadRunId: current.runId, remindedHeadRunId: null }
+              : {}),
+          }
+        : {}),
     }));
+  });
+
+  // A3 turn-end reminder (flow liveness): the aggregate turn provably ran
+  // and finished, yet the SAME head is still open — the agent ended its turn
+  // without submitting. Deliver exactly one reminder for that run. The caller
+  // has already checked the once-per-run budget (remindedHeadRunId).
+  const remindOpenHead = Effect.fn("ProjectWorkSessionRouter.remindOpenHead")(function* (
+    key: string,
+    target: ProjectWorkRoutingTarget,
+    threadId: ThreadId,
+    runs: ReadonlyArray<AssignedWorkQueueEntry>,
+  ): Effect.fn.Return<void> {
+    const ordered = orderAssignedWorkQueue(runs);
+    const current = ordered[0] ?? null;
+    if (current === null) {
+      return;
+    }
+    const delivered = yield* deliverAggregate(target, threadId, ordered).pipe(Effect.result);
+    if (delivered._tag === "Failure") {
+      // Contained like a deferred delivery failure: the marker is NOT spent,
+      // but only the reconcile sweep gives this path another chance — the
+      // operator-visible warning names the run either way.
+      yield* mutateSession(key, (s) => ({ ...s, phase: "idle", seenBusy: false }));
+      yield* Effect.logWarning(
+        "Project Work turn-end reminder could not be delivered; the reconcile sweep retries",
+        {
+          agentId: target.logicalAgentId,
+          projectId: target.projectServiceProjectId,
+          runId: current.runId,
+          code: delivered.failure.code,
+        },
+      );
+      return;
+    }
+    yield* mutateSession(key, (s) => ({
+      ...s,
+      phase: delivered.success !== null ? "notifying" : "idle",
+      seenBusy: false,
+      ...(delivered.success !== null
+        ? { remindedHeadRunId: current.runId, lastDeliveredAtIso: delivered.success }
+        : {}),
+    }));
+    if (delivered.success !== null) {
+      yield* Effect.logWarning(
+        "Project Work turn ended without a submit; delivered the single reminder for the still-open head",
+        {
+          agentId: target.logicalAgentId,
+          projectId: target.projectServiceProjectId,
+          runId: current.runId,
+        },
+      );
+    }
   });
 
   const routeWake = Effect.fn("ProjectWorkSessionRouter.routeWake")(function* (
@@ -871,15 +1018,17 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       session.phase === "notifying" &&
       !session.seenBusy &&
       (Option.isNone(shell.success) ||
-        shell.success.value.session === null ||
-        !TERMINAL_SESSION_STATUSES.has(shell.success.value.session.status))
+        (!workThreadTurnSettledAfterDelivery(shell.success.value, session.lastDeliveredAtIso) &&
+          (shell.success.value.session === null ||
+            !TERMINAL_SESSION_STATUSES.has(shell.success.value.session.status))))
     ) {
       // Queued-turn window: the aggregate was dispatched but its turn has
       // not engaged yet (no session, a resting/ready session, or a turn
       // still pending) — the turn has not finished, so recorded work must
       // keep waiting (dispatching again would stack a second notification
       // on the queued first one). Only a session that DIED without ever
-      // running the turn (stopped/error/interrupted) counts as lapsed.
+      // running the turn (stopped/error/interrupted), or a latest turn that
+      // settled strictly AFTER our delivery, counts as lapsed.
       return;
     }
     // Re-resolution uses the wake facts the session was routed under, in
@@ -900,8 +1049,10 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       // and never re-fire when the queue head rotates (the Project Service
       // records the next run's notice as already delivered), so the router
       // itself advances the queue when the head moved past the one the
-      // agent was last told about. An unchanged head is never re-delivered
-      // — an agent that has not submitted its current work is not nagged.
+      // agent was last told about. An unchanged head means the agent
+      // finished its turn WITHOUT submitting (the run is still open and
+      // still the head): exactly ONE reminder, then the session rests —
+      // the same run is never reminded twice.
       const runs = yield* deps
         .listOpenAssignedWork({
           agentId: target.success.logicalAgentId,
@@ -912,6 +1063,14 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         const nextHead = orderAssignedWorkQueue(runs.success)[0];
         if (nextHead !== undefined && nextHead.runId !== session.lastDeliveredHeadRunId) {
           yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
+          return;
+        }
+        if (
+          nextHead !== undefined &&
+          nextHead.runId === session.lastDeliveredHeadRunId &&
+          session.remindedHeadRunId !== nextHead.runId
+        ) {
+          yield* remindOpenHead(key, target.success, session.threadId, runs.success);
           return;
         }
       }
@@ -934,6 +1093,151 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     }
   });
 
+  // A1 reconcile sweep (flow liveness): one pass that repairs the strandings
+  // the event-driven machinery can leave behind. Project Service ACKs a
+  // notice the moment it routes, so nothing upstream re-fires it: a restart
+  // that emptied this registry, a session thread that died or was archived,
+  // a turn-end event the drain never saw, or a queue head that advanced past
+  // the last delivered aggregate would all strand the run forever. The pass
+  // is serialized exactly like routeWake (it runs INSIDE the key's permit;
+  // the helpers it calls must never re-acquire it) and never fails.
+  const reconcileOpenWork = Effect.fn("ProjectWorkSessionRouter.reconcileOpenWork")(function* (
+    input: ProjectWorkWakeInput,
+  ): Effect.fn.Return<void> {
+    const key = routingKeyOf(input.agentId, input.projectId);
+    yield* withKeySerialization(
+      key,
+      Effect.gen(function* () {
+        const session = yield* getSession(key);
+        // The registry's session when it still backs a live, uncontested
+        // thread; a gone or archived thread recovers exactly like routeWake
+        // would (drop, and let a fresh session take over below when work is
+        // still open).
+        let liveSession: RoutedSession | null = null;
+        if (session !== undefined) {
+          const shell = yield* deps.readThreadShell(session.threadId).pipe(Effect.result);
+          if (shell._tag === "Failure") {
+            // Projection unreadable: this pass stays silent and the next
+            // sweep retries.
+            return;
+          }
+          if (Option.isNone(shell.success) || !isWorkThreadCurrent(shell.success.value)) {
+            yield* dropSession(key);
+          } else if (session.phase === "notifying" || session.pendingWork) {
+            // The event-driven state machine owns this key, but its turn-end
+            // event may never have arrived (the busy window can coalesce
+            // past every shell read). processThreadEvent is a no-op while
+            // the turn is genuinely in flight or still queued, and performs
+            // the missed drain (pending flush, queue advancement, or the one
+            // reminder) when the turn provably settled after our delivery.
+            yield* processThreadEvent(key);
+            return;
+          } else if (isWorkThreadBusy(shell.success.value)) {
+            // An agent turn is genuinely running: the drain and reminder own
+            // the follow-up — a sweep never interrupts.
+            return;
+          } else {
+            liveSession = session;
+          }
+        }
+
+        const runs = yield* deps.listOpenAssignedWork(input).pipe(Effect.result);
+        if (runs._tag === "Failure") {
+          yield* Effect.logWarning(
+            "Project Work reconcile sweep could not query open work; retrying on the next sweep",
+            {
+              agentId: input.agentId,
+              projectId: input.projectId,
+              code: runs.failure.code,
+            },
+          );
+          return;
+        }
+        const head = orderAssignedWorkQueue(runs.success)[0];
+
+        if (liveSession !== null) {
+          // The session exists, is idle, and nothing is pending. The no-nag
+          // invariant: a head the session already delivered (or no open work
+          // at all) stays quiet — the one reminder owns the not-submitted
+          // case.
+          if (head === undefined || head.runId === liveSession.lastDeliveredHeadRunId) {
+            return;
+          }
+          // The head advanced past the one the agent was last told about and
+          // the drain event was missed: deliver the advancement exactly as
+          // the drain would have.
+          yield* Effect.logWarning(
+            "Project Work reconcile sweep found an open head the session was never told about; delivering",
+            {
+              agentId: input.agentId,
+              projectId: input.projectId,
+              runId: head.runId,
+            },
+          );
+          const target = yield* resolveRoutingTarget(liveSession.input, {
+            create: false,
+          }).pipe(Effect.result);
+          if (target._tag === "Failure") {
+            yield* Effect.logWarning(
+              "Project Work reconcile sweep could not resolve routing for stranded open work",
+              {
+                agentId: input.agentId,
+                projectId: input.projectId,
+                code: target.failure.code,
+                detail: target.failure.detail,
+              },
+            );
+            return;
+          }
+          yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
+          return;
+        }
+
+        if (head === undefined) {
+          return;
+        }
+        // No live session covers the open head: either the registry is fresh
+        // (a restart — the ACKed notice will never re-fire, so this one
+        // re-delivery is the repair) or the old session's thread is gone.
+        // Either way the sweep itself wakes, through the same serialized
+        // delivery a notice takes.
+        yield* Effect.logWarning(
+          "Project Work reconcile sweep found open work no session covers; delivering a wake",
+          {
+            agentId: input.agentId,
+            projectId: input.projectId,
+            runId: head.runId,
+          },
+        );
+        const target = yield* resolveRoutingTarget(input).pipe(Effect.result);
+        if (target._tag === "Failure") {
+          yield* Effect.logWarning(
+            "Project Work reconcile sweep could not resolve routing for stranded open work",
+            {
+              agentId: input.agentId,
+              projectId: input.projectId,
+              code: target.failure.code,
+              detail: target.failure.detail,
+            },
+          );
+          return;
+        }
+        const created = yield* createCurrentSession(key, input, target.success).pipe(Effect.result);
+        if (created._tag === "Failure") {
+          yield* Effect.logWarning(
+            "Project Work reconcile sweep could not deliver its wake; retrying on the next sweep",
+            {
+              agentId: input.agentId,
+              projectId: input.projectId,
+              code: created.failure.code,
+              detail: created.failure.detail,
+            },
+          );
+        }
+      }),
+    );
+  });
+
   const snapshotSessions: ProjectWorkSessionRouter["snapshotSessions"] = Ref.get(sessionsRef).pipe(
     Effect.map((sessions) =>
       [...sessions.entries()].map(([key, session]) => ({
@@ -946,5 +1250,5 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     ),
   );
 
-  return { routeWake, onThreadEvent, snapshotSessions };
+  return { routeWake, onThreadEvent, reconcileOpenWork, snapshotSessions };
 });

@@ -46,6 +46,7 @@ import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -73,6 +74,9 @@ export const CONSUMER_GATEWAY_WS_PATH = "/project/v1/consumer/ws";
 
 /** Self-declared consumer id; the server overrides it with the authenticated clientId. */
 const CONSUMER_ID = "t3" as ConsumerId;
+
+/** Spacing of the delivery reconcile sweep (flow liveness A1). */
+const RECONCILE_SWEEP_INTERVAL = Duration.minutes(3);
 
 const normalizeBaseUrl = (baseUrl: string): string | null => {
   try {
@@ -150,6 +154,8 @@ export interface ProjectConsumerRuntimeOverrides {
   readonly backoff?: (attempt: number) => number;
   /** Delay before a self-stopped runtime is revived (tests shorten it). */
   readonly revivalDelayMs?: number;
+  /** Spacing of the delivery reconcile sweep (tests shorten it). */
+  readonly reconcileSweepIntervalMs?: number;
 }
 
 /** listAgents cannot answer; the SDK cycles the channel and retries. */
@@ -249,11 +255,12 @@ const consumerAdapter = (
 // ── Runtime status callbacks (module-level: Effect.runSync stays outside Effect code) ──
 
 /**
- * Fire-and-forget a revival from the SDK's synchronous `stopped` callback.
- * Module-level so the Effect boundary stays outside Effect code.
+ * Fire-and-forget an Effect from one of the SDK's synchronous state
+ * callbacks (`stopped`, `connected`). Module-level so the Effect boundary
+ * stays outside Effect code.
  */
-const scheduleRevivalFromCallback = (revival: Effect.Effect<void>): void => {
-  void Effect.runPromise(revival);
+const fireAndForgetFromCallback = (effect: Effect.Effect<void>): void => {
+  void Effect.runPromise(effect);
 };
 
 const runtimeStatusCallbacks = (
@@ -265,6 +272,13 @@ const runtimeStatusCallbacks = (
      * integration converges after e.g. a Project Service relaunch window.
      */
     readonly onSelfStopped: () => void;
+    /**
+     * The runtime (re)connected — a fresh hello was accepted. The host runs
+     * the delivery reconcile sweep promptly instead of waiting for the
+     * periodic tick: a reconnect after a restart or outage is exactly when
+     * stranded open work needs recovering.
+     */
+    readonly onConnected?: () => void;
   },
 ) => ({
   onStateChange: (state: ConsumerRuntimeState) => {
@@ -279,6 +293,9 @@ const runtimeStatusCallbacks = (
     );
     if (state === "stopped") {
       hooks?.onSelfStopped();
+    }
+    if (state === "connected") {
+      hooks?.onConnected?.();
     }
   },
   onServerError: (payload: { readonly code: string; readonly message: string }) => {
@@ -575,11 +592,65 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       );
     }).pipe(Effect.provideService(Scope.Scope, layerScope));
 
+    // ── Delivery reconcile sweep (flow liveness A1) ───────────────
+    // A notice is ACKed the moment it routes; nothing upstream re-fires it.
+    // Work can therefore strand silently when the turn-end drain never fired
+    // (busy-coalesced work recorded against a turn whose events coalesced
+    // past the busy window) or when a restart emptied the in-memory session
+    // registry. The sweep re-derives every (Project Service project ×
+    // project-enabled logical agent) pair and asks the router to reconcile
+    // each against the authoritative open work. It only ever delivers what
+    // no live session covers — the router's lastDeliveredHeadRunId invariant
+    // keeps the sweep from nagging an agent that was already told.
+    const reconcileSweepInterval =
+      overrides?.reconcileSweepIntervalMs !== undefined
+        ? Duration.millis(overrides.reconcileSweepIntervalMs)
+        : RECONCILE_SWEEP_INTERVAL;
+    const reconcileSweep: Effect.Effect<void> = Effect.gen(function* () {
+      const status = yield* Ref.get(statusRef);
+      if (status.state !== "connected") {
+        // Nothing to reconcile against while the channel is down; the
+        // SDK's reconnect owns getting back here.
+        return;
+      }
+      const agents = yield* listProjectConsumerAgents(serverSettings).pipe(Effect.result);
+      if (agents._tag === "Failure") {
+        // Settings unreadable right now; the sweep retries on its next tick
+        // (and the SDK cycles inventory for the same condition).
+        return;
+      }
+      const agentIds = agents.success.map((agent) => agent.agentId);
+      if (agentIds.length === 0) {
+        return;
+      }
+      const projects = yield* workClient.listProjects().pipe(Effect.result);
+      if (projects._tag === "Failure") {
+        yield* Effect.logWarning(
+          "Project Work reconcile sweep could not list Project Service projects",
+          { error: projects.failure._tag },
+        );
+        return;
+      }
+      for (const project of projects.success) {
+        for (const agentId of agentIds) {
+          yield* router.reconcileOpenWork({
+            agentId,
+            projectId: project.projectId,
+            projectName: project.name,
+            workspaceDir: project.workspaceDir,
+          });
+        }
+      }
+    });
+
     const statusCallbacks = runtimeStatusCallbacks(statusRef, {
       onSelfStopped: () => {
         if (!selfClosing) {
-          scheduleRevivalFromCallback(scheduleRuntimeRevival);
+          fireAndForgetFromCallback(scheduleRuntimeRevival);
         }
+      },
+      onConnected: () => {
+        fireAndForgetFromCallback(reconcileSweep);
       },
     });
 
@@ -605,6 +676,20 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
             event.aggregateKind === "thread"
               ? router.onThreadEvent(ThreadId.make(event.aggregateId))
               : Effect.void,
+          ),
+        );
+        // Delivery reconcile sweep (flow liveness A1): a periodic pass that
+        // repairs stranded open work. The first execution runs before the
+        // channel is up and no-ops on the status guard; every (re)connection
+        // also triggers a prompt pass through the status callback above.
+        yield* forkParked(
+          reconcileSweep.pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Project Work reconcile sweep failed", {
+                cause: Cause.pretty(cause),
+              }),
+            ),
+            Effect.repeat(Schedule.spaced(reconcileSweepInterval)),
           ),
         );
       });

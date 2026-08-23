@@ -86,6 +86,7 @@ const startupDependencies = Layer.mergeAll(
     router: {
       routeWake: () => Effect.die("unused"),
       onThreadEvent: () => Effect.void,
+      reconcileOpenWork: () => Effect.void,
       snapshotSessions: Effect.succeed([]),
     },
   }),

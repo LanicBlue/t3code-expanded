@@ -15,6 +15,7 @@ import {
   ProviderInstanceId,
   type ServerSettings,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -122,6 +123,22 @@ const readySession = (threadId: string): OrchestrationSession => ({
 const stoppedSession = (threadId: string): OrchestrationSession => ({
   ...runningSession(threadId),
   status: "stopped",
+});
+
+/**
+ * A latestTurn that PROVABLY ran and settled strictly AFTER the harness's
+ * delivery timestamp (ISO) — the shell-fact form of the busy-window
+ * observation the event stream may have coalesced past. The projector keeps
+ * a queued turn's predecessor in place, so a shell WITHOUT this fact means
+ * the aggregate's turn never engaged (the queued-turn window).
+ */
+const settledTurn = (): NonNullable<OrchestrationThreadShell["latestTurn"]> => ({
+  turnId: TurnId.make("turn_settled"),
+  state: "completed",
+  requestedAt: ISO,
+  startedAt: ISO,
+  completedAt: "2026-08-14T12:00:01.000Z",
+  assistantMessageId: null,
 });
 
 interface Harness {
@@ -829,7 +846,9 @@ it.effect("idle session: one more wake delivers exactly one more aggregate", () 
     const projectId = String(created?.projectId);
     assert.isDefined(threadId);
 
-    // The aggregate's turn engaged, then finished.
+    // The aggregate's turn engaged, then finished: the unchanged head draws
+    // the one A3 reminder (turn ended without a submit), and the reminder's
+    // own turn must also run out before the session is idle again.
     const engage = (status: "running" | "ready") =>
       harness.putThread(
         makeThreadShell(threadId as string, projectId, (shell) => ({
@@ -841,10 +860,15 @@ it.effect("idle session: one more wake delivers exactly one more aggregate", () 
     yield* harness.router.onThreadEvent(threadId as never);
     engage("ready");
     yield* harness.router.onThreadEvent(threadId as never);
+    assert.lengthOf(turnStarts(harness.commands), 2);
+    engage("running");
+    yield* harness.router.onThreadEvent(threadId as never);
+    engage("ready");
+    yield* harness.router.onThreadEvent(threadId as never);
     assert.strictEqual((yield* harness.router.snapshotSessions)[0]?.phase, "idle");
 
     yield* wake(harness.router);
-    assert.lengthOf(turnStarts(harness.commands), 2);
+    assert.lengthOf(turnStarts(harness.commands), 3);
 
     // An idle, already-notified session with no new work stays quiet.
     harness.putThread(
@@ -854,7 +878,7 @@ it.effect("idle session: one more wake delivers exactly one more aggregate", () 
       })),
     );
     yield* harness.router.onThreadEvent(threadId as never);
-    assert.lengthOf(turnStarts(harness.commands), 2);
+    assert.lengthOf(turnStarts(harness.commands), 3);
   }),
 );
 
@@ -1241,6 +1265,10 @@ it.effect("dispatch failure fails the wake and leaves the created session recove
       })),
     );
     yield* harness.router.onThreadEvent(threadId as never);
+    // The unchanged head drew the one A3 reminder; let its turn settle too so
+    // the failure below meets an idle session (a notifying one would only
+    // coalesce the wake instead of surfacing the dispatch failure).
+    yield* runAggregateTurn(harness, threadId as string, projectId);
 
     harness.failDispatch(true);
     const failure = yield* wake(harness.router).pipe(Effect.flip);
@@ -1250,7 +1278,7 @@ it.effect("dispatch failure fails the wake and leaves the created session recove
     harness.failDispatch(false);
     yield* wake(harness.router);
     assert.lengthOf(threadCreates(harness.commands), 1);
-    assert.lengthOf(turnStarts(harness.commands), 2);
+    assert.lengthOf(turnStarts(harness.commands), 3);
   }),
 );
 
@@ -1464,6 +1492,9 @@ describe("execution-workspace binding", () => {
       const threadId = created?.type === "thread.create" ? created.threadId : undefined;
       const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
       assert.isDefined(threadId);
+      // Two full cycles: the first turn end draws the unchanged-head reminder
+      // (run_a still open), the reminder's turn settles it back to idle.
+      yield* runAggregateTurn(harness, threadId as string, projectId);
       yield* runAggregateTurn(harness, threadId as string, projectId);
 
       // The next work runs in a different managed worktree: a subsequent
@@ -1491,7 +1522,7 @@ describe("execution-workspace binding", () => {
       );
       const sessions = yield* harness.router.snapshotSessions;
       assert.strictEqual(sessions[0]?.boundWorktreePath, WT_B);
-      assert.lengthOf(turnStarts(harness.commands), 2);
+      assert.lengthOf(turnStarts(harness.commands), 3);
     }),
   );
 
@@ -1579,7 +1610,7 @@ describe("execution-workspace binding", () => {
     }),
   );
 
-  it.effect("turn end with an UNCHANGED head does not re-deliver", () =>
+  it.effect("turn end with an UNCHANGED head reminds exactly once (A3)", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeSettings());
       harness.setOpenRuns([
@@ -1594,14 +1625,219 @@ describe("execution-workspace binding", () => {
       const threadId = created?.type === "thread.create" ? created.threadId : undefined;
       const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
 
-      // The agent finished its turn without submitting: the head is still
-      // the one it was told about — no nagging, no second aggregate.
+      // The agent finished its turn without submitting: the head is still the
+      // one it was told about. Exactly ONE reminder wake fires — the run is
+      // still open and still the head, so the agent's turn provably produced
+      // nothing.
       yield* runAggregateTurn(harness, threadId as string, projectId);
+      assert.lengthOf(turnStarts(harness.commands), 2);
+      const reminder =
+        turnStarts(harness.commands)[1]?.type === "thread.turn.start"
+          ? turnStarts(harness.commands)[1]?.message.text
+          : null;
+      assert.strictEqual(
+        reminder,
+        assignedWorkWakeMessage({
+          current: workspaceRun({
+            runId: "run_a",
+            workspacePolicy: "managed-worktree",
+            workspacePath: WT_A,
+          }),
+          queued: 0,
+        }),
+      );
+      const afterReminder = yield* harness.router.snapshotSessions;
+      assert.strictEqual(afterReminder[0]?.phase, "notifying");
 
-      assert.lengthOf(turnStarts(harness.commands), 1);
+      // The reminder turn also ends without a submit: the SAME run is never
+      // reminded twice — the session rests instead of nagging.
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+      assert.lengthOf(turnStarts(harness.commands), 2);
       assert.isEmpty(threadMetaUpdates(harness.commands));
       const sessions = yield* harness.router.snapshotSessions;
       assert.strictEqual(sessions[0]?.phase, "idle");
+
+      // A head CHANGE re-arms the reminder budget: the new run gets its own
+      // single reminder when its turn also ends unsubmitted.
+      harness.setOpenRuns([
+        workspaceRun({
+          runId: "run_b",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+      ]);
+      yield* wake(harness.router);
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+      assert.lengthOf(turnStarts(harness.commands), 4);
+    }),
+  );
+});
+
+// ── Flow liveness: the reconcile sweep (A1) and its no-nag invariant ──
+
+describe("delivery reconcile sweep", () => {
+  it.effect("restart: open work no session covers gets exactly one synthetic wake", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+
+      // Fresh registry, as after a restart: the notice was ACKed upstream and
+      // will never re-fire, yet open work exists.
+      yield* harness.router.reconcileOpenWork(wakeInput());
+
+      assert.lengthOf(threadCreates(harness.commands), 1);
+      assert.lengthOf(turnStarts(harness.commands), 1);
+      assert.strictEqual((yield* harness.router.snapshotSessions)[0]?.phase, "notifying");
+
+      // No-nag: the delivered head is never re-delivered by later sweeps.
+      yield* harness.router.reconcileOpenWork(wakeInput());
+      yield* harness.router.reconcileOpenWork(wakeInput());
+      assert.lengthOf(turnStarts(harness.commands), 1);
+    }),
+  );
+
+  it.effect("no open work: the sweep stays silent and creates nothing", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenWorkCount(0);
+
+      yield* harness.router.reconcileOpenWork(wakeInput());
+
+      assert.isEmpty(harness.commands);
+      assert.isEmpty(yield* harness.router.snapshotSessions);
+    }),
+  );
+
+  it.effect("busy-coalesced work whose turn-end events were lost is flushed by the sweep", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      yield* wake(harness.router);
+      const [created] = threadCreates(harness.commands);
+      const threadId = created?.type === "thread.create" ? created.threadId : null;
+      const projectId = String(created?.projectId);
+      assert.lengthOf(turnStarts(harness.commands), 1);
+
+      // The aggregate turn engaged, a further notice coalesced against it,
+      // and the thread then settled — but the turn-end events never reached
+      // the router (the busy window was coalesced past). Only the shell's
+      // settled-after-delivery latestTurn and the sweep can release the
+      // pending work: the notice is already ACKed.
+      harness.putThread(
+        makeThreadShell(threadId as string, projectId, (shell) => ({
+          ...shell,
+          session: runningSession(threadId as string),
+        })),
+      );
+      yield* wake(harness.router);
+      assert.isTrue((yield* harness.router.snapshotSessions)[0]?.pendingWork);
+      harness.putThread(
+        makeThreadShell(threadId as string, projectId, (shell) => ({
+          ...shell,
+          session: readySession(threadId as string),
+          latestTurn: settledTurn(),
+        })),
+      );
+
+      yield* harness.router.reconcileOpenWork(wakeInput());
+
+      // The missed drain performed: exactly one coalesced aggregate.
+      assert.lengthOf(turnStarts(harness.commands), 2);
+      const sessions = yield* harness.router.snapshotSessions;
+      assert.isFalse(sessions[0]?.pendingWork);
+      assert.strictEqual(sessions[0]?.phase, "notifying");
+    }),
+  );
+
+  it.effect("a settled turn whose drain was lost gets its reminder from the sweep", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      yield* wake(harness.router);
+      const [created] = threadCreates(harness.commands);
+      const threadId = created?.type === "thread.create" ? created.threadId : null;
+      const projectId = String(created?.projectId);
+      assert.lengthOf(turnStarts(harness.commands), 1);
+
+      // The turn engaged and settled with the head unchanged — and not one
+      // event reached the router. The shell's settled-after-delivery turn is
+      // the only evidence; the sweep performs the drain, which is the one
+      // A3 reminder.
+      harness.putThread(
+        makeThreadShell(threadId as string, projectId, (shell) => ({
+          ...shell,
+          session: readySession(threadId as string),
+          latestTurn: settledTurn(),
+        })),
+      );
+      yield* harness.router.reconcileOpenWork(wakeInput());
+      assert.lengthOf(turnStarts(harness.commands), 2);
+
+      // The reminder's own turn has not engaged yet: a further sweep re-runs
+      // the drain, finds the reminder already spent, and rests the session
+      // instead of nagging.
+      yield* harness.router.reconcileOpenWork(wakeInput());
+      assert.lengthOf(turnStarts(harness.commands), 2);
+      assert.strictEqual((yield* harness.router.snapshotSessions)[0]?.phase, "idle");
+    }),
+  );
+
+  it.effect("a head that advanced past a lost drain is delivered by the sweep", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenRuns([workspaceRun({ runId: "run_a", task: { prompt: "第一件工作" } })]);
+      yield* wake(harness.router);
+      const [created] = threadCreates(harness.commands);
+      const threadId = created?.type === "thread.create" ? created.threadId : null;
+      const projectId = String(created?.projectId);
+
+      // The aggregate turn ends (drain draws the reminder), and the reminder
+      // turn settles with the head ROTATED — but its drain event is lost.
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+      harness.setOpenRuns([workspaceRun({ runId: "run_z", task: { prompt: "第二件工作" } })]);
+      harness.putThread(
+        makeThreadShell(threadId as string, projectId, (shell) => ({
+          ...shell,
+          session: readySession(threadId as string),
+          latestTurn: settledTurn(),
+        })),
+      );
+
+      yield* harness.router.reconcileOpenWork(wakeInput());
+
+      assert.lengthOf(turnStarts(harness.commands), 3);
+      const delivered =
+        turnStarts(harness.commands)[2]?.type === "thread.turn.start"
+          ? turnStarts(harness.commands)[2]?.message.text
+          : null;
+      assert.include(delivered, "第二件工作");
+    }),
+  );
+
+  it.effect("an archived session thread is replaced by the sweep when work is open", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      yield* wake(harness.router);
+      const [created] = threadCreates(harness.commands);
+      const threadId = created?.type === "thread.create" ? created.threadId : null;
+      const projectId = String(created?.projectId);
+
+      // The session's thread was archived with open work still pending: the
+      // sweep routes a fresh session exactly like a wake would.
+      harness.putThread(
+        makeThreadShell(threadId as string, projectId, (shell) => ({
+          ...shell,
+          archivedAt: ISO,
+        })),
+      );
+      yield* harness.router.reconcileOpenWork(wakeInput());
+
+      assert.lengthOf(threadCreates(harness.commands), 2);
+      assert.lengthOf(turnStarts(harness.commands), 2);
+      assert.notStrictEqual(
+        threadCreates(harness.commands)[1]?.type === "thread.create"
+          ? threadCreates(harness.commands)[1]?.threadId
+          : null,
+        threadId,
+      );
     }),
   );
 });

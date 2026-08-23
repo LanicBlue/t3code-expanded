@@ -275,7 +275,10 @@ const sessionWithStatus = (
   updatedAt: ISO,
 });
 
-const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
+const makeFakes = (
+  gateway: ReturnType<typeof makeGateway>,
+  options?: { readonly reconcileSweepIntervalMs?: number },
+) =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
     const threads = new Map<string, OrchestrationThreadShell>();
@@ -284,6 +287,8 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
     const eventQueue = yield* Queue.unbounded<OrchestrationEvent>();
     let openRunCount = 2;
     let runsFailure: ProjectServiceWorkClient.ProjectServiceWorkClientError | null = null;
+    // The Project Service project list the reconcile sweep enumerates.
+    let serviceProjects: ProjectServiceWorkClient.ProjectServiceProjectRecord[] = [];
 
     // Dispatched commands become visible thread/project state, mirroring the
     // projection (a notification turn.start makes the session busy).
@@ -427,7 +432,7 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
     } as unknown as ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]);
 
     const workClientLayer = Layer.succeed(ProjectServiceWorkClient.ProjectServiceWorkClient, {
-      listProjects: () => Effect.succeed([]),
+      listProjects: () => Effect.succeed(serviceProjects),
       getProjectGeneration: () => Effect.succeed(7),
       listPositions: () => Effect.succeed([]),
       listMy: () =>
@@ -458,6 +463,9 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
       socketFactory: gateway.factory,
       backoff: () => 10,
       revivalDelayMs: 20,
+      ...(options?.reconcileSweepIntervalMs !== undefined
+        ? { reconcileSweepIntervalMs: options.reconcileSweepIntervalMs }
+        : {}),
     }).pipe(
       Layer.provideMerge(engineLayer),
       Layer.provideMerge(snapshotQueryLayer),
@@ -476,6 +484,9 @@ const makeFakes = (gateway: ReturnType<typeof makeGateway>) =>
       openRunCount: () => openRunCount,
       setOpenRunCount: (count: number) => {
         openRunCount = count;
+      },
+      setServiceProjects: (list: ProjectServiceWorkClient.ProjectServiceProjectRecord[] | null) => {
+        serviceProjects = list ?? [];
       },
       failRuns: (failure: ProjectServiceWorkClient.ProjectServiceWorkClientError | null) => {
         runsFailure = failure;
@@ -944,6 +955,99 @@ describe("ProjectConsumerRuntimeService", () => {
     }),
   );
 
+  it.live("the sweep recovers open work stranded by a restart without any replayed notice", () =>
+    Effect.gen(function* () {
+      const gateway = makeGateway();
+      const fakes = yield* makeFakes(gateway);
+      fakes.setServiceProjects([
+        { projectId: PS_PROJECT_ID, name: "Registry", workspaceDir: WORKSPACE_DIR },
+      ]);
+
+      // Instance A routes a notice, then the process restarts.
+      yield* Effect.gen(function* () {
+        yield* configureIntegration;
+        yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService.pipe(
+          Effect.flatMap((service) => service.start()),
+        );
+        const socket = gateway.recording.sockets[0];
+        assert.isDefined(socket);
+        socket?.fireOpen();
+        yield* waitForSdk(40);
+        gateway.sendWorkAvailable(socket as FakeSocket, { runId: "run_1" });
+        yield* settleWake();
+        assert.lengthOf(turnStartCommands(fakes.commands), 1);
+      }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+
+      // Instance B: fresh routing registry, and the notice never replays
+      // (Project Service already ACKed it). Reaching connected triggers the
+      // reconcile sweep, which finds the still-open work uncovered by any
+      // session and delivers exactly one synthetic wake.
+      yield* Effect.gen(function* () {
+        yield* configureIntegration;
+        yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService.pipe(
+          Effect.flatMap((service) => service.start()),
+        );
+        const socket = gateway.recording.sockets.at(-1);
+        assert.isDefined(socket);
+        socket?.fireOpen();
+        yield* waitForSdk(60);
+        yield* settleWake();
+
+        assert.lengthOf(projectCreateCommands(fakes.commands), 1);
+        assert.lengthOf(threadCreateCommands(fakes.commands), 2);
+        assert.lengthOf(turnStartCommands(fakes.commands), 2);
+
+        // No-nag across a reconnect: the sweep re-runs on the fresh
+        // connection, finds the delivered head, and stays quiet.
+        (gateway.recording.sockets.at(-1) as FakeSocket).fireClose();
+        yield* waitForSdk(80);
+        const redialed = gateway.recording.sockets.at(-1);
+        assert.isDefined(redialed);
+        redialed?.fireOpen();
+        yield* waitForSdk(60);
+        yield* settleWake();
+        assert.lengthOf(turnStartCommands(fakes.commands), 2);
+      }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+    }),
+  );
+
+  it.live("the periodic sweep recovers work that strands between connections", () =>
+    Effect.gen(function* () {
+      const gateway = makeGateway();
+      const fakes = yield* makeFakes(gateway, { reconcileSweepIntervalMs: 40 });
+
+      yield* Effect.gen(function* () {
+        yield* configureIntegration;
+        yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService.pipe(
+          Effect.flatMap((service) => service.start()),
+        );
+        const socket = gateway.recording.sockets[0];
+        assert.isDefined(socket);
+        socket?.fireOpen();
+        yield* waitForSdk(40);
+
+        // Connected, but the Project Service project list is empty: the
+        // on-connect sweep has nothing to reconcile.
+        assert.isEmpty(turnStartCommands(fakes.commands));
+
+        // The project (with open work behind it) appears later — as after a
+        // stranded busy-coalesce whose notice never re-fires. No new
+        // connection event arrives; only the periodic tick can recover it.
+        fakes.setServiceProjects([
+          { projectId: PS_PROJECT_ID, name: "Registry", workspaceDir: WORKSPACE_DIR },
+        ]);
+        yield* waitForSdk(160);
+
+        assert.lengthOf(projectCreateCommands(fakes.commands), 1);
+        assert.lengthOf(threadCreateCommands(fakes.commands), 1);
+        assert.lengthOf(turnStartCommands(fakes.commands), 1);
+        // Later ticks do not multiply the delivery.
+        yield* waitForSdk(120);
+        assert.lengthOf(turnStartCommands(fakes.commands), 1);
+      }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+    }),
+  );
+
   it.live("busy session delivers one coalesced aggregate after the turn", () =>
     Effect.gen(function* () {
       const gateway = makeGateway();
@@ -1016,9 +1120,19 @@ describe("ProjectConsumerRuntimeService", () => {
         const sessionsBefore = yield* service.router.snapshotSessions;
         assert.lengthOf(sessionsBefore, 1);
 
-        // The notification turn engaged and finished, so the session is
-        // idle again — then the credential stops working between notices.
+        // The notification turn engaged and finished; the unchanged head then
+        // drew the one A3 reminder, whose turn must also settle before the
+        // session is idle again — then the credential stops working between
+        // notices.
         const threadId = sessionsBefore[0]?.threadId as string;
+        yield* Queue.offer(fakes.eventQueue, fakes.sessionSetEvent(threadId, "running"));
+        yield* waitForSdk(20);
+        fakes.threads.set(threadId, {
+          ...threadShellFor(threadId),
+          session: sessionWithStatus(threadId, "ready"),
+        });
+        yield* Queue.offer(fakes.eventQueue, fakes.sessionSetEvent(threadId, "ready"));
+        yield* waitForSdk(20);
         yield* Queue.offer(fakes.eventQueue, fakes.sessionSetEvent(threadId, "running"));
         yield* waitForSdk(20);
         fakes.threads.set(threadId, {
