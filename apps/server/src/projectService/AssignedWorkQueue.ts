@@ -150,5 +150,5 @@ export const assignedWorkWakeMessage = (input: {
     input.queued > 0
       ? ` ${input.queued} more item${input.queued === 1 ? "" : "s"} waiting behind it.`
       : "";
-  return `Your current work: ${summary}.${waiting} Use the Project tools to inspect and complete the current work first.`;
+  return `Your current work: ${summary}.${waiting} Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.`;
 };
