@@ -675,9 +675,7 @@ function ProjectDetail({ group }: { group: SidebarProjectSnapshot }) {
                     : []),
                 ]
               : [`This removes ${members.length} grouped project entries.`]),
-            ...(projectThreads.length > 0
-              ? ["This permanently clears conversation history for those threads."]
-              : []),
+            "Threads in this project — including archived ones — are permanently deleted.",
             isWholeGroup
               ? "This removes only the project entries, not the files on disk."
               : "Other entries in this grouped project are unaffected.",
@@ -690,17 +688,13 @@ function ProjectDetail({ group }: { group: SidebarProjectSnapshot }) {
 
       const draftStore = useComposerDraftStore.getState();
       for (const member of members) {
-        const memberThreads = projectThreads.filter(
-          (thread) =>
-            thread.environmentId === member.environmentId && thread.projectId === member.id,
-        );
+        // Archived threads are invisible to the shell snapshot but still block
+        // a non-forced delete server-side — the confirmed delete always force
+        // cascades so an archived-only project can actually be removed.
         const result = mapAtomCommandResult(
           await deleteProject({
             environmentId: member.environmentId,
-            input: {
-              projectId: member.id,
-              ...(memberThreads.length > 0 ? { force: true } : {}),
-            },
+            input: { projectId: member.id, force: true },
           }),
           () => undefined,
         );
