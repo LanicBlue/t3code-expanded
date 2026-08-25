@@ -22,6 +22,7 @@ import * as Option from "effect/Option";
 
 import {
   applyThinkLevelToOptions,
+  flowInstanceWorkSessionThreadTitle,
   makeProjectWorkSessionRouter,
   type ProjectWorkSessionRouter,
   ProjectWorkRoutingError,
@@ -49,7 +50,7 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: true },
+      project: { enabled: true, sessionScope: "project" },
     },
     [LogicalAgentId.make(OTHER_AGENT_ID)]: {
       agentName: "Secondary Agent",
@@ -57,7 +58,7 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: false },
+      project: { enabled: false, sessionScope: "project" },
     },
   };
   const base: ServerSettings = {
@@ -484,6 +485,7 @@ it("routing resolution is id-based and structural", () => {
       modelOverride: null,
       projectServiceProjectId: PS_PROJECT_ID,
       projectName: "Registry",
+      sessionScope: "project",
     });
     // The notice's project facts ride through; a name-less notice stays blank.
     const nameless = resolveProjectWorkRouting(settings, wakeInput({ projectName: undefined }));
@@ -1838,6 +1840,474 @@ describe("delivery reconcile sweep", () => {
           : null,
         threadId,
       );
+    }),
+  );
+});
+
+describe("flow-instance session scope", () => {
+  const INST_A = "fi_alpha";
+  const INST_B = "fi_beta";
+
+  /** Project-work settings with the agent scoped to one session per instance. */
+  const makeFlowSettings = () =>
+    makeSettings((base) => ({
+      ...base,
+      logicalAgents: {
+        ...base.logicalAgents,
+        [LogicalAgentId.make(AGENT_ID)]: {
+          agentName: "Primary Agent",
+          providerInstanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
+          persona: "",
+          thinkLevel: null,
+          modelOverride: null,
+          project: { enabled: true, sessionScope: "flow-instance" as const },
+        },
+      },
+    }));
+
+  /** A run owned by one flow instance (PS v2+ task snapshots carry instance). */
+  const flowRun = (
+    instanceId: string,
+    name: string,
+    overrides: Partial<AssignedWorkQueueEntry> = {},
+  ): AssignedWorkQueueEntry => ({
+    runId: `run_${instanceId}`,
+    positionId: `position_${instanceId}`,
+    runRevision: "run:1",
+    state: "open",
+    agentId: AGENT_ID,
+    task: { prompt: `work for ${name}`, instance: { instanceId, name, iteration: 1 } },
+    createdAt: "2026-08-21T00:00:10.000Z",
+    ...overrides,
+  });
+
+  /** A run without instance identity (the legacy bucket). */
+  const legacyRun = (runId: string, createdAt: string): AssignedWorkQueueEntry => ({
+    runId,
+    positionId: `position_${runId}`,
+    runRevision: "run:1",
+    state: "open",
+    agentId: AGENT_ID,
+    task: { prompt: `legacy work ${runId}` },
+    createdAt,
+  });
+
+  /**
+   * Run the aggregate turn to rest: engage + settle twice — the unchanged
+   * head draws the one reminder, whose own turn must also settle before the
+   * session is idle again.
+   */
+  const settleToIdle = (
+    harness: Harness,
+    threadId: string,
+    projectId: string,
+  ): Effect.Effect<void> =>
+    runAggregateTurn(harness, threadId, projectId).pipe(
+      Effect.flatMap(() => runAggregateTurn(harness, threadId, projectId)),
+    );
+
+  const titleOf = (command: OrchestrationCommand): string =>
+    command.type === "thread.create" ? command.title : "";
+
+  it("the instance-scoped title composes agent and instance name, falling back on blank", () => {
+    assert.strictEqual(
+      flowInstanceWorkSessionThreadTitle("Primary Agent", "Alpha"),
+      "Primary Agent · Alpha",
+    );
+    assert.strictEqual(
+      flowInstanceWorkSessionThreadTitle("  Primary Agent  ", null),
+      "Primary Agent",
+    );
+  });
+
+  it.effect("one wake, work across two instances: one session each in the SAME T3 project", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      const runA1 = flowRun(INST_A, "Alpha", {
+        runId: "run_a1",
+        createdAt: "2026-08-21T00:00:10.000Z",
+      });
+      const runA2 = flowRun(INST_A, "Alpha", {
+        runId: "run_a2",
+        createdAt: "2026-08-21T00:00:11.000Z",
+      });
+      const runB1 = flowRun(INST_B, "Beta", {
+        runId: "run_b1",
+        createdAt: "2026-08-21T00:00:12.000Z",
+      });
+      harness.setOpenRuns([runA1, runA2, runB1]);
+
+      yield* wake(harness.router);
+
+      const creates = threadCreates(harness.commands);
+      assert.lengthOf(creates, 2);
+      assert.lengthOf(projectCreates(harness.commands), 1);
+      // Same resolved project; titles carry the instance name so the two
+      // parallel sessions stay distinguishable in the UI.
+      assert.deepEqual(creates.map(titleOf).sort(), [
+        "Primary Agent · Alpha",
+        "Primary Agent · Beta",
+      ]);
+      assert.strictEqual(
+        new Set(
+          creates.map((command) =>
+            command.type === "thread.create" ? String(command.projectId) : "",
+          ),
+        ).size,
+        1,
+      );
+      // Each aggregate names ITS partition's head and queue depth only.
+      assert.deepEqual(
+        turnStarts(harness.commands)
+          .map((command) => (command.type === "thread.turn.start" ? command.message.text : ""))
+          .sort(),
+        [
+          assignedWorkWakeMessage({ current: runA1, queued: 1 }),
+          assignedWorkWakeMessage({ current: runB1, queued: 0 }),
+        ].sort(),
+      );
+      assert.deepEqual(
+        (yield* harness.router.snapshotSessions).map((session) => session.flowInstanceKey).sort(),
+        [INST_A, INST_B],
+      );
+    }),
+  );
+
+  it.effect("a second wake for the SAME instance reuses its session's thread", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+      ]);
+      yield* wake(harness.router);
+      const alphaThread = threadCreates(harness.commands).find(
+        (command) => titleOf(command) === "Primary Agent · Alpha",
+      );
+      const threadId = alphaThread?.type === "thread.create" ? alphaThread.threadId : null;
+      const projectId = String(alphaThread?.projectId);
+      assert.isNotNull(threadId);
+      yield* settleToIdle(harness, threadId as string, projectId);
+
+      yield* wake(harness.router);
+
+      // No third session: Alpha's wake resumed on the existing thread. The
+      // four turns are the two initial aggregates, Alpha's settle reminder,
+      // and the resumed Alpha aggregate (Beta was still notifying, so its
+      // wake only recorded).
+      assert.lengthOf(threadCreates(harness.commands), 2);
+      assert.lengthOf(turnStarts(harness.commands), 4);
+      const alphaTurns = turnStarts(harness.commands).filter(
+        (command) =>
+          command.type === "thread.turn.start" && String(command.threadId) === String(threadId),
+      );
+      assert.lengthOf(alphaTurns, 3);
+    }),
+  );
+
+  it.effect("a busy instance records its work; the OTHER instance's session delivers", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+      ]);
+      yield* wake(harness.router);
+      const byTitle = new Map(
+        threadCreates(harness.commands).map((command) => [
+          titleOf(command),
+          command.type === "thread.create" ? command.threadId : null,
+        ]),
+      );
+      const alphaThread = byTitle.get("Primary Agent · Alpha") as string;
+      const betaThread = byTitle.get("Primary Agent · Beta") as string;
+      const projectId = String(threadCreates(harness.commands)[0]?.projectId);
+      yield* settleToIdle(harness, alphaThread, projectId);
+      yield* settleToIdle(harness, betaThread, projectId);
+
+      // Alpha's turn is running again when a fresh notice lands.
+      harness.putThread(
+        makeThreadShell(alphaThread, projectId, (shell) => ({
+          ...shell,
+          session: runningSession(alphaThread),
+        })),
+      );
+      yield* wake(harness.router);
+
+      const turns = turnStarts(harness.commands);
+      // Two initial aggregates + two settle reminders + Beta's resumed
+      // aggregate — and the resumed one lands ONLY on Beta's thread.
+      assert.lengthOf(turns, 5);
+      assert.strictEqual(
+        turns.at(-1)?.type === "thread.turn.start" ? String(turns.at(-1)?.threadId) : null,
+        String(betaThread),
+      );
+      const alphaTurns = turns.filter(
+        (command) =>
+          command.type === "thread.turn.start" && String(command.threadId) === String(alphaThread),
+      );
+      assert.lengthOf(alphaTurns, 2);
+      const sessions = yield* harness.router.snapshotSessions;
+      const alpha = sessions.find((session) => session.flowInstanceKey === INST_A);
+      assert.isTrue(alpha?.pendingWork);
+    }),
+  );
+
+  it.effect(
+    "runs without instance identity share one legacy session beside the instance sessions",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeFlowSettings());
+        harness.setOpenRuns([
+          legacyRun("run_legacy_1", "2026-08-21T00:00:10.000Z"),
+          legacyRun("run_legacy_2", "2026-08-21T00:00:11.000Z"),
+          flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:12.000Z" }),
+        ]);
+
+        yield* wake(harness.router);
+
+        assert.deepEqual(threadCreates(harness.commands).map(titleOf).sort(), [
+          "Primary Agent",
+          "Primary Agent · Alpha",
+        ]);
+        assert.include(
+          turnStarts(harness.commands)
+            .map((command) => (command.type === "thread.turn.start" ? command.message.text : ""))
+            .join("\n"),
+          "1 more item waiting behind it",
+        );
+        assert.deepEqual(
+          (yield* harness.router.snapshotSessions).map((session) => session.flowInstanceKey).sort(),
+          ["", INST_A],
+        );
+      }),
+  );
+
+  it.effect("a head advancing in ONE instance advances only that instance's session", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        flowRun(INST_A, "Alpha", { runId: "run_a2", createdAt: "2026-08-21T00:00:11.000Z" }),
+        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:12.000Z" }),
+      ]);
+      yield* wake(harness.router);
+      const byTitle = new Map(
+        threadCreates(harness.commands).map((command) => [
+          titleOf(command),
+          command.type === "thread.create" ? command.threadId : null,
+        ]),
+      );
+      const alphaThread = byTitle.get("Primary Agent · Alpha") as string;
+      const betaThread = byTitle.get("Primary Agent · Beta") as string;
+      const projectId = String(threadCreates(harness.commands)[0]?.projectId);
+
+      // Alpha's aggregate engaged; its head then advanced (run_a1 resolved).
+      harness.putThread(
+        makeThreadShell(alphaThread, projectId, (shell) => ({
+          ...shell,
+          session: runningSession(alphaThread),
+        })),
+      );
+      yield* harness.router.onThreadEvent(alphaThread as never);
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", { runId: "run_a2", createdAt: "2026-08-21T00:00:11.000Z" }),
+        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:12.000Z" }),
+      ]);
+      harness.putThread(
+        makeThreadShell(alphaThread, projectId, (shell) => ({
+          ...shell,
+          session: readySession(alphaThread),
+        })),
+      );
+      yield* harness.router.onThreadEvent(alphaThread as never);
+
+      // Alpha's thread got exactly one advancement naming run_a2; Beta's
+      // thread was never touched by Alpha's drain.
+      const alphaTurns = turnStarts(harness.commands).filter(
+        (command) =>
+          command.type === "thread.turn.start" && String(command.threadId) === String(alphaThread),
+      );
+      assert.lengthOf(alphaTurns, 2);
+      assert.include(
+        alphaTurns[1]?.type === "thread.turn.start" ? alphaTurns[1]?.message.text : "",
+        "work for Alpha",
+      );
+      const betaTurns = turnStarts(harness.commands).filter(
+        (command) =>
+          command.type === "thread.turn.start" && String(command.threadId) === String(betaThread),
+      );
+      assert.lengthOf(betaTurns, 1);
+    }),
+  );
+
+  it.effect("each instance's session binds its own head's managed worktree", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", {
+          runId: "run_a1",
+          createdAt: "2026-08-21T00:00:10.000Z",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_A,
+        }),
+        flowRun(INST_B, "Beta", {
+          runId: "run_b1",
+          createdAt: "2026-08-21T00:00:11.000Z",
+          workspacePolicy: "managed-worktree",
+          workspacePath: WT_B,
+        }),
+      ]);
+
+      yield* wake(harness.router);
+
+      const bindingByTitle = new Map(
+        threadCreates(harness.commands).map((command) => [
+          titleOf(command),
+          command.type === "thread.create" ? command.worktreePath : null,
+        ]),
+      );
+      assert.strictEqual(bindingByTitle.get("Primary Agent · Alpha"), WT_A);
+      assert.strictEqual(bindingByTitle.get("Primary Agent · Beta"), WT_B);
+      const sessions = yield* harness.router.snapshotSessions;
+      assert.strictEqual(
+        sessions.find((session) => session.flowInstanceKey === INST_A)?.boundWorktreePath,
+        WT_A,
+      );
+      assert.strictEqual(
+        sessions.find((session) => session.flowInstanceKey === INST_B)?.boundWorktreePath,
+        WT_B,
+      );
+    }),
+  );
+
+  it.effect("restart: the sweep rebuilds one session per instance, then stays quiet", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+      ]);
+
+      yield* harness.router.reconcileOpenWork(wakeInput());
+
+      assert.lengthOf(threadCreates(harness.commands), 2);
+      assert.lengthOf(turnStarts(harness.commands), 2);
+      assert.deepEqual(
+        (yield* harness.router.snapshotSessions).map((session) => session.flowInstanceKey).sort(),
+        [INST_A, INST_B],
+      );
+
+      // No-nag per instance: later sweeps re-deliver nothing.
+      yield* harness.router.reconcileOpenWork(wakeInput());
+      yield* harness.router.reconcileOpenWork(wakeInput());
+      assert.lengthOf(turnStarts(harness.commands), 2);
+    }),
+  );
+
+  it.effect("toggling project→flow-instance PARKS the old shared session instead of chaining", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+      ]);
+      yield* wake(harness.router);
+      const [created] = threadCreates(harness.commands);
+      const threadId = created?.type === "thread.create" ? created.threadId : null;
+      const projectId = String(created?.projectId);
+      assert.lengthOf(turnStarts(harness.commands), 1);
+
+      // The scope flips while the shared session's aggregate turn is still
+      // in flight. Its turn then runs out: without the universe guard the
+      // drain would draw the one reminder (same head still open) and keep
+      // chaining the whole queue into the OLD thread.
+      harness.setSettings(makeFlowSettings());
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+
+      assert.lengthOf(turnStarts(harness.commands), 1);
+      const parked = (yield* harness.router.snapshotSessions).find(
+        (session) => session.flowInstanceKey === null,
+      );
+      assert.strictEqual(parked?.phase, "idle");
+      assert.isFalse(parked?.pendingWork);
+
+      // The next wake routes each instance onto its OWN session; the parked
+      // thread keeps exactly its one pre-toggle aggregate and is never
+      // spoken to again.
+      yield* wake(harness.router);
+      assert.lengthOf(threadCreates(harness.commands), 3);
+      assert.lengthOf(turnStarts(harness.commands), 3);
+      const parkedThreadTurns = turnStarts(harness.commands).filter(
+        (command) =>
+          command.type === "thread.turn.start" && String(command.threadId) === String(threadId),
+      );
+      assert.lengthOf(parkedThreadTurns, 1);
+    }),
+  );
+
+  it.effect("toggling flow-instance→project parks the instance sessions symmetrically", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+      ]);
+      yield* wake(harness.router);
+      assert.lengthOf(threadCreates(harness.commands), 2);
+      const alphaThread = threadCreates(harness.commands).find(
+        (command) => titleOf(command) === "Primary Agent · Alpha",
+      );
+      const threadId = alphaThread?.type === "thread.create" ? alphaThread.threadId : null;
+      const projectId = String(alphaThread?.projectId);
+
+      // Flip back to the shared scope mid-flight; Alpha's turn then runs out
+      // and its session parks without drawing its reminder.
+      harness.setSettings(makeSettings());
+      yield* runAggregateTurn(harness, threadId as string, projectId);
+      assert.lengthOf(turnStarts(harness.commands), 2);
+
+      // The next wake creates the ONE shared session covering every run.
+      yield* wake(harness.router);
+      assert.lengthOf(threadCreates(harness.commands), 3);
+      const sharedTurn = turnStarts(harness.commands)[2];
+      assert.strictEqual(
+        sharedTurn?.type === "thread.turn.start" ? sharedTurn.message.text : null,
+        assignedWorkWakeMessage({
+          current: flowRun(INST_A, "Alpha", {
+            runId: "run_a1",
+            createdAt: "2026-08-21T00:00:10.000Z",
+          }),
+          queued: 1,
+        }),
+      );
+    }),
+  );
+
+  it.effect("a wake with zero open work resolves the project and creates no session", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenWorkCount(0);
+
+      yield* wake(harness.router);
+
+      assert.lengthOf(projectCreates(harness.commands), 1);
+      assert.isEmpty(threadCreates(harness.commands));
+      assert.isEmpty(turnStarts(harness.commands));
+      assert.isEmpty(yield* harness.router.snapshotSessions);
+    }),
+  );
+
+  it.effect("a blank instance name falls back to the agent-name title", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeFlowSettings());
+      harness.setOpenRuns([
+        flowRun(INST_A, "   ", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+      ]);
+
+      yield* wake(harness.router);
+
+      assert.deepEqual(threadCreates(harness.commands).map(titleOf), ["Primary Agent"]);
     }),
   );
 });

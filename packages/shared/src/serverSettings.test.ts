@@ -530,7 +530,7 @@ describe("project service + logical agents patching", () => {
     persona: "",
     thinkLevel: null,
     modelOverride: null,
-    project: { enabled: false },
+    project: { enabled: false, sessionScope: "project" },
   });
 
   it("replaces the agent map wholesale", () => {
@@ -556,7 +556,7 @@ describe("project service + logical agents patching", () => {
       logicalAgents: {
         [agentId("ag_one")]: {
           ...agent(),
-          project: { enabled: true },
+          project: { enabled: true, sessionScope: "project" as const },
         },
       },
     };

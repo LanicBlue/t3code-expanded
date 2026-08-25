@@ -7,7 +7,11 @@ import {
   assignedWorkTaskSummary,
   assignedWorkWakeMessage,
   currentAssignedWork,
+  flowInstanceKeyOf,
+  flowInstanceNameOf,
   orderAssignedWorkQueue,
+  partitionOpenWork,
+  runsForFlowInstance,
 } from "./AssignedWorkQueue.ts";
 
 const run = (overrides: Partial<AssignedWorkQueueEntry>): AssignedWorkQueueEntry => ({
@@ -90,5 +94,88 @@ describe("AssignedWorkQueue", () => {
       assignedWorkWakeMessage({ current, queued: 3 }),
       "Your current work: 分诊：修复登录. 3 more items waiting behind it. Use the Project tools to inspect and complete the current work first.",
     );
+  });
+
+  it("flow-instance keys read task.instance.instanceId structurally, blank and absent facts degrade to the legacy bucket", () => {
+    const instanceRun = run({
+      task: {
+        prompt: "x",
+        instance: { instanceId: "inst_1", name: "  Release  , v2  ", iteration: 1 },
+      },
+    });
+    NodeAssert.equal(flowInstanceKeyOf(instanceRun), "inst_1");
+    NodeAssert.equal(flowInstanceNameOf(instanceRun), "Release  , v2");
+    // Absent, non-object, non-string, and blank facts all degrade.
+    NodeAssert.equal(flowInstanceKeyOf(run({ task: { prompt: "x" } })), "");
+    NodeAssert.equal(flowInstanceNameOf(run({ task: { prompt: "x" } })), null);
+    NodeAssert.equal(flowInstanceKeyOf(run({ task: { prompt: "x", instance: null } })), "");
+    NodeAssert.equal(flowInstanceNameOf(run({ task: { prompt: "x", instance: "inst_1" } })), null);
+    NodeAssert.equal(
+      flowInstanceKeyOf(run({ task: { prompt: "x", instance: { instanceId: "   " } } })),
+      "",
+    );
+    NodeAssert.equal(
+      flowInstanceNameOf(run({ task: { prompt: "x", instance: { instanceId: "i", name: "  " } } })),
+      null,
+    );
+    NodeAssert.equal(
+      flowInstanceNameOf(run({ task: { prompt: "x", instance: { instanceId: "i" } } })),
+      null,
+    );
+  });
+
+  it("partitionOpenWork groups OPEN runs by instance key in first-appearance order", () => {
+    const partitions = partitionOpenWork([
+      run({
+        runId: "run_b1",
+        task: { prompt: "x", instance: { instanceId: "inst_b", name: "b", iteration: 1 } },
+      }),
+      run({ runId: "run_legacy", task: { prompt: "x" } }),
+      run({
+        runId: "run_a1",
+        task: { prompt: "x", instance: { instanceId: "inst_a", name: "a", iteration: 1 } },
+      }),
+      run({
+        runId: "run_b2",
+        task: { prompt: "x", instance: { instanceId: "inst_b", name: "b", iteration: 1 } },
+      }),
+      // Settled runs never form or join a partition.
+      run({
+        runId: "run_c_done",
+        state: "completed",
+        task: { prompt: "x", instance: { instanceId: "inst_c", name: "c", iteration: 1 } },
+      }),
+    ]);
+    NodeAssert.deepEqual(
+      [...partitions.entries()].map(([key, entries]) => [key, entries.map((entry) => entry.runId)]),
+      [
+        ["inst_b", ["run_b1", "run_b2"]],
+        ["", ["run_legacy"]],
+        ["inst_a", ["run_a1"]],
+      ],
+    );
+  });
+
+  it("runsForFlowInstance: null owns every run, a string owns that instance's runs", () => {
+    const aRun = run({
+      runId: "run_a",
+      task: { prompt: "x", instance: { instanceId: "inst_a", name: "a", iteration: 1 } },
+    });
+    const legacyRun = run({ runId: "run_legacy", task: { prompt: "x" } });
+    const all = [aRun, legacyRun];
+    // Project scope: identity (every run, whatever its state).
+    NodeAssert.deepEqual(
+      runsForFlowInstance(all, null).map((entry) => entry.runId),
+      ["run_a", "run_legacy"],
+    );
+    NodeAssert.deepEqual(
+      runsForFlowInstance(all, "inst_a").map((entry) => entry.runId),
+      ["run_a"],
+    );
+    NodeAssert.deepEqual(
+      runsForFlowInstance(all, "").map((entry) => entry.runId),
+      ["run_legacy"],
+    );
+    NodeAssert.deepEqual(runsForFlowInstance([], "inst_a"), []);
   });
 });

@@ -224,7 +224,7 @@ function AgentRow({
               updateSettings({
                 logicalAgents: nextAgentMapWithAgent(agentMap, agentId, {
                   ...agent,
-                  project: { enabled: Boolean(checked) },
+                  project: { ...agent.project, enabled: Boolean(checked) },
                 }),
               })
             }

@@ -871,7 +871,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
               persona: "",
               thinkLevel: null,
               modelOverride: null,
-              project: { enabled: false },
+              project: { enabled: false, sessionScope: "project" },
             },
           },
         }),
@@ -891,7 +891,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             persona: "",
             thinkLevel: null,
             modelOverride: null,
-            project: { enabled: false },
+            project: { enabled: false, sessionScope: "project" },
           },
         },
       });
@@ -916,7 +916,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             persona: "",
             thinkLevel: null,
             modelOverride: null,
-            project: { enabled: true },
+            project: { enabled: true, sessionScope: "project" },
           },
           [LogicalAgentId.make("ag_review")]: {
             agentName: "Review agent",
@@ -924,7 +924,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             persona: "",
             thinkLevel: null,
             modelOverride: null,
-            project: { enabled: true },
+            project: { enabled: true, sessionScope: "project" },
           },
           [LogicalAgentId.make("ag_other")]: {
             agentName: "Other agent",
@@ -932,7 +932,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             persona: "",
             thinkLevel: null,
             modelOverride: null,
-            project: { enabled: true },
+            project: { enabled: true, sessionScope: "project" },
           },
         },
       });
@@ -947,7 +947,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
               persona: "",
               thinkLevel: null,
               modelOverride: null,
-              project: { enabled: false },
+              project: { enabled: false, sessionScope: "project" },
             },
           },
         }),
@@ -972,7 +972,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             persona: "",
             thinkLevel: null,
             modelOverride: null,
-            project: { enabled: true },
+            project: { enabled: true, sessionScope: "project" },
           },
         },
       });
@@ -1010,7 +1010,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             persona: "",
             thinkLevel: null,
             modelOverride: null,
-            project: { enabled: false },
+            project: { enabled: false, sessionScope: "project" },
           },
         },
       });
@@ -1063,7 +1063,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           persona: "",
           thinkLevel: null,
           modelOverride: null,
-          project: { enabled: true },
+          project: { enabled: true, sessionScope: "project" },
           projectBindings: [{ projectId: "proj_9", projectName: "Wiki", t3ProjectId: "local-1" }],
         },
       };
@@ -1077,7 +1077,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         persona: "",
         thinkLevel: null,
         modelOverride: null,
-        project: { enabled: true },
+        project: { enabled: true, sessionScope: "project" },
       });
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );

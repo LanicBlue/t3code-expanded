@@ -509,7 +509,7 @@ const configureIntegration = Effect.gen(function* () {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: true },
+      project: { enabled: true, sessionScope: "project" },
     },
   };
   yield* serverSettings.updateSettings({

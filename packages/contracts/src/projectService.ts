@@ -144,6 +144,15 @@ import { LogicalAgentId } from "./providerInstance.ts";
 
 export const LOGICAL_AGENT_PERSONA_MAX_CHARS = 4000;
 
+/**
+ * How Project Service work maps onto sessions: "project" routes all work of
+ * one (agent, project) onto ONE session; "flow-instance" gives each flow
+ * instance's work its own session, so concurrent instances run in parallel
+ * threads of the same T3 project.
+ */
+export const ProjectWorkSessionScope = Schema.Literals(["project", "flow-instance"]);
+export type ProjectWorkSessionScope = typeof ProjectWorkSessionScope.Type;
+
 export const LogicalAgentConfig = Schema.Struct({
   /** Mutable display name; changing it changes nothing else. */
   agentName: TrimmedNonEmptyString,
@@ -179,6 +188,16 @@ export const LogicalAgentConfig = Schema.Struct({
   ),
   project: Schema.Struct({
     enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+    /**
+     * Session routing for this agent's Project Service work: "project"
+     * (default) = all work of one (agent, project) on ONE session;
+     * "flow-instance" = each flow instance's work gets its own session (runs
+     * whose task snapshot carries no instance identity share one legacy
+     * session).
+     */
+    sessionScope: ProjectWorkSessionScope.pipe(
+      Schema.withDecodingDefault(Effect.succeed("project")),
+    ),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });
 export type LogicalAgentConfig = typeof LogicalAgentConfig.Type;

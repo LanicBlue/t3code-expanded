@@ -301,12 +301,44 @@ function AgentDetail({
               <Switch
                 checked={agent.project.enabled}
                 onCheckedChange={(checked) =>
-                  patchAgent({ ...agent, project: { enabled: Boolean(checked) } })
+                  patchAgent({ ...agent, project: { ...agent.project, enabled: Boolean(checked) } })
                 }
                 aria-label="Project work enabled"
               />
               Project work enabled
             </label>
+          }
+        />
+        <SettingsRow
+          title="Session scope"
+          description="How this agent's Project Service work maps onto sessions. One session per project works every flow instance's work in arrival order on a single thread; a session per flow instance runs each instance's work on its own thread (parallel, titled with the instance name). Affects newly routed work — existing sessions rest."
+          control={
+            <Select
+              value={agent.project.sessionScope}
+              onValueChange={(scope) => {
+                if (scope !== null) {
+                  patchAgent({
+                    ...agent,
+                    project: {
+                      ...agent.project,
+                      sessionScope: scope === "flow-instance" ? "flow-instance" : "project",
+                    },
+                  });
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-56" aria-label="Session scope">
+                <SelectValue>
+                  {agent.project.sessionScope === "flow-instance"
+                    ? "Session per flow instance"
+                    : "One session per project"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem value="project">One session per project</SelectItem>
+                <SelectItem value="flow-instance">Session per flow instance</SelectItem>
+              </SelectPopup>
+            </Select>
           }
         />
         <SettingsRow

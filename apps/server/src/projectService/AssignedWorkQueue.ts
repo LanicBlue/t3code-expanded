@@ -44,6 +44,61 @@ export const currentAssignedWork = (
   runs: ReadonlyArray<AssignedWorkQueueEntry>,
 ): AssignedWorkQueueEntry | null => orderAssignedWorkQueue(runs).at(0) ?? null;
 
+// ── Flow-instance scoping ────────────────────────────────────────
+
+/** The run's `task.instance.instanceId` when a non-blank string; "" without one. */
+export const flowInstanceKeyOf = (run: AssignedWorkQueueEntry): string => {
+  const instance = run.task.instance;
+  if (typeof instance !== "object" || instance === null) return "";
+  const id = (instance as Record<string, unknown>).instanceId;
+  return typeof id === "string" && id.trim().length > 0 ? id : "";
+};
+
+/** The run's `task.instance.name` trimmed; null when absent or blank. */
+export const flowInstanceNameOf = (run: AssignedWorkQueueEntry): string | null => {
+  const instance = run.task.instance;
+  if (typeof instance !== "object" || instance === null) return null;
+  const name = (instance as Record<string, unknown>).name;
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+/**
+ * Open runs grouped by flow-instance key (same open-only discipline as
+ * `orderAssignedWorkQueue`, so a partition of only settled runs never exists
+ * and no key is ever minted for a dead instance). Map iteration order is the
+ * keys' first appearance in the input.
+ */
+export const partitionOpenWork = (
+  runs: ReadonlyArray<AssignedWorkQueueEntry>,
+): Map<string, Array<AssignedWorkQueueEntry>> => {
+  const partitions = new Map<string, Array<AssignedWorkQueueEntry>>();
+  for (const run of runs) {
+    if (run.state !== "open") continue;
+    const key = flowInstanceKeyOf(run);
+    const partition = partitions.get(key);
+    if (partition === undefined) {
+      partitions.set(key, [run]);
+    } else {
+      partition.push(run);
+    }
+  }
+  return partitions;
+};
+
+/**
+ * A session's run universe: null owns every run (project scope); a string
+ * owns that instance's runs, with "" as the legacy no-instance bucket.
+ */
+export const runsForFlowInstance = (
+  runs: ReadonlyArray<AssignedWorkQueueEntry>,
+  flowInstanceKey: string | null,
+): Array<AssignedWorkQueueEntry> =>
+  flowInstanceKey === null
+    ? [...runs]
+    : runs.filter((run) => flowInstanceKeyOf(run) === flowInstanceKey);
+
 /**
  * A compact one-line summary of a work task payload for wake messages. The
  * task is the run's free-form snapshot record; prefer its `prompt` value,

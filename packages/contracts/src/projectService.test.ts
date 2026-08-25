@@ -106,7 +106,7 @@ describe("ServerSettings project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: true },
+      project: { enabled: true, sessionScope: "project" },
     });
     expect(encodeServerSettings(decoded).logicalAgents).toEqual(decoded.logicalAgents);
   });
@@ -123,7 +123,7 @@ describe("ServerSettings project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: false },
+      project: { enabled: false, sessionScope: "project" },
     });
   });
 
@@ -144,6 +144,20 @@ describe("ServerSettings project service surfaces", () => {
         thinkLevel: "high",
       }).thinkLevel,
     ).toBe("high");
+  });
+
+  it("decodes the agent's session scope, defaulting to one session per project", () => {
+    expect(
+      decodeLogicalAgentConfig({ agentName: "A", providerInstanceId: "codex" }).project
+        .sessionScope,
+    ).toBe("project");
+    expect(
+      decodeLogicalAgentConfig({
+        agentName: "A",
+        providerInstanceId: "codex",
+        project: { enabled: true, sessionScope: "flow-instance" },
+      }).project,
+    ).toEqual({ enabled: true, sessionScope: "flow-instance" });
   });
 
   it("strips a stale projectBindings key from a hand-edited settings.json silently", () => {
@@ -169,7 +183,7 @@ describe("ServerSettings project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: true },
+      project: { enabled: true, sessionScope: "project" },
     });
     expect(JSON.stringify(decoded)).not.toContain("projectBindings");
   });
@@ -214,7 +228,7 @@ describe("ServerSettingsPatch project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: false },
+      project: { enabled: false, sessionScope: "project" },
     });
   });
 });

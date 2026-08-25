@@ -7,8 +7,10 @@
  * queue-head wake message from `AssignedWorkQueue.ts`). The local pending set is debounce/dedup
  * state only — Work lifecycle is never mirrored into T3.
  *
- * The routing key is `logicalAgentId + Project Service projectId`; names in
- * either direction are display metadata and never participate in the mapping.
+ * The routing key is `logicalAgentId + Project Service projectId` — plus the
+ * flow-instance key when the agent's session scope is "flow-instance", which
+ * gives each instance's work its own session; names in either direction are
+ * display metadata and never participate in the mapping.
  * The T3 project is resolved from the notice's WORKSPACE DIRECTORY: the
  * active local project keyed by that directory is reused, and a missing one
  * is created on the spot (issue #6's auto-reuse/auto-create rule), so no
@@ -42,6 +44,7 @@ import {
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
   ProjectId,
+  type ProjectWorkSessionScope,
   type ProviderDriverKind,
   type ServerSettings,
   ThreadId,
@@ -56,7 +59,10 @@ import {
   type AssignedWorkQueueEntry,
   assignedWorkWakeMessage,
   currentAssignedWork,
+  flowInstanceNameOf,
   orderAssignedWorkQueue,
+  partitionOpenWork,
+  runsForFlowInstance,
 } from "./AssignedWorkQueue.ts";
 
 const DEFAULT_ROUTING_RUNTIME_MODE = "full-access" as const;
@@ -110,6 +116,8 @@ export interface ProjectWorkRoutingTarget {
   readonly projectName: string;
   /** The local project resolved for the notice's workspace directory. */
   readonly t3ProjectId: ProjectId;
+  /** The agent's configured session scope for this work. */
+  readonly sessionScope: ProjectWorkSessionScope;
 }
 
 /** Agent-level routing facts before the workspace directory is resolved. */
@@ -121,6 +129,7 @@ export interface ProjectWorkAgentRouting {
   readonly modelOverride: ModelSelection | null;
   readonly projectServiceProjectId: string;
   readonly projectName: string;
+  readonly sessionScope: ProjectWorkSessionScope;
 }
 
 export type ProjectWorkRoutingResolution =
@@ -181,6 +190,7 @@ export const resolveProjectWorkRouting = (
       modelOverride: agentConfig.modelOverride,
       projectServiceProjectId: input.projectId,
       projectName: input.projectName ?? "",
+      sessionScope: agentConfig.project.sessionScope,
     },
   };
 };
@@ -278,6 +288,18 @@ export const applyThinkLevelToOptions = (
  */
 export const workSessionThreadTitle = (agentName: string): string => agentName.trim();
 
+/**
+ * Title for a flow-instance-scoped session: the agent name plus the
+ * instance's name, because several such sessions share one project and the
+ * title is the only human-visible discriminator between them. A blank
+ * instance name falls back to the agent name alone (the title must stay
+ * non-empty).
+ */
+export const flowInstanceWorkSessionThreadTitle = (
+  agentName: string,
+  instanceName: string | null,
+): string => (instanceName === null ? agentName.trim() : `${agentName.trim()} · ${instanceName}`);
+
 // ── Router ───────────────────────────────────────────────────────
 
 /** What a wake carries into the router; SDK notice facts minus transport detail. */
@@ -355,6 +377,8 @@ export interface ProjectWorkSessionRouterDeps {
 export interface ProjectWorkSessionSnapshot {
   readonly agentId: string;
   readonly projectId: string;
+  /** The flow instance this session owns (null = the whole project queue). */
+  readonly flowInstanceKey: string | null;
   readonly threadId: ThreadId;
   readonly phase: "idle" | "notifying";
   readonly pendingWork: boolean;
@@ -399,6 +423,15 @@ interface RoutedSession {
   readonly threadId: ThreadId;
   /** The wake facts this session was routed under (re-resolution input). */
   readonly input: ProjectWorkWakeInput;
+  /**
+   * The run universe this session owns, fixed at creation: null = every run
+   * of the (agent, project) queue (project scope); a string = one flow
+   * instance's runs, with "" as the legacy bucket for runs without instance
+   * identity. A session only drives while the agent's CONFIGURED scope
+   * matches this universe — the universe guard in processThreadEvent parks
+   * it the moment a settings toggle moves the work to other sessions.
+   */
+  readonly flowInstanceKey: string | null;
   phase: "idle" | "notifying";
   pendingWork: boolean;
   /**
@@ -443,15 +476,16 @@ interface RoutedSession {
   remindedHeadRunId: string | null;
 }
 
-const routingKeyOf = (agentId: string, projectId: string): string => `${agentId}::${projectId}`;
-
-const routingKeyParts = (key: string): { readonly agentId: string; readonly projectId: string } => {
-  const separator = key.indexOf("::");
-  return {
-    agentId: separator === -1 ? key : key.slice(0, separator),
-    projectId: separator === -1 ? "" : key.slice(separator + 2),
-  };
-};
+/**
+ * The registry key: opaque, never parsed back (snapshots read their facts
+ * off the RoutedSession). Project scope is the two-segment key; a flow
+ * instance appends its key as a third segment ("" — the legacy bucket —
+ * yields a trailing separator, still distinct from the plain key).
+ */
+const routingKeyOf = (agentId: string, projectId: string, flowInstanceKey: string | null): string =>
+  flowInstanceKey === null
+    ? `${agentId}::${projectId}`
+    : `${agentId}::${projectId}::${flowInstanceKey}`;
 
 export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRouter")(function* (
   deps: ProjectWorkSessionRouterDeps,
@@ -677,27 +711,23 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         projectServiceProjectId: resolution.routing.projectServiceProjectId,
         projectName: resolution.routing.projectName,
         t3ProjectId,
+        sessionScope: resolution.routing.sessionScope,
       };
     },
   );
 
-  // Deliver the aggregate. The open-work count always comes from the
-  // authoritative query at delivery time; a synchronous create path may
-  // pass the runs it just queried as `knownRuns`. Resolves to the dispatch
-  // timestamp when a notification turn was actually dispatched (null when
-  // there was nothing to say) — callers record it so the queued-turn guard
-  // can tell OUR turn's settlement from a previous turn's.
+  // Deliver the aggregate for runs the caller already holds, SESSION-SCOPED
+  // (the open-work count always comes from an authoritative query; flow
+  // instance sessions pass their partition, project sessions the whole list).
+  // Resolves to the dispatch timestamp when a notification turn was actually
+  // dispatched (null when there was nothing to say) — callers record it so
+  // the queued-turn guard can tell OUR turn's settlement from a previous
+  // turn's.
   const deliverAggregate = Effect.fn("ProjectWorkSessionRouter.deliverAggregate")(function* (
     target: ProjectWorkRoutingTarget,
     threadId: ThreadId,
-    knownRuns?: ReadonlyArray<AssignedWorkQueueEntry>,
+    runs: ReadonlyArray<AssignedWorkQueueEntry>,
   ): Effect.fn.Return<string | null, ProjectWorkRoutingError> {
-    const runs =
-      knownRuns ??
-      (yield* deps.listOpenAssignedWork({
-        agentId: target.logicalAgentId,
-        projectId: target.projectServiceProjectId,
-      }));
     const ordered = orderAssignedWorkQueue(runs);
     const current = ordered.at(0);
     if (current === undefined) {
@@ -725,12 +755,16 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
 
   // Creates the next current session and delivers the aggregate as its
   // first turn. Used for missing sessions and archived ones (an archived
-  // session is no longer current, so a NEW session becomes it).
+  // session is no longer current, so a NEW session becomes it). `runs`,
+  // when the caller already holds the authoritative query, must already be
+  // scoped to `flowInstanceKey`.
   const createCurrentSession = Effect.fn("ProjectWorkSessionRouter.createCurrentSession")(
     function* (
       key: string,
       input: ProjectWorkWakeInput,
       target: ProjectWorkRoutingTarget,
+      flowInstanceKey: string | null,
+      knownRuns?: ReadonlyArray<AssignedWorkQueueEntry>,
     ): Effect.fn.Return<void, ProjectWorkRoutingError> {
       const project = yield* deps.readProjectShell(target.t3ProjectId);
       if (Option.isNone(project)) {
@@ -739,10 +773,15 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           detail: `T3 project ${target.t3ProjectId} resolved for Project Service project ${target.projectServiceProjectId} does not exist`,
         });
       }
-      const openRuns = yield* deps.listOpenAssignedWork({
-        agentId: target.logicalAgentId,
-        projectId: target.projectServiceProjectId,
-      });
+      const openRuns =
+        knownRuns ??
+        runsForFlowInstance(
+          yield* deps.listOpenAssignedWork({
+            agentId: target.logicalAgentId,
+            projectId: target.projectServiceProjectId,
+          }),
+          flowInstanceKey,
+        );
       if (currentAssignedWork(openRuns) === null) {
         // No session is needed for work that no longer exists.
         return;
@@ -757,7 +796,13 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         commandId: CommandId.make(yield* deps.newId),
         threadId,
         projectId: target.t3ProjectId,
-        title: workSessionThreadTitle(target.agentName),
+        title:
+          flowInstanceKey === null
+            ? workSessionThreadTitle(target.agentName)
+            : flowInstanceWorkSessionThreadTitle(
+                target.agentName,
+                ordered[0] !== undefined ? flowInstanceNameOf(ordered[0]) : null,
+              ),
         logicalAgentId: target.logicalAgentId,
         modelSelection,
         runtimeMode: DEFAULT_ROUTING_RUNTIME_MODE,
@@ -772,6 +817,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       yield* putSession(key, {
         threadId,
         input,
+        flowInstanceKey,
         phase: "idle",
         pendingWork: false,
         seenBusy: false,
@@ -800,6 +846,8 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
   // session's thread when the current work's execution workspace moved
   // (same managed worktree keeps the session; a different one follows it
   // in place — thread.meta.update restarts the session in the new cwd).
+  // `knownRuns`, when passed, must already be scoped to the session's flow
+  // instance; the query branch scopes itself.
   const flushRecordedWork = Effect.fn("ProjectWorkSessionRouter.flushRecordedWork")(function* (
     key: string,
     target: ProjectWorkRoutingTarget,
@@ -812,10 +860,13 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     }
     const runs =
       knownRuns ??
-      (yield* deps.listOpenAssignedWork({
-        agentId: target.logicalAgentId,
-        projectId: target.projectServiceProjectId,
-      }));
+      runsForFlowInstance(
+        yield* deps.listOpenAssignedWork({
+          agentId: target.logicalAgentId,
+          projectId: target.projectServiceProjectId,
+        }),
+        session.flowInstanceKey,
+      );
     const ordered = orderAssignedWorkQueue(runs);
     const current = ordered[0] ?? null;
     // Rebind first: the aggregate delivered on the rebound thread names the
@@ -960,36 +1011,65 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     }
   });
 
+  // The per-key wake body: the session state machine for one routing key.
+  // `knownRuns`, when the driver already queried the authoritative work list,
+  // is scoped to `flowInstanceKey`.
+  const routeWakeForKey = Effect.fn("ProjectWorkSessionRouter.routeWakeForKey")(function* (
+    key: string,
+    input: ProjectWorkWakeInput,
+    target: ProjectWorkRoutingTarget,
+    flowInstanceKey: string | null,
+    knownRuns?: ReadonlyArray<AssignedWorkQueueEntry>,
+  ): Effect.fn.Return<void, ProjectWorkRoutingError> {
+    const session = yield* getSession(key);
+
+    if (session === undefined) {
+      return yield* createCurrentSession(key, input, target, flowInstanceKey, knownRuns);
+    }
+
+    const shell = yield* deps.readThreadShell(session.threadId);
+    if (Option.isNone(shell) || !isWorkThreadCurrent(shell.value)) {
+      // Archived or gone: no longer current; a new session takes over.
+      yield* dropSession(key);
+      return yield* createCurrentSession(key, input, target, flowInstanceKey, knownRuns);
+    }
+    // Busy sessions (a turn running, or our aggregate still in flight) get
+    // the work recorded — never an interrupt.
+    if (session.phase === "notifying" || isWorkThreadBusy(shell.value)) {
+      yield* mutateSession(key, (current) => ({ ...current, pendingWork: true }));
+      return;
+    }
+    yield* mutateSession(key, (current) => ({ ...current, pendingWork: true }));
+    return yield* flushRecordedWork(key, target, false, knownRuns);
+  });
+
+  /**
+   * Route one notice. Flow-instance scope queries the authoritative work
+   * list ONCE per wake and runs the identical per-key body for each open
+   * partition (a busy partition still costs this one query; its failure
+   * fails the ACK so the service repairs and redelivers, like the create
+   * path). Project scope is the historical single-key path.
+   */
   const routeWake = Effect.fn("ProjectWorkSessionRouter.routeWake")(function* (
     input: ProjectWorkWakeInput,
   ): Effect.fn.Return<void, ProjectWorkRoutingError> {
     const target = yield* resolveRoutingTarget(input);
-    const key = routingKeyOf(input.agentId, input.projectId);
-    return yield* withKeySerialization(
-      key,
-      Effect.gen(function* () {
-        const session = yield* getSession(key);
-
-        if (session === undefined) {
-          return yield* createCurrentSession(key, input, target);
-        }
-
-        const shell = yield* deps.readThreadShell(session.threadId);
-        if (Option.isNone(shell) || !isWorkThreadCurrent(shell.value)) {
-          // Archived or gone: no longer current; a new session takes over.
-          yield* dropSession(key);
-          return yield* createCurrentSession(key, input, target);
-        }
-        // Busy sessions (a turn running, or our aggregate still in flight) get
-        // the work recorded — never an interrupt.
-        if (session.phase === "notifying" || isWorkThreadBusy(shell.value)) {
-          yield* mutateSession(key, (current) => ({ ...current, pendingWork: true }));
-          return;
-        }
-        yield* mutateSession(key, (current) => ({ ...current, pendingWork: true }));
-        return yield* flushRecordedWork(key, target, false);
-      }),
-    );
+    if (target.sessionScope === "flow-instance") {
+      const runs = yield* deps.listOpenAssignedWork({
+        agentId: target.logicalAgentId,
+        projectId: target.projectServiceProjectId,
+      });
+      for (const [instanceKey, partitionRuns] of partitionOpenWork(runs)) {
+        const key = routingKeyOf(input.agentId, input.projectId, instanceKey);
+        yield* withKeySerialization(
+          key,
+          routeWakeForKey(key, input, target, instanceKey, partitionRuns),
+        );
+      }
+      return;
+    }
+    const key = routingKeyOf(input.agentId, input.projectId, null);
+    return yield* withKeySerialization(key, routeWakeForKey(key, input, target, null, undefined));
   });
 
   // One thread event's work for a single routing key. Re-reads the session:
@@ -1042,6 +1122,21 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       yield* mutateSession(key, (current) => ({ ...current, phase: "idle" }));
       return;
     }
+    if ((target.success.sessionScope === "project") !== (session.flowInstanceKey === null)) {
+      // Universe guard: the agent's configured scope moved on, so this
+      // session's run universe is owned by other sessions now (this is the
+      // one entry point driven by thread events rather than by a freshly
+      // computed key). Park it — no delivery, no reminder; the no-nag
+      // markers stay so a toggle back resumes without re-delivering the
+      // current head.
+      yield* mutateSession(key, (current) => ({
+        ...current,
+        phase: "idle",
+        pendingWork: false,
+        seenBusy: false,
+      }));
+      return;
+    }
     if (session.pendingWork) {
       yield* flushRecordedWork(key, target.success, true).pipe(Effect.ignore);
     } else {
@@ -1060,7 +1155,9 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         })
         .pipe(Effect.result);
       if (runs._tag === "Success") {
-        const nextHead = orderAssignedWorkQueue(runs.success)[0];
+        const nextHead = orderAssignedWorkQueue(
+          runsForFlowInstance(runs.success, session.flowInstanceKey),
+        )[0];
         if (nextHead !== undefined && nextHead.runId !== session.lastDeliveredHeadRunId) {
           yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
           return;
@@ -1100,12 +1197,16 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
   // a turn-end event the drain never saw, or a queue head that advanced past
   // the last delivered aggregate would all strand the run forever. The pass
   // is serialized exactly like routeWake (it runs INSIDE the key's permit;
-  // the helpers it calls must never re-acquire it) and never fails.
-  const reconcileOpenWork = Effect.fn("ProjectWorkSessionRouter.reconcileOpenWork")(function* (
+  // the helpers it calls must never re-acquire it) and never fails. The
+  // per-key body below is driven once per routing key: the plain key in
+  // project scope, one key per open flow instance in flow-instance scope.
+  const sweepBody = (
     input: ProjectWorkWakeInput,
-  ): Effect.fn.Return<void> {
-    const key = routingKeyOf(input.agentId, input.projectId);
-    yield* withKeySerialization(
+    key: string,
+    flowInstanceKey: string | null,
+    knownRuns?: ReadonlyArray<AssignedWorkQueueEntry>,
+  ): Effect.Effect<void> =>
+    withKeySerialization(
       key,
       Effect.gen(function* () {
         const session = yield* getSession(key);
@@ -1141,19 +1242,25 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           }
         }
 
-        const runs = yield* deps.listOpenAssignedWork(input).pipe(Effect.result);
-        if (runs._tag === "Failure") {
-          yield* Effect.logWarning(
-            "Project Work reconcile sweep could not query open work; retrying on the next sweep",
-            {
-              agentId: input.agentId,
-              projectId: input.projectId,
-              code: runs.failure.code,
-            },
-          );
-          return;
+        let runs: ReadonlyArray<AssignedWorkQueueEntry>;
+        if (knownRuns !== undefined) {
+          runs = knownRuns;
+        } else {
+          const queried = yield* deps.listOpenAssignedWork(input).pipe(Effect.result);
+          if (queried._tag === "Failure") {
+            yield* Effect.logWarning(
+              "Project Work reconcile sweep could not query open work; retrying on the next sweep",
+              {
+                agentId: input.agentId,
+                projectId: input.projectId,
+                code: queried.failure.code,
+              },
+            );
+            return;
+          }
+          runs = runsForFlowInstance(queried.success, flowInstanceKey);
         }
-        const head = orderAssignedWorkQueue(runs.success)[0];
+        const head = orderAssignedWorkQueue(runs)[0];
 
         if (liveSession !== null) {
           // The session exists, is idle, and nothing is pending. The no-nag
@@ -1189,7 +1296,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
             );
             return;
           }
-          yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
+          yield* flushRecordedWork(key, target.success, true, runs).pipe(Effect.ignore);
           return;
         }
 
@@ -1222,7 +1329,13 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           );
           return;
         }
-        const created = yield* createCurrentSession(key, input, target.success).pipe(Effect.result);
+        const created = yield* createCurrentSession(
+          key,
+          input,
+          target.success,
+          flowInstanceKey,
+          knownRuns,
+        ).pipe(Effect.result);
         if (created._tag === "Failure") {
           yield* Effect.logWarning(
             "Project Work reconcile sweep could not deliver its wake; retrying on the next sweep",
@@ -1236,12 +1349,55 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         }
       }),
     );
+
+  // The sweep driver: the agent's CONFIGURED scope decides which keys this
+  // pass covers. Unreadable settings or an unroutable agent read as
+  // "project" so the plain key's upkeep never stops while routing is broken.
+  const reconcileOpenWork = Effect.fn("ProjectWorkSessionRouter.reconcileOpenWork")(function* (
+    input: ProjectWorkWakeInput,
+  ): Effect.fn.Return<void> {
+    const scope = yield* deps.readSettings.pipe(
+      Effect.result,
+      Effect.map((read) => {
+        if (read._tag === "Failure") {
+          return "project" as const;
+        }
+        const resolution = resolveProjectWorkRouting(read.success, input);
+        return resolution.ok ? resolution.routing.sessionScope : ("project" as const);
+      }),
+    );
+    if (scope === "flow-instance") {
+      const runs = yield* deps.listOpenAssignedWork(input).pipe(Effect.result);
+      if (runs._tag === "Failure") {
+        yield* Effect.logWarning(
+          "Project Work reconcile sweep could not query open work; retrying on the next sweep",
+          {
+            agentId: input.agentId,
+            projectId: input.projectId,
+            code: runs.failure.code,
+          },
+        );
+        return;
+      }
+      for (const [instanceKey, partitionRuns] of partitionOpenWork(runs.success)) {
+        yield* sweepBody(
+          input,
+          routingKeyOf(input.agentId, input.projectId, instanceKey),
+          instanceKey,
+          partitionRuns,
+        );
+      }
+      return;
+    }
+    yield* sweepBody(input, routingKeyOf(input.agentId, input.projectId, null), null, undefined);
   });
 
   const snapshotSessions: ProjectWorkSessionRouter["snapshotSessions"] = Ref.get(sessionsRef).pipe(
     Effect.map((sessions) =>
-      [...sessions.entries()].map(([key, session]) => ({
-        ...routingKeyParts(key),
+      [...sessions.values()].map((session) => ({
+        agentId: session.input.agentId,
+        projectId: session.input.projectId,
+        flowInstanceKey: session.flowInstanceKey,
         threadId: session.threadId,
         phase: session.phase,
         pendingWork: session.pendingWork,
