@@ -839,7 +839,7 @@ it.effect("concurrent-create invariant loss falls back to the winner", () =>
   }),
 );
 
-it.effect("idle session: one more wake delivers exactly one more aggregate", () =>
+it.effect("idle session: a replayed wake for the same Work set stays silent", () =>
   Effect.gen(function* () {
     const harness = yield* makeHarness(makeSettings());
     yield* wake(harness.router);
@@ -870,7 +870,7 @@ it.effect("idle session: one more wake delivers exactly one more aggregate", () 
     assert.strictEqual((yield* harness.router.snapshotSessions)[0]?.phase, "idle");
 
     yield* wake(harness.router);
-    assert.lengthOf(turnStarts(harness.commands), 3);
+    assert.lengthOf(turnStarts(harness.commands), 2);
 
     // An idle, already-notified session with no new work stays quiet.
     harness.putThread(
@@ -880,7 +880,7 @@ it.effect("idle session: one more wake delivers exactly one more aggregate", () 
       })),
     );
     yield* harness.router.onThreadEvent(threadId as never);
-    assert.lengthOf(turnStarts(harness.commands), 3);
+    assert.lengthOf(turnStarts(harness.commands), 2);
   }),
 );
 
@@ -902,7 +902,9 @@ it.effect("busy session: work is recorded, never interrupted, then coalesced aft
       })),
     );
 
-    // Several notices arrive while busy: all recorded, none dispatched.
+    // A new Work appears behind the current one. Replayed notices for that
+    // same authoritative set coalesce into one pending update.
+    harness.setOpenWorkCount(3);
     yield* wake(harness.router);
     yield* wake(harness.router);
     yield* wake(harness.router);
@@ -931,15 +933,15 @@ it.effect("busy session: work is recorded, never interrupted, then coalesced aft
         turnStarts(harness.commands)[1]?.message.text,
       assignedWorkWakeMessage({
         current: {
-          runId: "run-2",
-          positionId: "position-2",
+          runId: "run-3",
+          positionId: "position-3",
           runRevision: "run:1",
           state: "open",
           agentId: AGENT_ID,
-          task: { prompt: "工作 2: do the thing" },
+          task: { prompt: "工作 3: do the thing" },
           createdAt: "2026-08-21T00:00:10Z",
         },
-        queued: 1,
+        queued: 2,
       }),
     );
 
@@ -996,6 +998,7 @@ it.effect("deferred delivery failure keeps pending work and redelivers on the ne
         session: runningSession(threadId as string),
       })),
     );
+    harness.setOpenWorkCount(3);
     yield* wake(harness.router);
     yield* harness.router.onThreadEvent(threadId as never);
     assert.isTrue((yield* harness.router.snapshotSessions)[0]?.pendingWork);
@@ -1031,6 +1034,7 @@ it.effect("queued-turn window: a second notice waits until the first turn engage
 
     // The aggregate was dispatched but no provider session engaged yet.
     harness.putThread(makeThreadShell(threadId as string, projectId));
+    harness.setOpenWorkCount(3);
     yield* wake(harness.router);
     assert.lengthOf(turnStarts(harness.commands), 1);
 
@@ -1136,6 +1140,7 @@ it.effect("authoritative count is re-queried at delivery time", () =>
         session: runningSession(threadId as string),
       })),
     );
+    harness.setOpenWorkCount(3);
     yield* wake(harness.router);
     yield* harness.router.onThreadEvent(threadId as never); // engaged: running
     harness.setOpenWorkCount(0);
@@ -1273,6 +1278,7 @@ it.effect("dispatch failure fails the wake and leaves the created session recove
     yield* runAggregateTurn(harness, threadId as string, projectId);
 
     harness.failDispatch(true);
+    harness.setOpenWorkCount(3);
     const failure = yield* wake(harness.router).pipe(Effect.flip);
     assert.strictEqual(failure.code, "CONSUMER_INTERNAL");
 
@@ -1329,6 +1335,7 @@ it.effect("dying session without a turn: a queued notification is released", () 
         session: stoppedSession(threadId as string),
       })),
     );
+    harness.setOpenWorkCount(3);
     yield* wake(harness.router);
     yield* harness.router.onThreadEvent(threadId as never);
     assert.lengthOf(turnStarts(harness.commands), 2);
@@ -1350,6 +1357,7 @@ it.effect("a deferred event after the resolved project vanished never re-creates
         session: runningSession(threadId as string),
       })),
     );
+    harness.setOpenWorkCount(3);
     yield* wake(harness.router);
     yield* harness.router.onThreadEvent(threadId as never);
 
@@ -1730,6 +1738,7 @@ describe("delivery reconcile sweep", () => {
           session: runningSession(threadId as string),
         })),
       );
+      harness.setOpenWorkCount(3);
       yield* wake(harness.router);
       assert.isTrue((yield* harness.router.snapshotSessions)[0]?.pendingWork);
       harness.putThread(

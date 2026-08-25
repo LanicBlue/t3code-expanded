@@ -26,6 +26,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, describe, vi } from "@effect/vitest";
 
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -887,6 +888,59 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("serializes concurrent turn starts for the same thread", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-serialized-turns");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project",
+        runtimeMode: "full-access",
+      });
+
+      const firstEntered = yield* Deferred.make<void>();
+      const releaseFirst = yield* Deferred.make<void>();
+      const originalSendTurn = routing.codex.sendTurn.getMockImplementation();
+      let callCount = 0;
+      routing.codex.sendTurn.mockImplementation((input) =>
+        Effect.gen(function* () {
+          callCount += 1;
+          const currentCall = callCount;
+          if (currentCall === 1) {
+            yield* Deferred.succeed(firstEntered, undefined);
+            yield* Deferred.await(releaseFirst);
+          }
+          return {
+            threadId: input.threadId,
+            turnId: TurnId.make(`turn-${currentCall}`),
+          };
+        }),
+      );
+
+      const first = yield* provider
+        .sendTurn({ threadId, input: "first", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(firstEntered);
+      const second = yield* provider
+        .sendTurn({ threadId, input: "second", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(callCount, 1);
+
+      yield* Deferred.succeed(releaseFirst, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      assert.equal(callCount, 2);
+      if (originalSendTurn !== undefined) {
+        routing.codex.sendTurn.mockImplementation(originalSendTurn);
+      }
+      routing.codex.sendTurn.mockClear();
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
   it.effect("routes provider operations and rollback conversation", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

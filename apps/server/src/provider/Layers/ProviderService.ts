@@ -34,6 +34,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -268,6 +269,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         Effect.orElseSucceed(() => Option.none<LogicalAgentId>()),
       ));
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const turnSemaphoresRef = yield* Ref.make(new Map<ThreadId, Semaphore.Semaphore>());
+  const serializeTurnStart = <A, E, R>(
+    threadId: ThreadId,
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E, R> =>
+    Effect.flatMap(
+      Ref.modify(turnSemaphoresRef, (semaphores) => {
+        const existing = semaphores.get(threadId);
+        if (existing !== undefined) return [existing, semaphores];
+        const created = Semaphore.makeUnsafe(1);
+        semaphores.set(threadId, created);
+        return [created, semaphores];
+      }),
+      (semaphore) => semaphore.withPermits(1)(effect),
+    );
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   /**
    * Attach the `t3-code` MCP server to the session that is about to start.
@@ -862,51 +878,54 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
     let metricProvider = "unknown";
     let metricModel = input.modelSelection?.model;
-    return yield* Effect.gen(function* () {
-      const routed = yield* resolveRoutableSession({
-        threadId: input.threadId,
-        operation: "ProviderService.sendTurn",
-        allowRecovery: true,
-      });
-      metricProvider = routed.adapter.provider;
-      metricModel = input.modelSelection?.model;
-      yield* Effect.annotateCurrentSpan({
-        "provider.kind": routed.adapter.provider,
-        ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
-      });
-      // A turn is the clearest sign a session is still alive. The MCP
-      // credential is minted once at session start and cannot be rotated into
-      // an already-spawned agent process, so we keep the existing token valid
-      // rather than issuing a new one: sessions that go a long time between
-      // browser tool calls used to lose the toolkit outright.
-      yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
-      const turn = yield* routed.adapter.sendTurn(input);
-      yield* directory.upsert({
-        threadId: input.threadId,
-        provider: routed.adapter.provider,
-        providerInstanceId: routed.instanceId,
-        status: "running",
-        ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-        runtimePayload: {
-          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-          activeTurnId: turn.turnId,
-          lastRuntimeEvent: "provider.sendTurn",
-          lastRuntimeEventAt: yield* nowIso,
-        },
-      });
-      yield* analytics.record("provider.turn.sent", {
-        provider: routed.adapter.provider,
-        model: input.modelSelection?.model,
-        interactionMode: input.interactionMode,
-        // Session-start events alone skew runtime mode toward users who toggle
-        // often, since every toggle restarts the session. Recording it per turn
-        // gives a usage-weighted view and lets it cross with interactionMode.
-        runtimeMode: routed.runtimeMode,
-        attachmentCount: input.attachments.length,
-        hasInput: typeof input.input === "string" && input.input.trim().length > 0,
-      });
-      return turn;
-    }).pipe(
+    return yield* serializeTurnStart(
+      input.threadId,
+      Effect.gen(function* () {
+        const routed = yield* resolveRoutableSession({
+          threadId: input.threadId,
+          operation: "ProviderService.sendTurn",
+          allowRecovery: true,
+        });
+        metricProvider = routed.adapter.provider;
+        metricModel = input.modelSelection?.model;
+        yield* Effect.annotateCurrentSpan({
+          "provider.kind": routed.adapter.provider,
+          ...(input.modelSelection?.model ? { "provider.model": input.modelSelection.model } : {}),
+        });
+        // A turn is the clearest sign a session is still alive. The MCP
+        // credential is minted once at session start and cannot be rotated into
+        // an already-spawned agent process, so we keep the existing token valid
+        // rather than issuing a new one: sessions that go a long time between
+        // browser tool calls used to lose the toolkit outright.
+        yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
+        const turn = yield* routed.adapter.sendTurn(input);
+        yield* directory.upsert({
+          threadId: input.threadId,
+          provider: routed.adapter.provider,
+          providerInstanceId: routed.instanceId,
+          status: "running",
+          ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
+          runtimePayload: {
+            ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+            activeTurnId: turn.turnId,
+            lastRuntimeEvent: "provider.sendTurn",
+            lastRuntimeEventAt: yield* nowIso,
+          },
+        });
+        yield* analytics.record("provider.turn.sent", {
+          provider: routed.adapter.provider,
+          model: input.modelSelection?.model,
+          interactionMode: input.interactionMode,
+          // Session-start events alone skew runtime mode toward users who toggle
+          // often, since every toggle restarts the session. Recording it per turn
+          // gives a usage-weighted view and lets it cross with interactionMode.
+          runtimeMode: routed.runtimeMode,
+          attachmentCount: input.attachments.length,
+          hasInput: typeof input.input === "string" && input.input.trim().length > 0,
+        });
+        return turn;
+      }),
+    ).pipe(
       withMetrics({
         counter: providerTurnsTotal,
         timer: providerTurnDuration,

@@ -474,6 +474,12 @@ interface RoutedSession {
    * the budget — the new head gets its own single reminder.
    */
   remindedHeadRunId: string | null;
+  /**
+   * Stable identity of the open Work set last observed for this session.
+   * Project Service notices are triggers and may be replayed, so an
+   * unchanged authoritative set is not new pending work.
+   */
+  observedWorkSignature: string;
 }
 
 /**
@@ -486,6 +492,15 @@ const routingKeyOf = (agentId: string, projectId: string, flowInstanceKey: strin
   flowInstanceKey === null
     ? `${agentId}::${projectId}`
     : `${agentId}::${projectId}::${flowInstanceKey}`;
+
+const openWorkSignature = (runs: ReadonlyArray<AssignedWorkQueueEntry>): string =>
+  JSON.stringify(orderAssignedWorkQueue(runs).map((run) => run.runId));
+
+const workDeliveryId = (
+  threadId: ThreadId,
+  kind: "aggregate" | "reminder",
+  signature: string,
+): string => `project-work:${threadId}:${kind}:${signature}`;
 
 export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRouter")(function* (
   deps: ProjectWorkSessionRouterDeps,
@@ -727,6 +742,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     target: ProjectWorkRoutingTarget,
     threadId: ThreadId,
     runs: ReadonlyArray<AssignedWorkQueueEntry>,
+    kind: "aggregate" | "reminder" = "aggregate",
   ): Effect.fn.Return<string | null, ProjectWorkRoutingError> {
     const ordered = orderAssignedWorkQueue(runs);
     const current = ordered.at(0);
@@ -736,12 +752,16 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       return null;
     }
     const createdAt = yield* deps.nowIso;
+    const deliveryId = workDeliveryId(threadId, kind, openWorkSignature(ordered));
     yield* deps.dispatchCommand({
       type: "thread.turn.start",
-      commandId: CommandId.make(yield* deps.newId),
+      // A Project Service notice can be replayed or race the reconcile sweep.
+      // The orchestration receipt makes the same authoritative delivery a
+      // durable no-op, including across process restarts.
+      commandId: CommandId.make(deliveryId),
       threadId,
       message: {
-        messageId: MessageId.make(yield* deps.newId),
+        messageId: MessageId.make(`message:${deliveryId}`),
         role: "user",
         text: assignedWorkWakeMessage({ current, queued: ordered.length - 1 }),
         attachments: [],
@@ -825,6 +845,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         lastDeliveredHeadRunId: null,
         lastDeliveredAtIso: null,
         remindedHeadRunId: null,
+        observedWorkSignature: openWorkSignature(ordered),
       });
       const deliveredAt = yield* deliverAggregate(target, threadId, ordered);
       yield* mutateSession(key, (session) => ({
@@ -836,6 +857,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           deliveredAt !== null && ordered[0] !== undefined
             ? ordered[0].runId
             : session.lastDeliveredHeadRunId,
+        observedWorkSignature: openWorkSignature(ordered),
       }));
     },
   );
@@ -869,6 +891,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       );
     const ordered = orderAssignedWorkQueue(runs);
     const current = ordered[0] ?? null;
+    const signature = openWorkSignature(ordered);
     // Rebind first: the aggregate delivered on the rebound thread names the
     // work the next turn does, so the turn must already run in that cwd.
     const binding = worktreeBindingFor(current);
@@ -928,6 +951,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         pendingWork: false,
         phase: delivered.success !== null ? "notifying" : "idle",
         seenBusy: false,
+        observedWorkSignature: signature,
         ...(delivered.success !== null && current !== null
           ? {
               lastDeliveredAtIso: delivered.success,
@@ -948,6 +972,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       pendingWork: false,
       phase: dispatchedAt !== null ? "notifying" : "idle",
       seenBusy: false,
+      observedWorkSignature: signature,
       ...(dispatchedAt !== null && current !== null
         ? {
             lastDeliveredAtIso: dispatchedAt,
@@ -974,7 +999,9 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     if (current === null) {
       return;
     }
-    const delivered = yield* deliverAggregate(target, threadId, ordered).pipe(Effect.result);
+    const delivered = yield* deliverAggregate(target, threadId, ordered, "reminder").pipe(
+      Effect.result,
+    );
     if (delivered._tag === "Failure") {
       // Contained like a deferred delivery failure: the marker is NOT spent,
       // but only the reconcile sweep gives this path another chance — the
@@ -996,7 +1023,11 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       phase: delivered.success !== null ? "notifying" : "idle",
       seenBusy: false,
       ...(delivered.success !== null
-        ? { remindedHeadRunId: current.runId, lastDeliveredAtIso: delivered.success }
+        ? {
+            remindedHeadRunId: current.runId,
+            lastDeliveredAtIso: delivered.success,
+            observedWorkSignature: openWorkSignature(ordered),
+          }
         : {}),
     }));
     if (delivered.success !== null) {
@@ -1033,14 +1064,44 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       yield* dropSession(key);
       return yield* createCurrentSession(key, input, target, flowInstanceKey, knownRuns);
     }
-    // Busy sessions (a turn running, or our aggregate still in flight) get
-    // the work recorded — never an interrupt.
+    // Busy sessions (a turn running, or our aggregate still in flight) only
+    // record work when the authoritative open set changed. Replayed notices
+    // for the same run set are acknowledgements, not a second user message.
     if (session.phase === "notifying" || isWorkThreadBusy(shell.value)) {
-      yield* mutateSession(key, (current) => ({ ...current, pendingWork: true }));
+      const runs =
+        knownRuns ??
+        runsForFlowInstance(
+          yield* deps.listOpenAssignedWork({
+            agentId: target.logicalAgentId,
+            projectId: target.projectServiceProjectId,
+          }),
+          session.flowInstanceKey,
+        );
+      const signature = openWorkSignature(runs);
+      if (signature !== session.observedWorkSignature) {
+        yield* mutateSession(key, (current) => ({
+          ...current,
+          pendingWork: true,
+          observedWorkSignature: signature,
+        }));
+      }
+      return;
+    }
+    const runs =
+      knownRuns ??
+      runsForFlowInstance(
+        yield* deps.listOpenAssignedWork({
+          agentId: target.logicalAgentId,
+          projectId: target.projectServiceProjectId,
+        }),
+        session.flowInstanceKey,
+      );
+    const signature = openWorkSignature(runs);
+    if (signature === session.observedWorkSignature) {
       return;
     }
     yield* mutateSession(key, (current) => ({ ...current, pendingWork: true }));
-    return yield* flushRecordedWork(key, target, false, knownRuns);
+    return yield* flushRecordedWork(key, target, false, runs);
   });
 
   /**
