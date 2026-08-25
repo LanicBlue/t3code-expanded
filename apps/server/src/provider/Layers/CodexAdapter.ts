@@ -1665,6 +1665,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const codexMcpEndpoint = mcpSession?.endpoint.replace(
+          /^http:\/\/127\.0\.0\.1(?=[:/])/,
+          "http://localhost",
+        );
+        const inheritedEnvironment = options?.environment ?? process.env;
+        const noProxy = [
+          inheritedEnvironment.NO_PROXY,
+          inheritedEnvironment.no_proxy,
+          "localhost",
+          "127.0.0.1",
+        ]
+          .filter((value): value is string => Boolean(value))
+          .join(",");
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
@@ -1684,12 +1697,14 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(mcpSession
             ? {
                 environment: {
-                  ...(options?.environment ?? process.env),
+                  ...inheritedEnvironment,
+                  NO_PROXY: noProxy,
+                  no_proxy: noProxy,
                   T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
                 },
                 appServerArgs: [
                   "-c",
-                  `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
+                  `mcp_servers.t3-code.url=${codexMcpEndpoint}`,
                   "-c",
                   'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
                 ],

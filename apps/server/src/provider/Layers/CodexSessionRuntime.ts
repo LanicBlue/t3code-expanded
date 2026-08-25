@@ -1813,13 +1813,11 @@ export const makeCodexSessionRuntime = (
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;
           if (hasConfiguredMcpServer(options.appServerArgs)) {
-            yield* client.request("config/mcpServer/reload", undefined).pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("Failed to refresh Codex MCP tool catalog before turn.", {
-                  cause,
-                }),
-              ),
-            );
+            // The app-server starts the inline MCP server while the thread is
+            // opened. Reloading here tears that catalog down immediately
+            // before the turn snapshots its tools, so allow the initial
+            // discovery to settle instead.
+            yield* Effect.sleep("1 second");
           }
           const normalizedModel = normalizeCodexModelSlug(
             input.model ?? (yield* Ref.get(sessionRef)).model,
