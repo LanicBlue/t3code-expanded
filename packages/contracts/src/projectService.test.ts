@@ -106,7 +106,7 @@ describe("ServerSettings project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: true, sessionScope: "project" },
+      project: { enabled: true, sessionScope: "project", sessionRetention: "settle" },
     });
     expect(encodeServerSettings(decoded).logicalAgents).toEqual(decoded.logicalAgents);
   });
@@ -123,7 +123,7 @@ describe("ServerSettings project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: false, sessionScope: "project" },
+      project: { enabled: false, sessionScope: "project", sessionRetention: "settle" },
     });
   });
 
@@ -155,9 +155,9 @@ describe("ServerSettings project service surfaces", () => {
       decodeLogicalAgentConfig({
         agentName: "A",
         providerInstanceId: "codex",
-        project: { enabled: true, sessionScope: "flow-instance" },
+        project: { enabled: true, sessionScope: "flow-instance", sessionRetention: "settle" },
       }).project,
-    ).toEqual({ enabled: true, sessionScope: "flow-instance" });
+    ).toEqual({ enabled: true, sessionScope: "flow-instance", sessionRetention: "settle" });
   });
 
   it("strips a stale projectBindings key from a hand-edited settings.json silently", () => {
@@ -183,7 +183,7 @@ describe("ServerSettings project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: true, sessionScope: "project" },
+      project: { enabled: true, sessionScope: "project", sessionRetention: "settle" },
     });
     expect(JSON.stringify(decoded)).not.toContain("projectBindings");
   });
@@ -228,7 +228,7 @@ describe("ServerSettingsPatch project service surfaces", () => {
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: false, sessionScope: "project" },
+      project: { enabled: false, sessionScope: "project", sessionRetention: "settle" },
     });
   });
 });
