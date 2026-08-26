@@ -486,9 +486,13 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
     const retirement = yield* makeProjectRetirementHandler({
       loadLedger: retirementLedger.load,
       storeLedger: retirementLedger.store,
+      // The plan includes archived shells, so the executor must read them too
+      // — a None here must genuinely mean the thread is gone, or an archived
+      // session would be ACKed as deleted without ever dispatching
+      // thread.delete.
       readThreadShell: (threadId) =>
         snapshotQuery
-          .getThreadShellById(threadId)
+          .getThreadShellByIdIncludingArchived(threadId)
           .pipe(Effect.mapError(() => internal("thread projection could not be read"))),
       // The durable session scan: routed shells (logicalAgentId set) in the
       // resolved T3 project, archived ones included.

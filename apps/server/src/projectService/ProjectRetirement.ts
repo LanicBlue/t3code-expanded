@@ -228,6 +228,12 @@ export interface ProjectRetirementHandlerDeps {
   readonly storeLedger: (
     records: ReadonlyArray<RetirementLedgerRecord>,
   ) => Effect.Effect<void, ProjectRetirementLedgerError>;
+  /**
+   * The executor's shell read must see ARCHIVED shells — the plan includes
+   * them, and a None is treated as "proven gone" (see processRecord). A
+   * seam that filters archived threads would ACK archived sessions as
+   * deleted without ever dispatching their thread.delete.
+   */
   readonly readThreadShell: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectWorkRoutingError>;

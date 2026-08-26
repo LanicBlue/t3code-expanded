@@ -197,7 +197,20 @@ const makeHarness = (
       return `id-${idCounter}`;
     };
 
-    const readThreadShell = (threadId: ThreadId) =>
+    // Two read seams, mirroring the production pair: the router reads
+    // active-only shells (getThreadShellById filters archived threads), while
+    // the retirement executor reads archived shells too
+    // (getThreadShellByIdIncludingArchived) because its deletion plan includes
+    // them. Deleted threads are absent from the map in both.
+    const readActiveThreadShell = (threadId: ThreadId) =>
+      Effect.succeed(
+        threads.has(threadId) &&
+          (threads.get(threadId) as OrchestrationThreadShell).archivedAt === null
+          ? Option.some(threads.get(threadId) as OrchestrationThreadShell)
+          : Option.none(),
+      );
+
+    const readThreadShellIncludingArchived = (threadId: ThreadId) =>
       Effect.succeed(
         threads.has(threadId)
           ? Option.some(threads.get(threadId) as OrchestrationThreadShell)
@@ -283,7 +296,7 @@ const makeHarness = (
 
     const router = yield* makeProjectWorkSessionRouter({
       readSettings: Effect.succeed(makeSettings()),
-      readThreadShell,
+      readThreadShell: readActiveThreadShell,
       readProjectShell: (projectId) =>
         Effect.succeed(
           projects.has(projectId)
@@ -326,7 +339,7 @@ const makeHarness = (
         return yield* makeProjectRetirementHandler({
           loadLedger: ledgerStore.load,
           storeLedger: ledgerStore.store,
-          readThreadShell,
+          readThreadShell: readThreadShellIncludingArchived,
           listProjectThreadShells: (projectId) =>
             Effect.succeed(
               [...threads.values()].filter((thread) => thread.projectId === projectId),
@@ -486,6 +499,46 @@ it.layer(NodeServices.layer, { excludeTestServices: true })("ProjectRetirement",
         const records = yield* readLedgerRecords(harness.ledgerPath);
         assert.strictEqual(records.length, 1);
         assert.strictEqual(records[0]?.status, "acked");
+      }),
+    );
+
+    it.effect("deletes an archived work session via thread.delete instead of marking it gone", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(yield* makeTempLedgerPath);
+        harness.putProjectServiceProject(PS_PROJECT_ID, WORKSPACE_DIR);
+        // An archived routed session ONLY the durable shell scan can find —
+        // the shape a restart leaves most often. The router's active-only
+        // read cannot see it; the executor's archived-including read must.
+        harness.putThread(
+          makeThreadShell("t_archived_only", T3_PROJECT_ID, (shell) =>
+            settleThread({ ...shell, archivedAt: ISO }),
+          ),
+        );
+
+        const outcome = yield* harness.retirement.handleRetiredNotice({
+          noticeId: "notice-archived",
+          projectId: PS_PROJECT_ID,
+          workspaceDir: WORKSPACE_DIR,
+        });
+
+        // The archived session was REALLY deleted: a thread.delete was
+        // dispatched for it and the shell is gone. (The production bug this
+        // pins: the executor's read filtered archived threads, returned
+        // None, and the notice was ACKed as deleted with no dispatch.)
+        assert.deepStrictEqual(outcome.status, "acked");
+        assert.deepStrictEqual(outcome.status === "acked" ? outcome.deletedThreadIds : [], [
+          ThreadId.make("t_archived_only"),
+        ]);
+        const archivedDelete = harness.commands.find(
+          (command) =>
+            command.type === "thread.delete" &&
+            command.threadId === ThreadId.make("t_archived_only"),
+        );
+        assert.isDefined(archivedDelete);
+        assert.isUndefined(harness.getThread("t_archived_only"));
+        const records = yield* readLedgerRecords(harness.ledgerPath);
+        assert.strictEqual(records[0]?.status, "acked");
+        assert.deepStrictEqual(records[0]?.deletedThreadIds, [ThreadId.make("t_archived_only")]);
       }),
     );
 
