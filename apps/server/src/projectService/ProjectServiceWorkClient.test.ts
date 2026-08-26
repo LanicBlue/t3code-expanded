@@ -85,6 +85,14 @@ const RUN_VIEW = {
   task: { prompt: "Summarize the wiki" },
   createdAt: "2026-08-01T00:00:00.000Z",
   resolvedAt: null,
+  // apiMinor 2: the completion contract rides the run view; the client-side
+  // projection must carry it through to the MCP tools.
+  action: {
+    kind: "state",
+    transitions: [{ transitionId: "handoff", to: "reading" }],
+    abandonAvailable: true,
+    documents: { read: [], write: ["decision.md"] },
+  },
 };
 
 const POSITION_VIEW = {
@@ -169,6 +177,12 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
           task: { prompt: "Summarize the wiki" },
           createdAt: "2026-08-01T00:00:00.000Z",
           resolvedAt: null,
+          action: {
+            kind: "state",
+            transitions: [{ transitionId: "handoff", to: "reading" }],
+            abandonAvailable: true,
+            documents: { read: [], write: ["decision.md"] },
+          },
         },
       ]);
       assert.deepEqual(positions, [

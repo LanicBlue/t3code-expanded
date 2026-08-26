@@ -373,6 +373,23 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       );
       assert.equal(wsResult.runs[0]?.workspacePolicy, "managed-worktree");
       assert.equal(wsResult.runs[0]?.workspacePath, "/tmp/wt-1");
+      // The action projection (PS apiMinor 2) rides the current-work item the
+      // same way — the completion contract as model-readable facts. Absent on
+      // older PS, the field stays absent (the first block's RUN_VIEW has none).
+      const ACTION_VIEW = {
+        kind: "state",
+        transitions: [{ transitionId: "handoff", to: "reading" }],
+        abandonAvailable: true,
+        documents: { read: [], write: ["decision.md"] },
+      } as const;
+      const { layer: actionLayer } = makeWorkClientLayer({
+        runs: [{ ...RUN_VIEW, action: ACTION_VIEW }],
+      });
+      const actionResult = yield* ProjectWorkToolkitHandlers.project_work_list().pipe(
+        withHandlerLayers({ workClientLayer: actionLayer, capabilities: new Set(["preview"]) }),
+      );
+      assert.deepEqual(actionResult.runs[0]?.action, ACTION_VIEW);
+      assert.isUndefined(result.runs[0]?.action);
     });
   });
 

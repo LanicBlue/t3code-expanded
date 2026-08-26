@@ -312,6 +312,13 @@ const ProjectWorkListItem = Schema.Struct({
   /** Where this run's work happens (managed worktree path / project root). */
   workspacePolicy: Schema.optional(Schema.String),
   workspacePath: Schema.optional(Schema.String),
+  /**
+   * THE completion contract for this run (PS apiMinor 2): the submit shape it
+   * accepts, the transitions a state submission chooses among (with target
+   * states), where a gate's accept/reject send the instance, and the display
+   * paths of the run's document rights. Absent on older PS deployments.
+   */
+  action: Schema.optional(ProjectServiceWorkClient.ProjectWorkActionRecord),
 });
 
 const ProjectWorkPositionItem = Schema.Struct({
@@ -361,7 +368,7 @@ export const ProjectWorkGetTool = Tool.make("project_work_get", {
 
 export const ProjectWorkSubmitTool = Tool.make("project_work_submit", {
   description:
-    'Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Match the run\'s completion contract (project_work_list\'s action field): a STATE work submits {"kind":"after", "message"?} — add "transitionId" only when the state has multiple outgoing lines — or {"kind":"abandon", "message"} to abandon the whole instance (the reason is mandatory; an abandon gate reviews it, and a rejection bounces the state for one more attempt); a TERMINAL work submits {"kind":"terminal", "message"?} which ends the instance; a GATE work submits {"kind":"before", "outcome":"accept"|"reject"} — reject REQUIRES "feedback" and sends the SAME instance back for rework: a fresh run re-delivers automatically, and its prompt carries a \'Rework context\' block (attempt ordinal + prior gate feedback) that the next attempt must address. Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
+    'Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Match the run\'s completion contract — the action field on the run project_work_list returns spells it out (kind, the transitions with their target states, the gate outcomes, the document paths). In short: a STATE work submits {"kind":"after", "message"?} — add "transitionId" only when action.transitions lists more than one — or {"kind":"abandon", "message"} to abandon the whole instance (the reason is mandatory; an abandon gate reviews it, and a rejection bounces the state for one more attempt); a TERMINAL work submits {"kind":"terminal", "message"?} which ends the instance; a GATE work submits {"kind":"before", "outcome":"accept"|"reject"} — reject REQUIRES "feedback" and sends the SAME instance back for rework (action.review.rejectTo names where): a fresh run re-delivers automatically, and its prompt carries a \'Rework context\' block (attempt ordinal + prior gate feedback) that the next attempt must address. Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
   parameters: ProjectWorkSubmitInput,
   success: ProjectServiceWorkClient.ProjectWorkOperationRecord,
   failure: ProjectWorkError,

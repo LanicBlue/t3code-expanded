@@ -320,6 +320,7 @@ const handlers = {
                   ...(current.workspacePath === undefined
                     ? {}
                     : { workspacePath: current.workspacePath }),
+                  ...(current.action === undefined ? {} : { action: current.action }),
                 },
               ],
         queuedWorkCount: Math.max(0, queue.length - 1),

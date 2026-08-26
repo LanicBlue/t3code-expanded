@@ -113,6 +113,44 @@ export const ProjectWorkPositionRecord = Schema.Struct({
 });
 export type ProjectWorkPositionRecord = typeof ProjectWorkPositionRecord.Type;
 
+/**
+ * The run's completion contract as PS projects it (apiMinor 2): which submit
+ * shape project_work_submit accepts, with the facts prose used to omit —
+ * transition target states, gate accept/reject destinations, document display
+ * paths. `transitions`/`documents` are absent when the definition join
+ * degraded; the whole field is absent on older servers.
+ */
+export const ProjectWorkActionRecord = Schema.Struct({
+  kind: Schema.Literals(["state", "gate", "terminal"]),
+  /** State work: the {"kind":"after"} submission picks one of these. */
+  transitions: Schema.optional(
+    Schema.Array(Schema.Struct({ transitionId: Schema.String, to: Schema.String })),
+  ),
+  /** Gate work: where accept / reject(→rework) send the instance. AcceptTo/
+   * rejectTo are omitted on the synthesized ABANDON gate — accept ends the
+   * instance, reject bounces the submitting state; neither is a real state. */
+  review: Schema.optional(
+    Schema.Struct({
+      acceptTo: Schema.optional(Schema.String),
+      rejectTo: Schema.optional(Schema.String),
+      feedbackRequiredOn: Schema.Literals(["reject"]),
+    }),
+  ),
+  /** Terminal work: the end disposition this submission sets. */
+  terminal: Schema.optional(Schema.Literals(["completed", "abandoned"])),
+  /** True when {"kind":"abandon","message"} is an accepted alternative. */
+  abandonAvailable: Schema.Boolean,
+  /** Display paths for the run's document rights. */
+  documents: Schema.optional(
+    Schema.Struct({
+      read: Schema.Array(Schema.String),
+      write: Schema.Array(Schema.String),
+      evidence: Schema.optional(Schema.Array(Schema.String)),
+    }),
+  ),
+});
+export type ProjectWorkActionRecord = typeof ProjectWorkActionRecord.Type;
+
 export const ProjectWorkRunRecord = Schema.Struct({
   runId: Schema.String,
   positionId: Schema.String,
@@ -130,6 +168,7 @@ export const ProjectWorkRunRecord = Schema.Struct({
    */
   workspacePolicy: Schema.optional(Schema.String),
   workspacePath: Schema.optional(Schema.String),
+  action: Schema.optional(ProjectWorkActionRecord),
 });
 export type ProjectWorkRunRecord = typeof ProjectWorkRunRecord.Type;
 
@@ -314,6 +353,9 @@ const projectRunRecord = (run: ProjectWorkRunRecord): ProjectWorkRunRecord => ({
   ...(run.resolvedAt === undefined ? {} : { resolvedAt: run.resolvedAt }),
   ...(run.workspacePolicy === undefined ? {} : { workspacePolicy: run.workspacePolicy }),
   ...(run.workspacePath === undefined ? {} : { workspacePath: run.workspacePath }),
+  // The completion contract (PS apiMinor 2) is agent-facing like the rest of
+  // this projection — absent on older PS stays absent.
+  ...(run.action === undefined ? {} : { action: run.action }),
 });
 
 const projectPositionRecord = (position: ProjectWorkPositionRecord): ProjectWorkPositionRecord => ({
