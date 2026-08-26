@@ -153,6 +153,16 @@ export const LOGICAL_AGENT_PERSONA_MAX_CHARS = 4000;
 export const ProjectWorkSessionScope = Schema.Literals(["project", "flow-instance"]);
 export type ProjectWorkSessionScope = typeof ProjectWorkSessionScope.Type;
 
+/**
+ * What happens to a flow-instance session when its flow instance reaches a
+ * terminal state and the session is safely idle: "settle" (default) parks the
+ * session as done work that stays in the project; "delete" removes the
+ * temporary session entirely — only after the settle-safety conditions hold
+ * (never while the session runs a turn or waits on human input).
+ */
+export const ProjectWorkSessionRetention = Schema.Literals(["settle", "delete"]);
+export type ProjectWorkSessionRetention = typeof ProjectWorkSessionRetention.Type;
+
 export const LogicalAgentConfig = Schema.Struct({
   /** Mutable display name; changing it changes nothing else. */
   agentName: TrimmedNonEmptyString,
@@ -197,6 +207,16 @@ export const LogicalAgentConfig = Schema.Struct({
      */
     sessionScope: ProjectWorkSessionScope.pipe(
       Schema.withDecodingDefault(Effect.succeed("project")),
+    ),
+    /**
+     * Retention for a flow-instance session whose instance reached a
+     * terminal state: "settle" (default) keeps the session as settled work;
+     * "delete" removes the temporary session once it is safely idle.
+     * Project-scope sessions are long-lived and are never settled or
+     * deleted by flow finalization regardless of this setting.
+     */
+    sessionRetention: ProjectWorkSessionRetention.pipe(
+      Schema.withDecodingDefault(Effect.succeed("settle")),
     ),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });

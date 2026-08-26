@@ -44,6 +44,7 @@ import {
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
   ProjectId,
+  type ProjectWorkSessionRetention,
   type ProjectWorkSessionScope,
   type ProviderDriverKind,
   type ServerSettings,
@@ -59,6 +60,7 @@ import {
   type AssignedWorkQueueEntry,
   assignedWorkWakeMessage,
   currentAssignedWork,
+  flowInstanceKeyOf,
   flowInstanceNameOf,
   orderAssignedWorkQueue,
   partitionOpenWork,
@@ -118,6 +120,8 @@ export interface ProjectWorkRoutingTarget {
   readonly t3ProjectId: ProjectId;
   /** The agent's configured session scope for this work. */
   readonly sessionScope: ProjectWorkSessionScope;
+  /** The agent's configured retention for ended flow-instance sessions. */
+  readonly sessionRetention: ProjectWorkSessionRetention;
 }
 
 /** Agent-level routing facts before the workspace directory is resolved. */
@@ -130,6 +134,7 @@ export interface ProjectWorkAgentRouting {
   readonly projectServiceProjectId: string;
   readonly projectName: string;
   readonly sessionScope: ProjectWorkSessionScope;
+  readonly sessionRetention: ProjectWorkSessionRetention;
 }
 
 export type ProjectWorkRoutingResolution =
@@ -191,6 +196,7 @@ export const resolveProjectWorkRouting = (
       projectServiceProjectId: input.projectId,
       projectName: input.projectName ?? "",
       sessionScope: agentConfig.project.sessionScope,
+      sessionRetention: agentConfig.project.sessionRetention,
     },
   };
 };
@@ -245,6 +251,57 @@ const workThreadTurnSettledAfterDelivery = (
 /** Archived sessions are no longer current (deleted ones read as absent). */
 export const isWorkThreadCurrent = (shell: OrchestrationThreadShell): boolean =>
   shell.archivedAt === null;
+
+/** Same adoption window the decider's settle guard uses (client contract). */
+const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
+
+/**
+ * A queued turn start — a user message no turn has picked up yet — as the
+ * SHELL sees it: the latest user message is strictly newer than every
+ * latestTurn timestamp, inside the bounded adoption grace window. The
+ * shell-fact mirror of the decider's messages-based guard; a failed session
+ * start (stopped/error/interrupted) clears the block immediately. The
+ * finalization drive uses this only as a churn guard — the settle command's
+ * own decider check stays the authority.
+ */
+export const workThreadHasQueuedTurnStart = (
+  shell: OrchestrationThreadShell,
+  nowIso: string,
+): boolean => {
+  if (shell.session !== null && TERMINAL_SESSION_STATUSES.has(shell.session.status)) {
+    return false;
+  }
+  if (shell.latestUserMessageAt === null) {
+    return false;
+  }
+  const messageAtMs = Date.parse(shell.latestUserMessageAt);
+  if (Number.isNaN(messageAtMs)) {
+    return false;
+  }
+  const latestTurnAtMs =
+    shell.latestTurn === null
+      ? Number.NEGATIVE_INFINITY
+      : Math.max(
+          ...[
+            shell.latestTurn.requestedAt,
+            shell.latestTurn.startedAt,
+            shell.latestTurn.completedAt,
+          ].map((candidate) =>
+            candidate == null || Number.isNaN(Date.parse(candidate))
+              ? Number.NEGATIVE_INFINITY
+              : Date.parse(candidate),
+          ),
+        );
+  if (messageAtMs <= latestTurnAtMs) {
+    return false;
+  }
+  const nowMs = Date.parse(nowIso);
+  if (Number.isNaN(nowMs)) {
+    return false;
+  }
+  const ageMs = nowMs - messageAtMs;
+  return Math.abs(ageMs) <= QUEUED_TURN_START_GRACE_MS;
+};
 
 // ── Aggregate notification ───────────────────────────────────────
 
@@ -370,6 +427,19 @@ export interface ProjectWorkSessionRouterDeps {
   readonly listOpenAssignedWork: (
     input: ProjectWorkWakeInput,
   ) => Effect.Effect<ReadonlyArray<AssignedWorkQueueEntry>, ProjectWorkRoutingError>;
+  /**
+   * Persist one instance→thread association into the routing ledger. Called
+   * at every aggregate delivery, best-effort: the Project Service's run
+   * lists only answer OPEN runs, so this durable row is the only fact that
+   * survives the run's closure — which is exactly when flow-end finalization
+   * needs to know which session ran the instance's work.
+   */
+  readonly recordFlowSessionRoute: (input: {
+    readonly instanceId: string;
+    readonly agentId: string;
+    readonly psProjectId: string;
+    readonly threadId: string;
+  }) => Effect.Effect<void, ProjectWorkRoutingError>;
   readonly nowIso: Effect.Effect<string>;
   readonly newId: Effect.Effect<string>;
 }
@@ -385,6 +455,41 @@ export interface ProjectWorkSessionSnapshot {
   /** The worktree the session's thread is bound to (null = project root). */
   readonly boundWorktreePath: string | null;
 }
+
+/** Facts one recorded flow-instance finalization carries into its drive. */
+export interface FlowInstanceFinalizationInput {
+  /** The logical agent whose session(s) the instance's work ran on. */
+  readonly agentId: string;
+  /** The Project Service project the instance belongs to. */
+  readonly projectId: string;
+  /**
+   * The flow instance id — the routing-key segment the instance's sessions
+   * live under (the legacy no-instance bucket "" never reaches finalization:
+   * its runs carry no instance identity to end).
+   */
+  readonly instanceKey: string;
+  /**
+   * The session thread the intake resolved for this (instance, agent). The
+   * live registry entry wins when present; this is the restart fallback.
+   */
+  readonly threadId: string;
+}
+
+/**
+ * Why a finalization could not finish yet. Every waiting reason is retried
+ * on the next thread event, sweep tick, or reconnect — never dropped.
+ */
+export type FlowInstanceFinalizationWait =
+  | "session-busy"
+  | "open-work"
+  | "work-query-unavailable"
+  | "routing-unavailable"
+  | "projection-unreadable";
+
+/** One finalization drive's outcome. */
+export type FlowInstanceFinalizationOutcome =
+  | { readonly kind: "completed" }
+  | { readonly kind: "waiting"; readonly reason: FlowInstanceFinalizationWait };
 
 export interface ProjectWorkSessionRouter {
   /**
@@ -409,6 +514,19 @@ export interface ProjectWorkSessionRouter {
    * never re-delivered (the no-nag invariant).
    */
   readonly reconcileOpenWork: (input: ProjectWorkWakeInput) => Effect.Effect<void>;
+  /**
+   * Drive one recorded flow-instance finalization (flow-end design): under
+   * the routing key's serialization, wait for the session's safe-idle
+   * conditions, apply the agent's retention for flow-instance sessions
+   * (settle, or settle-then-delete), remove the instance's routing record —
+   * or, for a project-scope session, recompute the workspace binding from
+   * CURRENT open work (next work's worktree, or project root when none).
+   * Never fails: a session that cannot finish yet resolves "waiting" and the
+   * caller retries on the next event or sweep.
+   */
+  readonly finalizeFlowInstance: (
+    input: FlowInstanceFinalizationInput,
+  ) => Effect.Effect<FlowInstanceFinalizationOutcome>;
   /** Test/observability view of the current-session registry. */
   readonly snapshotSessions: Effect.Effect<ReadonlyArray<ProjectWorkSessionSnapshot>>;
 }
@@ -727,6 +845,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         projectName: resolution.routing.projectName,
         t3ProjectId,
         sessionScope: resolution.routing.sessionScope,
+        sessionRetention: resolution.routing.sessionRetention,
       };
     },
   );
@@ -770,6 +889,35 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       interactionMode: DEFAULT_ROUTING_INTERACTION_MODE,
       createdAt,
     });
+    // Durable instance→thread association, written while the work is still
+    // OPEN (the only moment a live API can see it): the finalization intake
+    // reads this ledger after the runs have closed or a restart emptied the
+    // registry. Best-effort by design — a failed write never fails the
+    // delivery it rides on; the intake's overturnable no-op repairs a missed
+    // row when a later delivery lands.
+    for (const instanceKey of new Set(
+      ordered.map((run) => flowInstanceKeyOf(run)).filter((key) => key.length > 0),
+    )) {
+      const recorded = yield* deps
+        .recordFlowSessionRoute({
+          instanceId: instanceKey,
+          agentId: target.logicalAgentId,
+          psProjectId: target.projectServiceProjectId,
+          threadId,
+        })
+        .pipe(Effect.result);
+      if (recorded._tag === "Failure") {
+        yield* Effect.logWarning(
+          "Project Work session route could not be persisted; the finalization intake retries on the next delivery",
+          {
+            agentId: target.logicalAgentId,
+            projectId: target.projectServiceProjectId,
+            instanceId: instanceKey,
+            code: recorded.failure.code,
+          },
+        );
+      }
+    }
     return createdAt;
   });
 
@@ -1453,6 +1601,228 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     yield* sweepBody(input, routingKeyOf(input.agentId, input.projectId, null), null, undefined);
   });
 
+  // ── Flow-instance finalization (flow-end design) ────────────────
+
+  /**
+   * The agent's CURRENT session facts: settings are re-read every drive, so
+   * a scope or retention toggle between intake and drive is honored — the
+   * pending row never freezes a stale routing decision. A missing or
+   * project-disabled agent resolves null (waiting; the sweep retries).
+   */
+  const agentProjectFacts = Effect.fn("ProjectWorkSessionRouter.agentProjectFacts")(function* (
+    agentId: string,
+  ): Effect.fn.Return<{
+    sessionScope: ProjectWorkSessionScope;
+    sessionRetention: ProjectWorkSessionRetention;
+  } | null> {
+    const settings = yield* deps.readSettings.pipe(Effect.result);
+    if (settings._tag === "Failure") {
+      return null;
+    }
+    const entry = Object.entries(settings.success.logicalAgents).find(([id]) => id === agentId);
+    if (entry === undefined || !entry[1].project.enabled) {
+      return null;
+    }
+    return {
+      sessionScope: entry[1].project.sessionScope,
+      sessionRetention: entry[1].project.sessionRetention,
+    };
+  });
+
+  /**
+   * Dispatch one finalization command. A rejection is the decider re-checking
+   * the safety invariants (a raced turn start, a blocking request) — the
+   * drive waits and retries, never forces.
+   */
+  const dispatchForFinalization = (
+    command: OrchestrationCommand,
+  ): Effect.Effect<"dispatched" | "rejected"> =>
+    deps.dispatchCommand(command).pipe(
+      Effect.as("dispatched" as const),
+      Effect.orElseSucceed(() => "rejected" as const),
+    );
+
+  /** The flow-instance retention drive: settle (default) or settle+delete. */
+  const finalizeFlowInstanceSession = Effect.fn(
+    "ProjectWorkSessionRouter.finalizeFlowInstanceSession",
+  )(function* (
+    key: string,
+    input: FlowInstanceFinalizationInput,
+    retention: ProjectWorkSessionRetention,
+    registrySession: RoutedSession | undefined,
+  ): Effect.fn.Return<FlowInstanceFinalizationOutcome> {
+    const threadId = registrySession?.threadId ?? ThreadId.make(input.threadId);
+    const shell = yield* deps.readThreadShell(threadId).pipe(Effect.result);
+    if (shell._tag === "Failure") {
+      return { kind: "waiting", reason: "projection-unreadable" };
+    }
+    if (Option.isNone(shell.success) || !isWorkThreadCurrent(shell.success.value)) {
+      // Gone or archived: the session is finished by definition, and the
+      // instance's routing record goes with it.
+      if (registrySession !== undefined) {
+        yield* dropSession(key);
+      }
+      return { kind: "completed" };
+    }
+    const nowIso = yield* deps.nowIso;
+    const thread = shell.success.value;
+    if (
+      isWorkThreadBusy(thread) ||
+      thread.hasPendingApprovals ||
+      thread.hasPendingUserInput ||
+      workThreadHasQueuedTurnStart(thread, nowIso)
+    ) {
+      // Active, queued, or blocked-on-you work: never settle or delete into
+      // it. The thread-event and sweep triggers retry.
+      return { kind: "waiting", reason: "session-busy" };
+    }
+    // New open work for a terminal instance (a work notice racing the
+    // terminal observation) keeps the session alive until it is done.
+    const runs = yield* deps
+      .listOpenAssignedWork({
+        agentId: input.agentId,
+        projectId: input.projectId,
+      })
+      .pipe(Effect.result);
+    if (runs._tag === "Failure") {
+      return { kind: "waiting", reason: "work-query-unavailable" };
+    }
+    if (orderAssignedWorkQueue(runsForFlowInstance(runs.success, input.instanceKey)).length > 0) {
+      return { kind: "waiting", reason: "open-work" };
+    }
+    const settled = yield* dispatchForFinalization({
+      type: "thread.settle",
+      commandId: CommandId.make(yield* deps.newId),
+      threadId,
+    });
+    if (settled === "rejected") {
+      return { kind: "waiting", reason: "session-busy" };
+    }
+    if (retention === "delete") {
+      // Delete rides BEHIND the settle, but never on the settle's coattails:
+      // the command carries requireIdle, so the delete decision point ITSELF
+      // re-validates safe idle (non-running, no queued turn, no pending
+      // approval/user-input) inside the decider. A turn or human request
+      // that lands in the window between the two dispatches rejects the
+      // delete, and the drive waits for the next event or sweep instead of
+      // deleting into live work.
+      const deleted = yield* dispatchForFinalization({
+        type: "thread.delete",
+        commandId: CommandId.make(yield* deps.newId),
+        threadId,
+        requireIdle: true,
+      });
+      if (deleted === "rejected") {
+        return { kind: "waiting", reason: "session-busy" };
+      }
+    }
+    // Retention landed: the instance's Project Work routing record is gone.
+    if (registrySession !== undefined) {
+      yield* dropSession(key);
+    }
+    return { kind: "completed" };
+  });
+
+  /** The project-scope drive: recompute the binding from current facts. */
+  const finalizeProjectSession = Effect.fn("ProjectWorkSessionRouter.finalizeProjectSession")(
+    function* (
+      key: string,
+      input: FlowInstanceFinalizationInput,
+      registrySession: RoutedSession | undefined,
+    ): Effect.fn.Return<FlowInstanceFinalizationOutcome> {
+      const threadId = registrySession?.threadId ?? ThreadId.make(input.threadId);
+      const shell = yield* deps.readThreadShell(threadId).pipe(Effect.result);
+      if (shell._tag === "Failure") {
+        return { kind: "waiting", reason: "projection-unreadable" };
+      }
+      if (Option.isNone(shell.success) || !isWorkThreadCurrent(shell.success.value)) {
+        if (registrySession !== undefined) {
+          yield* dropSession(key);
+        }
+        return { kind: "completed" };
+      }
+      const thread = shell.success.value;
+      if (isWorkThreadBusy(thread) || workThreadHasQueuedTurnStart(thread, yield* deps.nowIso)) {
+        // The session is still finishing the old flow's last turn: rebind only
+        // after the turn ends, so the running provider keeps its cwd.
+        return { kind: "waiting", reason: "session-busy" };
+      }
+      const runs = yield* deps
+        .listOpenAssignedWork({
+          agentId: input.agentId,
+          projectId: input.projectId,
+        })
+        .pipe(Effect.result);
+      if (runs._tag === "Failure") {
+        return { kind: "waiting", reason: "work-query-unavailable" };
+      }
+      const head = orderAssignedWorkQueue(runs.success)[0] ?? null;
+      if (registrySession === undefined && head !== null) {
+        // No registry entry (a restart emptied it) while open work exists: the
+        // reconcile sweep owns creating the next session — rebinding an
+        // untracked thread would fork the binding. Wait; the sweep's session
+        // makes the next drive a registry-driven no-op.
+        return { kind: "waiting", reason: "open-work" };
+      }
+      // CURRENT facts decide: the queue head's execution workspace, or project
+      // root when no work remains. A late terminal notification for an older
+      // flow can therefore never pull the session back to root while newer
+      // work holds it elsewhere — the binding it would clear is not the one
+      // the facts computed.
+      const binding = worktreeBindingFor(head);
+      if (binding === thread.worktreePath) {
+        return { kind: "completed" };
+      }
+      const rebound = yield* dispatchForFinalization({
+        type: "thread.meta.update",
+        commandId: CommandId.make(yield* deps.newId),
+        threadId,
+        worktreePath: binding,
+      });
+      if (rebound === "rejected") {
+        return { kind: "waiting", reason: "projection-unreadable" };
+      }
+      if (registrySession !== undefined) {
+        yield* mutateSession(key, (session) => ({ ...session, boundWorktreePath: binding }));
+      }
+      return { kind: "completed" };
+    },
+  );
+
+  const finalizeFlowInstance = Effect.fn("ProjectWorkSessionRouter.finalizeFlowInstance")(
+    function* (
+      input: FlowInstanceFinalizationInput,
+    ): Effect.fn.Return<FlowInstanceFinalizationOutcome> {
+      if (input.instanceKey.length === 0) {
+        // The legacy no-instance bucket has no instance to finalize; the
+        // intake never records one. Treat as nothing to do.
+        return { kind: "completed" };
+      }
+      const facts = yield* agentProjectFacts(input.agentId);
+      if (facts === null) {
+        return { kind: "waiting", reason: "routing-unavailable" };
+      }
+      // The registry key follows the agent's CURRENT scope: the instance
+      // segment exists only for flow-instance sessions — a project-scope
+      // session lives under the plain key.
+      const key = routingKeyOf(
+        input.agentId,
+        input.projectId,
+        facts.sessionScope === "flow-instance" ? input.instanceKey : null,
+      );
+      return yield* withKeySerialization(
+        key,
+        Effect.gen(function* () {
+          const session = yield* getSession(key);
+          if (facts.sessionScope === "flow-instance") {
+            return yield* finalizeFlowInstanceSession(key, input, facts.sessionRetention, session);
+          }
+          return yield* finalizeProjectSession(key, input, session);
+        }),
+      );
+    },
+  );
+
   const snapshotSessions: ProjectWorkSessionRouter["snapshotSessions"] = Ref.get(sessionsRef).pipe(
     Effect.map((sessions) =>
       [...sessions.values()].map((session) => ({
@@ -1467,5 +1837,5 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     ),
   );
 
-  return { routeWake, onThreadEvent, reconcileOpenWork, snapshotSessions };
+  return { routeWake, onThreadEvent, reconcileOpenWork, finalizeFlowInstance, snapshotSessions };
 });

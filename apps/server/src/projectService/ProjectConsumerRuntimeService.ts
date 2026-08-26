@@ -57,11 +57,17 @@ import type { OrchestrationDispatchError } from "../orchestration/Errors.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
+import * as ProjectFlowFinalizationStore from "../persistence/ProjectFlowFinalization.ts";
 import { forkParked } from "../serverActivation.ts";
 import { getAutoBootstrapDefaultModelSelection } from "../serverRuntimeStartup.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { canonicalWorkspaceDirectory } from "./ProjectDirectoryKey.ts";
+import {
+  FlowFinalizationDependencyError,
+  makeFlowSessionFinalization,
+  type FlowSessionFinalization,
+} from "./FlowSessionFinalization.ts";
 import * as ProjectServiceWorkClient from "./ProjectServiceWorkClient.ts";
 import {
   makeProjectWorkSessionRouter,
@@ -140,6 +146,12 @@ export interface ProjectConsumerRuntimeServiceShape {
   readonly getStatus: Effect.Effect<ProjectConsumerRuntimeStatus>;
   /** Exposed for observability/tests; routing goes through the SDK adapter. */
   readonly router: ProjectWorkSessionRouter;
+  /**
+   * The flow-end intake + pending-finalization driver (flow session
+   * finalization design). Driven by the reconcile sweep, thread events,
+   * and the startup replay of the durable pending ledger.
+   */
+  readonly finalization: FlowSessionFinalization;
 }
 
 export class ProjectConsumerRuntimeService extends Context.Service<
@@ -345,6 +357,9 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       detail: "not-started",
     });
 
+    const finalizationStore = yield* ProjectFlowFinalizationStore.ProjectFlowFinalizationStore;
+    const sessionRouteStore = yield* ProjectFlowFinalizationStore.ProjectFlowSessionRouteStore;
+
     // A Work-path credential rejection must reach the integration status
     // (the WS handshake may still succeed while facet calls are rejected).
     // Routing sessions are never touched.
@@ -424,8 +439,119 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
           });
           return runs.filter((run) => run.state === "open");
         }).pipe(Effect.tapError(noteWorkPathCredentialError), Effect.mapError(workQueryFailure)),
+      // The durable instance→thread association, written at every aggregate
+      // delivery (see deliverAggregate): the only association fact that
+      // survives the run's closure and a registry-emptying restart.
+      recordFlowSessionRoute: (input) =>
+        Effect.flatMap(Effect.map(DateTime.now, DateTime.formatIso), (updatedAt) =>
+          sessionRouteStore
+            .record({ ...input, updatedAt })
+            .pipe(Effect.mapError(() => internal("flow session route could not be persisted"))),
+        ),
       nowIso: Effect.map(DateTime.now, DateTime.formatIso),
       newId: crypto.randomUUIDv4.pipe(Effect.orDie),
+    });
+
+    // ── Flow session finalization (flow-end design) ────────────────
+    // The intake derives terminal observations from the authoritative
+    // instance list; the durable ledger keeps recorded finalizations across
+    // restarts. Drives ride the sweep cadence, thread events (turn ends),
+    // and the first sweep tick after startup (the pending-row replay).
+    const finalizationReadFailure =
+      (source: "store" | "settings" | "work-client" | "projection") => (detail: string) =>
+        new FlowFinalizationDependencyError({ source, detail });
+    const finalization = makeFlowSessionFinalization({
+      store: {
+        record: (input) =>
+          finalizationStore
+            .record(input)
+            .pipe(
+              Effect.mapError((error) =>
+                finalizationReadFailure("store")(`ledger record failed (${error._tag})`),
+              ),
+            ),
+        listPending: () =>
+          finalizationStore
+            .listPending()
+            .pipe(
+              Effect.mapError((error) =>
+                finalizationReadFailure("store")(`ledger read failed (${error._tag})`),
+              ),
+            ),
+        markDone: (input) =>
+          finalizationStore
+            .markDone(input)
+            .pipe(
+              Effect.mapError((error) =>
+                finalizationReadFailure("store")(`ledger update failed (${error._tag})`),
+              ),
+            ),
+      },
+      // The restart-safe association read: the durable instance→thread row
+      // the routing path recorded while the instance's work was open. Read
+      // failures surface as store degradation so the intake skips (and
+      // retries) instead of recording an overturnable-but-premature no-op.
+      resolveSessionRoute: (input) =>
+        sessionRouteStore.find(input).pipe(
+          Effect.map((route) => (route === null ? null : route.threadId)),
+          Effect.mapError((error) =>
+            finalizationReadFailure("store")(`session route read failed (${error._tag})`),
+          ),
+        ),
+      readSettings: serverSettings.getSettings.pipe(
+        Effect.mapError(() => finalizationReadFailure("settings")("settings could not be read")),
+      ),
+      snapshotSessions: router.snapshotSessions,
+      readThreadShells: Effect.map(
+        snapshotQuery.getShellSnapshot(),
+        (snapshot) => snapshot.threads,
+      ).pipe(
+        Effect.mapError(() =>
+          finalizationReadFailure("projection")("thread shells could not be read"),
+        ),
+      ),
+      finalizeFlowInstance: router.finalizeFlowInstance,
+      nowIso: Effect.map(DateTime.now, DateTime.formatIso),
+      workReads: {
+        listProjects: () =>
+          workClient
+            .listProjects()
+            .pipe(
+              Effect.mapError((error) =>
+                finalizationReadFailure("work-client")(`project list failed (${error._tag})`),
+              ),
+            ),
+        getProjectGeneration: (projectId: string) =>
+          workClient
+            .getProjectGeneration(projectId)
+            .pipe(
+              Effect.mapError((error) =>
+                finalizationReadFailure("work-client")(
+                  `project generation read failed (${error._tag})`,
+                ),
+              ),
+            ),
+        listMy: (input: {
+          readonly projectId: string;
+          readonly projectGeneration: number;
+          readonly agentId: string;
+        }) =>
+          workClient
+            .listMy(input)
+            .pipe(
+              Effect.mapError((error) =>
+                finalizationReadFailure("work-client")(`work list failed (${error._tag})`),
+              ),
+            ),
+        listFlowInstances: (input: { readonly projectId: string }) =>
+          workClient
+            .listFlowInstances(input)
+            .pipe(
+              Effect.mapError((error) =>
+                finalizationReadFailure("work-client")(`flow instances failed (${error._tag})`),
+              ),
+            ),
+      },
     });
 
     // ── SDK runtime lifecycle ─────────────────────────────────────
@@ -607,6 +733,10 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         ? Duration.millis(overrides.reconcileSweepIntervalMs)
         : RECONCILE_SWEEP_INTERVAL;
     const reconcileSweep: Effect.Effect<void> = Effect.gen(function* () {
+      // Pending finalizations drive regardless of the channel state — the
+      // ledger replay at startup (the first tick) and every later tick must
+      // progress even while disconnected: settling a session is local.
+      yield* finalization.drivePending();
       const status = yield* Ref.get(statusRef);
       if (status.state !== "connected") {
         // Nothing to reconcile against while the channel is down; the
@@ -631,6 +761,9 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         );
         return;
       }
+      // Flow-end intake (derived terminal notifications) runs on the same
+      // cadence and connection gates as the delivery reconcile.
+      yield* finalization.intakeSweep();
       for (const project of projects.success) {
         for (const agentId of agentIds) {
           yield* router.reconcileOpenWork({
@@ -670,11 +803,15 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         const changes = yield* serverSettings.subscribeChanges;
         yield* forkParked(Stream.runForEach(changes, () => syncRuntime));
         // Turn-finish observation: the engine's domain events drive the
-        // coalesced post-turn aggregate deliveries.
+        // coalesced post-turn aggregate deliveries, and wake pending flow
+        // finalizations whose session was waiting on the turn's end.
         yield* forkParked(
           Stream.runForEach(engine.streamDomainEvents, (event) =>
             event.aggregateKind === "thread"
-              ? router.onThreadEvent(ThreadId.make(event.aggregateId))
+              ? Effect.gen(function* () {
+                  yield* router.onThreadEvent(ThreadId.make(event.aggregateId));
+                  yield* finalization.drivePendingForThread(event.aggregateId);
+                })
               : Effect.void,
           ),
         );
@@ -698,6 +835,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       start,
       getStatus: Ref.get(statusRef),
       router,
+      finalization,
     } satisfies ProjectConsumerRuntimeServiceShape;
   });
 

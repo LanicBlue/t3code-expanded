@@ -697,6 +697,14 @@ const ThreadDeleteCommand = Schema.Struct({
   type: Schema.Literal("thread.delete"),
   commandId: CommandId,
   threadId: ThreadId,
+  // Opt-in server-side idle precondition for AUTOMATED retention deletes:
+  // the decider re-validates safe idle (no starting/running session, no open
+  // approval/user-input request, no queued turn start) at the delete decision
+  // point itself, so a turn or human request that lands between a settle and
+  // its trailing delete is rejected instead of deleted into. User-driven
+  // deletes omit it and keep their unconditional semantics — deleting a
+  // stuck running thread stays the user's escape hatch.
+  requireIdle: Schema.optional(Schema.Boolean),
 });
 
 const ThreadArchiveCommand = Schema.Struct({

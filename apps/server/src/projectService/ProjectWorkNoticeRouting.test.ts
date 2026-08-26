@@ -50,7 +50,7 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: true, sessionScope: "project" },
+      project: { enabled: true, sessionScope: "project", sessionRetention: "settle" },
     },
     [LogicalAgentId.make(OTHER_AGENT_ID)]: {
       agentName: "Secondary Agent",
@@ -58,7 +58,7 @@ const makeSettings = (mutations?: (settings: ServerSettings) => ServerSettings) 
       persona: "",
       thinkLevel: null,
       modelOverride: null,
-      project: { enabled: false, sessionScope: "project" },
+      project: { enabled: false, sessionScope: "project", sessionRetention: "settle" },
     },
   };
   const base: ServerSettings = {
@@ -178,6 +178,22 @@ interface Harness {
   readonly setWorkCountDelayMs: (ms: number) => void;
   /** Simulated latency on orchestration dispatch (real ms, it.live). */
   readonly setDispatchDelayMs: (ms: number) => void;
+  /** The persisted instance→thread associations, as the routing ledger wrote them. */
+  readonly routeRecords: ReadonlyArray<{
+    readonly instanceId: string;
+    readonly agentId: string;
+    readonly psProjectId: string;
+    readonly threadId: string;
+  }>;
+  /** Fail the association-ledger write (best-effort path containment). */
+  readonly failRouteRecord: (shouldFail: boolean) => void;
+  /**
+   * Arm a mutation that lands when the NEXT thread.settle commits — the
+   * deterministic settle→delete race: a turn or human request entering the
+   * window between the two dispatches, projected synchronously inside the
+   * settle's dispatch transaction.
+   */
+  readonly armOnSettleCommitted: (mutate: () => void) => void;
 }
 
 const CREATED_PROJECT_MODEL_SELECTION: ModelSelection = {
@@ -221,6 +237,16 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
     let dispatchDelayMs = 0;
     let countCalls = 0;
     let idCounter = 0;
+    // The persisted instance→thread association ledger (flow-end design).
+    const routeRecords: Array<{
+      instanceId: string;
+      agentId: string;
+      psProjectId: string;
+      threadId: string;
+    }> = [];
+    let routeRecordShouldFail = false;
+    // The armed settle-commit mutation (the deterministic settle→delete race).
+    let onSettleCommitted: (() => void) | null = null;
 
     const shellFor = (project: OrchestrationProject): OrchestrationProjectShell => ({
       id: project.id,
@@ -287,11 +313,34 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
             new ProjectWorkRoutingError({ code: "CONSUMER_INTERNAL", detail: "dispatch failed" }),
           );
         }
-        // The dispatch transaction: the engine's active-workspaceRoot-taken
-        // invariant (exactly one active project per root) is enforced AT
-        // COMMIT TIME, so a concurrent wake that queried before the winner
-        // committed loses its create here — after any simulated latency.
         const attempt = (): Effect.Effect<void, ProjectWorkRoutingError> => {
+          // The decider's idle-required delete guard, simulated at the
+          // decision point: the delete itself re-validates the CURRENT
+          // thread state, never the settle's stale one.
+          if (
+            command.type === "thread.delete" &&
+            command.requireIdle === true &&
+            threads.has(command.threadId)
+          ) {
+            const shell = threads.get(command.threadId) as OrchestrationThreadShell;
+            if (
+              (shell.session !== null &&
+                (shell.session.status === "starting" || shell.session.status === "running")) ||
+              shell.hasPendingApprovals ||
+              shell.hasPendingUserInput
+            ) {
+              return Effect.fail(
+                new ProjectWorkRoutingError({
+                  code: "CONSUMER_INTERNAL",
+                  detail: "decider rejected the idle-required delete",
+                }),
+              );
+            }
+          }
+          // The dispatch transaction: the engine's active-workspaceRoot-taken
+          // invariant (exactly one active project per root) is enforced AT
+          // COMMIT TIME, so a concurrent wake that queried before the winner
+          // committed loses its create here — after any simulated latency.
           if (command.type === "project.create") {
             const conflicting = [...projectsById.values()].find(
               (project) =>
@@ -347,6 +396,15 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
                 makeThreadShell(command.threadId, String(command.projectId)),
               );
             }
+            // The settle's commit is the deterministic race point: the armed
+            // mutation lands synchronously INSIDE this transaction, exactly
+            // where a turn start or human request would interleave before
+            // the trailing delete dispatch arrives.
+            if (command.type === "thread.settle" && onSettleCommitted !== null) {
+              const mutate = onSettleCommitted;
+              onSettleCommitted = null;
+              mutate();
+            }
           });
         };
         return dispatchDelayMs > 0
@@ -367,6 +425,25 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
           ? Effect.sleep(workCountDelayMs).pipe(Effect.flatMap(() => outcome))
           : outcome;
       },
+      recordFlowSessionRoute: (input) =>
+        routeRecordShouldFail
+          ? Effect.fail(
+              new ProjectWorkRoutingError({
+                code: "CONSUMER_INTERNAL",
+                detail: "session route ledger write failed",
+              }),
+            )
+          : Effect.sync(() => {
+              const existing = routeRecords.findIndex(
+                (record) =>
+                  record.instanceId === input.instanceId && record.agentId === input.agentId,
+              );
+              if (existing >= 0) {
+                routeRecords[existing] = input;
+              } else {
+                routeRecords.push(input);
+              }
+            }),
       nowIso: Effect.succeed(ISO),
       newId: Effect.sync(() => {
         idCounter += 1;
@@ -431,6 +508,13 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
       armCreateRace: () => {
         createRaceArmed = true;
       },
+      routeRecords,
+      failRouteRecord: (shouldFail) => {
+        routeRecordShouldFail = shouldFail;
+      },
+      armOnSettleCommitted: (mutate) => {
+        onSettleCommitted = mutate;
+      },
       setWorkCountDelayMs: (ms) => {
         workCountDelayMs = ms;
       },
@@ -486,6 +570,7 @@ it("routing resolution is id-based and structural", () => {
       projectServiceProjectId: PS_PROJECT_ID,
       projectName: "Registry",
       sessionScope: "project",
+      sessionRetention: "settle",
     });
     // The notice's project facts ride through; a name-less notice stays blank.
     const nameless = resolveProjectWorkRouting(settings, wakeInput({ projectName: undefined }));
@@ -1869,7 +1954,11 @@ describe("flow-instance session scope", () => {
           persona: "",
           thinkLevel: null,
           modelOverride: null,
-          project: { enabled: true, sessionScope: "flow-instance" as const },
+          project: {
+            enabled: true,
+            sessionScope: "flow-instance" as const,
+            sessionRetention: "settle",
+          },
         },
       },
     }));
@@ -2352,4 +2441,649 @@ describe("applyThinkLevelToOptions", () => {
       ],
     );
   });
+});
+
+// ── Flow-instance finalization drive (flow-end design) ───────────
+
+describe("flow-instance finalization drive", () => {
+  const INST_A = "fi_alpha";
+  const INST_B = "fi_beta";
+  const WT_A = "/wt/alpha";
+  const WT_B = "/wt/beta";
+
+  const settleCommands = (commands: OrchestrationCommand[]) =>
+    commands.filter((command) => command.type === "thread.settle");
+  const deleteCommands = (commands: OrchestrationCommand[]) =>
+    commands.filter((command) => command.type === "thread.delete");
+  const metaUpdates = (commands: OrchestrationCommand[]) =>
+    commands.filter((command) => command.type === "thread.meta.update");
+
+  const makeScopedSettings = (
+    sessionScope: "project" | "flow-instance",
+    sessionRetention: "settle" | "delete" = "settle",
+  ) =>
+    makeSettings((base) => ({
+      ...base,
+      logicalAgents: {
+        ...base.logicalAgents,
+        [LogicalAgentId.make(AGENT_ID)]: {
+          agentName: "Primary Agent",
+          providerInstanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
+          persona: "",
+          thinkLevel: null,
+          modelOverride: null,
+          project: { enabled: true, sessionScope, sessionRetention },
+        },
+      },
+    }));
+
+  const instanceRun = (
+    instanceId: string,
+    runId: string,
+    overrides: Partial<AssignedWorkQueueEntry> = {},
+  ): AssignedWorkQueueEntry => ({
+    runId,
+    positionId: `position_${runId}`,
+    runRevision: "run:1",
+    state: "open",
+    agentId: AGENT_ID,
+    task: { prompt: `work ${runId}`, instance: { instanceId, name: instanceId, iteration: 1 } },
+    createdAt: "2026-08-21T00:00:10.000Z",
+    ...overrides,
+  });
+
+  /** A project-scope queue head running in a managed worktree. */
+  const worktreeRun = (runId: string, workspacePath: string): AssignedWorkQueueEntry => ({
+    runId,
+    positionId: `position_${runId}`,
+    runRevision: "run:1",
+    state: "open",
+    agentId: AGENT_ID,
+    task: { prompt: `work ${runId}` },
+    createdAt: "2026-08-21T00:00:10.000Z",
+    workspacePolicy: "managed-worktree",
+    workspacePath,
+  });
+
+  /** Route one wake under flow-instance scope and return the instance's session thread. */
+  const routedInstanceSession = (
+    harness: Harness,
+    instanceId: string,
+  ): { readonly threadId: string; readonly projectId: string } => {
+    const create = threadCreates(harness.commands).find(
+      (command) => command.type === "thread.create" && command.title.includes(instanceId),
+    );
+    assert.isDefined(create);
+    return create !== undefined && create.type === "thread.create"
+      ? { threadId: String(create.threadId), projectId: String(create.projectId) }
+      : { threadId: "", projectId: "" };
+  };
+
+  it.effect(
+    "flow-instance scope: settles the safely-idle session and removes the routing record",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
+        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        yield* wake(harness.router);
+        const { threadId } = routedInstanceSession(harness, INST_A);
+        harness.setOpenRuns([]);
+
+        const outcome = yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        });
+
+        assert.deepEqual(outcome, { kind: "completed" });
+        assert.lengthOf(settleCommands(harness.commands), 1);
+        const settle = settleCommands(harness.commands)[0];
+        assert.ok(settle !== undefined && settle.type === "thread.settle");
+        if (settle.type === "thread.settle") {
+          assert.strictEqual(String(settle.threadId), threadId);
+        }
+        assert.isUndefined(deleteCommands(harness.commands)[0]);
+        // The instance's Project Work routing record is gone.
+        assert.deepEqual(
+          (yield* harness.router.snapshotSessions).map((session) => session.flowInstanceKey),
+          [],
+        );
+      }),
+  );
+
+  it.effect("flow-instance scope: a running session, pending input, or queued turn waits", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
+      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      yield* wake(harness.router);
+      const { threadId, projectId } = routedInstanceSession(harness, INST_A);
+      harness.setOpenRuns([]);
+
+      // Running session: never settled into.
+      harness.putThread(
+        makeThreadShell(threadId, projectId, (shell) => ({
+          ...shell,
+          session: runningSession(threadId),
+        })),
+      );
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "waiting", reason: "session-busy" },
+      );
+      assert.lengthOf(settleCommands(harness.commands), 0);
+
+      // Blocked-on-you approval: waiting, not settled.
+      harness.putThread(
+        makeThreadShell(threadId, projectId, (shell) => ({
+          ...shell,
+          session: readySession(threadId),
+          hasPendingApprovals: true,
+        })),
+      );
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "waiting", reason: "session-busy" },
+      );
+
+      // Pending user input: waiting, not settled.
+      harness.putThread(
+        makeThreadShell(threadId, projectId, (shell) => ({
+          ...shell,
+          hasPendingUserInput: true,
+        })),
+      );
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "waiting", reason: "session-busy" },
+      );
+      assert.lengthOf(settleCommands(harness.commands), 0);
+    }),
+  );
+
+  it.effect("flow-instance scope: new open work for the instance keeps the session alive", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
+      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      yield* wake(harness.router);
+      const { threadId } = routedInstanceSession(harness, INST_A);
+      // The terminal observation raced a new open work notice for the same
+      // instance: the session keeps serving it.
+      harness.setOpenRuns([instanceRun(INST_A, "run_a2")]);
+
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "waiting", reason: "open-work" },
+      );
+      assert.lengthOf(settleCommands(harness.commands), 0);
+    }),
+  );
+
+  it.effect(
+    "delete retention: the settle lands first, the delete rides behind it idle-guarded",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeScopedSettings("flow-instance", "delete"));
+        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        yield* wake(harness.router);
+        const { threadId } = routedInstanceSession(harness, INST_A);
+        harness.setOpenRuns([]);
+
+        const outcome = yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        });
+
+        assert.deepEqual(outcome, { kind: "completed" });
+        // The settle strictly precedes the delete, and the delete itself
+        // carries the idle-required precondition: its own decision point
+        // re-validates safe idle, never the settle's stale snapshot.
+        const settleIndex = harness.commands.findIndex(
+          (command) => command.type === "thread.settle",
+        );
+        const deleteIndex = harness.commands.findIndex(
+          (command) => command.type === "thread.delete",
+        );
+        assert.isAtLeast(settleIndex, 0);
+        assert.strictEqual(deleteIndex, settleIndex + 1);
+        const deleted = deleteCommands(harness.commands)[0];
+        assert.ok(deleted !== undefined && deleted.type === "thread.delete");
+        if (deleted.type === "thread.delete") {
+          assert.strictEqual(deleted.requireIdle, true);
+        }
+        assert.deepEqual(
+          (yield* harness.router.snapshotSessions).map((session) => session.flowInstanceKey),
+          [],
+        );
+      }),
+  );
+
+  it.effect(
+    "delete retention: a turn entering between the settle and the delete rejects the delete and waits",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeScopedSettings("flow-instance", "delete"));
+        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        yield* wake(harness.router);
+        const { threadId, projectId } = routedInstanceSession(harness, INST_A);
+        harness.setOpenRuns([]);
+
+        // The deterministic race: the moment the settle commits, a user turn
+        // starts on the same thread — inside the window between the two
+        // dispatches. The trailing delete is decided against THIS state.
+        harness.armOnSettleCommitted(() => {
+          harness.putThread(
+            makeThreadShell(threadId, projectId, (shell) => ({
+              ...shell,
+              session: runningSession(threadId),
+            })),
+          );
+        });
+
+        const outcome = yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        });
+
+        // The settle landed; the idle-required delete was REJECTED against
+        // the current running state, so the drive waits instead of deleting
+        // into the live turn.
+        assert.deepEqual(outcome, { kind: "waiting", reason: "session-busy" });
+        assert.lengthOf(settleCommands(harness.commands), 1);
+        assert.lengthOf(deleteCommands(harness.commands), 0);
+        // The routing record survives — the finalization is not done.
+        assert.deepEqual(
+          (yield* harness.router.snapshotSessions).map((session) => session.flowInstanceKey),
+          [INST_A],
+        );
+
+        // The turn ends: the next drive settles the (already settled) thread
+        // idempotently and the delete now passes its own re-validation.
+        harness.putThread(
+          makeThreadShell(threadId, projectId, (shell) => ({
+            ...shell,
+            session: stoppedSession(threadId),
+          })),
+        );
+        assert.deepEqual(
+          yield* harness.router.finalizeFlowInstance({
+            agentId: AGENT_ID,
+            projectId: PS_PROJECT_ID,
+            instanceKey: INST_A,
+            threadId,
+          }),
+          { kind: "completed" },
+        );
+        assert.lengthOf(deleteCommands(harness.commands), 1);
+      }),
+  );
+
+  it.effect(
+    "delete retention: a pending human request entering the window also rejects the delete",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeScopedSettings("flow-instance", "delete"));
+        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        yield* wake(harness.router);
+        const { threadId, projectId } = routedInstanceSession(harness, INST_A);
+        harness.setOpenRuns([]);
+
+        harness.armOnSettleCommitted(() => {
+          harness.putThread(
+            makeThreadShell(threadId, projectId, (shell) => ({
+              ...shell,
+              hasPendingUserInput: true,
+            })),
+          );
+        });
+
+        assert.deepEqual(
+          yield* harness.router.finalizeFlowInstance({
+            agentId: AGENT_ID,
+            projectId: PS_PROJECT_ID,
+            instanceKey: INST_A,
+            threadId,
+          }),
+          { kind: "waiting", reason: "session-busy" },
+        );
+        assert.lengthOf(deleteCommands(harness.commands), 0);
+      }),
+  );
+
+  it.effect("delivery persists the instance→thread association the finalization intake reads", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
+      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      yield* wake(harness.router);
+      const { threadId } = routedInstanceSession(harness, INST_A);
+
+      // The association is durable from the FIRST delivery — before the flow
+      // ends, before any restart, while the run is still open.
+      assert.deepEqual(harness.routeRecords, [
+        {
+          instanceId: INST_A,
+          agentId: AGENT_ID,
+          psProjectId: PS_PROJECT_ID,
+          threadId,
+        },
+      ]);
+
+      // A redelivered notice on a recreated session REPLACES the row (the
+      // newest delivering thread is the association).
+      harness.setOpenRuns([]);
+      harness.setOpenRuns([instanceRun(INST_A, "run_a2")]);
+      yield* wake(harness.router);
+      assert.deepEqual(
+        harness.routeRecords.map((record) => record.threadId),
+        [threadId],
+      );
+
+      // The ledger write is best-effort: its failure never fails the wake.
+      harness.failRouteRecord(true);
+      harness.setOpenRuns([instanceRun(INST_B, "run_b1")]);
+      yield* wake(harness.router);
+      assert.isUndefined(harness.routeRecords.find((record) => record.instanceId === INST_B));
+    }),
+  );
+
+  it.effect("a gone or archived session completes and drops the routing record", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
+      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      yield* wake(harness.router);
+      const { threadId, projectId } = routedInstanceSession(harness, INST_A);
+      harness.setOpenRuns([]);
+
+      // Deleted sessions read as absent; archived ones as no longer current.
+      harness.putThread(
+        makeThreadShell(threadId, projectId, (shell) => ({
+          ...shell,
+          archivedAt: "2026-08-21T00:00:20.000Z",
+        })),
+      );
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "completed" },
+      );
+      assert.lengthOf(settleCommands(harness.commands), 0);
+      assert.deepEqual(
+        (yield* harness.router.snapshotSessions).map((session) => session.flowInstanceKey),
+        [],
+      );
+
+      // And an absent thread (deleted outright) completes the same way.
+      harness.removeThread(threadId);
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "completed" },
+      );
+    }),
+  );
+
+  it.effect("restart: with the registry empty, the recorded thread still settles", () =>
+    Effect.gen(function* () {
+      // The registry never reconstitutes an ended instance's session; the
+      // intake-resolved threadId is the fallback the drive settles.
+      const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
+      harness.putThread(makeThreadShell("thread_restart_1", "t3_proj_1"));
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId: "thread_restart_1",
+        }),
+        { kind: "completed" },
+      );
+      assert.lengthOf(settleCommands(harness.commands), 1);
+    }),
+  );
+
+  it.effect("project scope: no remaining work returns the session to the project root", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeScopedSettings("project"));
+      harness.setOpenRuns([worktreeRun("run_1", WT_A)]);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      const threadId = created?.type === "thread.create" ? String(created.threadId) : "";
+      const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
+      // The projected binding the engine would hold after the session ran in
+      // the instance's managed worktree.
+      harness.putThread(
+        makeThreadShell(threadId, projectId, (shell) => ({ ...shell, worktreePath: WT_A })),
+      );
+      harness.setOpenRuns([]);
+
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "completed" },
+      );
+      const rebinds = metaUpdates(harness.commands);
+      assert.lengthOf(rebinds, 1);
+      assert.strictEqual(
+        rebinds[0]?.type === "thread.meta.update" ? rebinds[0].worktreePath : undefined,
+        null,
+      );
+      // No settle, no delete: project sessions are long-lived.
+      assert.lengthOf(settleCommands(harness.commands), 0);
+      assert.lengthOf(deleteCommands(harness.commands), 0);
+    }),
+  );
+
+  it.effect(
+    "project scope: remaining work rebinds to ITS workspace — a late notice never pulls the session back to root",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeScopedSettings("project"));
+        harness.setOpenRuns([worktreeRun("run_1", WT_A)]);
+        yield* wake(harness.router);
+        const created = threadCreates(harness.commands)[0];
+        const threadId = created?.type === "thread.create" ? String(created.threadId) : "";
+        const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
+        // A newer flow's work arrived and the session is already bound to its
+        // workspace; the OLD instance's terminal notification arrives late.
+        harness.putThread(
+          makeThreadShell(threadId, projectId, (shell) => ({ ...shell, worktreePath: WT_B })),
+        );
+        harness.setOpenRuns([
+          instanceRun(INST_B, "run_b1", {
+            runId: "run_b1",
+            workspacePolicy: "managed-worktree",
+            workspacePath: WT_B,
+          }),
+        ]);
+
+        const outcome = yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        });
+
+        // The current facts keep the newer binding: nothing is dispatched.
+        assert.deepEqual(outcome, { kind: "completed" });
+        assert.lengthOf(metaUpdates(harness.commands), 0);
+        assert.lengthOf(settleCommands(harness.commands), 0);
+      }),
+  );
+
+  it.effect("project scope: a still-running turn defers the recompute", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeScopedSettings("project"));
+      harness.setOpenRuns([worktreeRun("run_1", WT_A)]);
+      yield* wake(harness.router);
+      const created = threadCreates(harness.commands)[0];
+      const threadId = created?.type === "thread.create" ? String(created.threadId) : "";
+      const projectId = created?.type === "thread.create" ? String(created.projectId) : "";
+      harness.putThread(
+        makeThreadShell(threadId, projectId, (shell) => ({
+          ...shell,
+          worktreePath: WT_A,
+          session: runningSession(threadId),
+        })),
+      );
+      harness.setOpenRuns([]);
+
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId,
+        }),
+        { kind: "waiting", reason: "session-busy" },
+      );
+      assert.lengthOf(metaUpdates(harness.commands), 0);
+    }),
+  );
+
+  it.effect(
+    "project scope: registry empty with open work waits for the sweep; empty with none rebinds the recorded thread",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeScopedSettings("project"));
+        harness.setOpenRuns([worktreeRun("run_next", WT_B)]);
+
+        // Registry empty (a restart) while open work exists: the sweep owns
+        // creating the next session; the drive must not fork the binding.
+        harness.putThread(makeThreadShell("thread_orphan", "t3_proj_1"));
+        assert.deepEqual(
+          yield* harness.router.finalizeFlowInstance({
+            agentId: AGENT_ID,
+            projectId: PS_PROJECT_ID,
+            instanceKey: INST_A,
+            threadId: "thread_orphan",
+          }),
+          { kind: "waiting", reason: "open-work" },
+        );
+
+        // No open work at all: the recorded thread returns to the root.
+        harness.putThread(
+          makeThreadShell("thread_orphan", "t3_proj_1", (shell) => ({
+            ...shell,
+            worktreePath: WT_A,
+          })),
+        );
+        harness.setOpenRuns([]);
+        assert.deepEqual(
+          yield* harness.router.finalizeFlowInstance({
+            agentId: AGENT_ID,
+            projectId: PS_PROJECT_ID,
+            instanceKey: INST_A,
+            threadId: "thread_orphan",
+          }),
+          { kind: "completed" },
+        );
+        const rebinds = metaUpdates(harness.commands);
+        assert.lengthOf(rebinds, 1);
+        assert.strictEqual(
+          rebinds[0]?.type === "thread.meta.update" ? rebinds[0].worktreePath : undefined,
+          null,
+        );
+      }),
+  );
+
+  it.effect("a scope toggle between intake and drive: the CURRENT settings win", () =>
+    Effect.gen(function* () {
+      // Recorded under flow-instance scope, driven after the agent moved to
+      // project scope: the recompute path runs, not the retention path.
+      const harness = yield* makeHarness(makeScopedSettings("project"));
+      harness.putThread(
+        makeThreadShell("thread_moved", "t3_proj_1", (shell) => ({
+          ...shell,
+          worktreePath: WT_A,
+        })),
+      );
+      harness.setOpenRuns([]);
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: AGENT_ID,
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId: "thread_moved",
+        }),
+        { kind: "completed" },
+      );
+      assert.lengthOf(settleCommands(harness.commands), 0);
+      assert.lengthOf(metaUpdates(harness.commands), 1);
+    }),
+  );
+
+  it.effect("an unknown or project-disabled agent waits as routing-unavailable", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(
+        makeSettings((base) => ({
+          ...base,
+          logicalAgents: {
+            ...base.logicalAgents,
+            [LogicalAgentId.make("ag_gone")]: {
+              agentName: "Gone",
+              providerInstanceId: ProviderInstanceId.make(PROVIDER_INSTANCE),
+              persona: "",
+              thinkLevel: null,
+              modelOverride: null,
+              project: { enabled: false, sessionScope: "project", sessionRetention: "settle" },
+            },
+          },
+        })),
+      );
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: "ag_gone",
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId: "thread_any",
+        }),
+        { kind: "waiting", reason: "routing-unavailable" },
+      );
+      assert.deepEqual(
+        yield* harness.router.finalizeFlowInstance({
+          agentId: "ag_missing",
+          projectId: PS_PROJECT_ID,
+          instanceKey: INST_A,
+          threadId: "thread_any",
+        }),
+        { kind: "waiting", reason: "routing-unavailable" },
+      );
+    }),
+  );
 });

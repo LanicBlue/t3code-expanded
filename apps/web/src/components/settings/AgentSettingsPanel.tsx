@@ -342,6 +342,38 @@ function AgentDetail({
           }
         />
         <SettingsRow
+          title="Session retention"
+          description="What happens to a flow instance's session when its flow ends and the session is safely idle: settled sessions stay in the project as finished work; deleted sessions are removed. Never applies mid-turn or while human input is pending. Project-scope sessions are long-lived and always stay."
+          control={
+            <Select
+              value={agent.project.sessionRetention}
+              onValueChange={(retention) => {
+                if (retention !== null) {
+                  patchAgent({
+                    ...agent,
+                    project: {
+                      ...agent.project,
+                      sessionRetention: retention === "delete" ? "delete" : "settle",
+                    },
+                  });
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-56" aria-label="Session retention">
+                <SelectValue>
+                  {agent.project.sessionRetention === "delete"
+                    ? "Delete ended sessions"
+                    : "Settle ended sessions"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem value="settle">Settle ended sessions</SelectItem>
+                <SelectItem value="delete">Delete ended sessions</SelectItem>
+              </SelectPopup>
+            </Select>
+          }
+        />
+        <SettingsRow
           title="Model"
           description="Default model for this agent's sessions on its provider instance."
           control={

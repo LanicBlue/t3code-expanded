@@ -24,7 +24,7 @@ export function makeEmptyLogicalAgentConfig(
     persona: "",
     thinkLevel: null,
     modelOverride: null,
-    project: { enabled: false, sessionScope: "project" },
+    project: { enabled: false, sessionScope: "project", sessionRetention: "settle" },
   };
 }
 
