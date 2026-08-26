@@ -60,6 +60,7 @@ import {
   type AssignedWorkQueueEntry,
   assignedWorkWakeMessage,
   currentAssignedWork,
+  flowInstanceKeyOf,
   flowInstanceNameOf,
   orderAssignedWorkQueue,
   partitionOpenWork,
@@ -426,6 +427,19 @@ export interface ProjectWorkSessionRouterDeps {
   readonly listOpenAssignedWork: (
     input: ProjectWorkWakeInput,
   ) => Effect.Effect<ReadonlyArray<AssignedWorkQueueEntry>, ProjectWorkRoutingError>;
+  /**
+   * Persist one instance→thread association into the routing ledger. Called
+   * at every aggregate delivery, best-effort: the Project Service's run
+   * lists only answer OPEN runs, so this durable row is the only fact that
+   * survives the run's closure — which is exactly when flow-end finalization
+   * needs to know which session ran the instance's work.
+   */
+  readonly recordFlowSessionRoute: (input: {
+    readonly instanceId: string;
+    readonly agentId: string;
+    readonly psProjectId: string;
+    readonly threadId: string;
+  }) => Effect.Effect<void, ProjectWorkRoutingError>;
   readonly nowIso: Effect.Effect<string>;
   readonly newId: Effect.Effect<string>;
 }
@@ -875,6 +889,35 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       interactionMode: DEFAULT_ROUTING_INTERACTION_MODE,
       createdAt,
     });
+    // Durable instance→thread association, written while the work is still
+    // OPEN (the only moment a live API can see it): the finalization intake
+    // reads this ledger after the runs have closed or a restart emptied the
+    // registry. Best-effort by design — a failed write never fails the
+    // delivery it rides on; the intake's overturnable no-op repairs a missed
+    // row when a later delivery lands.
+    for (const instanceKey of new Set(
+      ordered.map((run) => flowInstanceKeyOf(run)).filter((key) => key.length > 0),
+    )) {
+      const recorded = yield* deps
+        .recordFlowSessionRoute({
+          instanceId: instanceKey,
+          agentId: target.logicalAgentId,
+          psProjectId: target.projectServiceProjectId,
+          threadId,
+        })
+        .pipe(Effect.result);
+      if (recorded._tag === "Failure") {
+        yield* Effect.logWarning(
+          "Project Work session route could not be persisted; the finalization intake retries on the next delivery",
+          {
+            agentId: target.logicalAgentId,
+            projectId: target.projectServiceProjectId,
+            instanceId: instanceKey,
+            code: recorded.failure.code,
+          },
+        );
+      }
+    }
     return createdAt;
   });
 
@@ -1656,16 +1699,21 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       return { kind: "waiting", reason: "session-busy" };
     }
     if (retention === "delete") {
-      // Delete rides BEHIND the settle: the settle command's own decider
-      // guards prove the session is safely idle, so a running or
-      // human-blocked session is never deleted directly.
+      // Delete rides BEHIND the settle, but never on the settle's coattails:
+      // the command carries requireIdle, so the delete decision point ITSELF
+      // re-validates safe idle (non-running, no queued turn, no pending
+      // approval/user-input) inside the decider. A turn or human request
+      // that lands in the window between the two dispatches rejects the
+      // delete, and the drive waits for the next event or sweep instead of
+      // deleting into live work.
       const deleted = yield* dispatchForFinalization({
         type: "thread.delete",
         commandId: CommandId.make(yield* deps.newId),
         threadId,
+        requireIdle: true,
       });
       if (deleted === "rejected") {
-        return { kind: "waiting", reason: "projection-unreadable" };
+        return { kind: "waiting", reason: "session-busy" };
       }
     }
     // Retention landed: the instance's Project Work routing record is gone.

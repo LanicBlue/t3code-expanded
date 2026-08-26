@@ -666,10 +666,14 @@ export const make = Effect.gen(function* () {
     return records.map(projectServiceProjectRecord);
   });
 
-  // GET /:id/flow/instances answers { ok, result: { instances: [...] } }; the
-  // intake reads identity + terminal marker only, extra view fields drop at
-  // this trust boundary like on every other read. Failures keep the service's
-  // own envelope codes.
+  // GET /:id/flow/instances answers { ok, result: { instances: [...],
+  // status, ... } } — the flowOk envelope every flow route rides (project-router
+  // wraps flow.listInstances in { ok: true, result }). Decoding reads
+  // value.result (NOT value itself): a 200 body that is not the success
+  // envelope is a typed shape failure, never a silently-empty instance list.
+  // The intake reads identity + terminal marker only; extra view fields drop
+  // at this trust boundary like on every other read. Failures keep the
+  // service's own envelope codes.
   const listFlowInstances = Effect.fn("ProjectServiceWorkClient.listFlowInstances")(function* (
     projectId: string,
   ) {
@@ -700,7 +704,10 @@ export const make = Effect.gen(function* () {
     const result = yield* Effect.try({
       try: () =>
         decodeOrIncompatible(
-          Schema.Struct({ instances: Schema.Array(ProjectFlowInstanceRecord) }),
+          Schema.Struct({
+            ok: Schema.Literals([true]),
+            result: Schema.Struct({ instances: Schema.Array(ProjectFlowInstanceRecord) }),
+          }),
           value,
         ),
       catch: (cause) =>
@@ -708,7 +715,7 @@ export const make = Effect.gen(function* () {
           ? cause
           : new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" }),
     });
-    return result.instances;
+    return result.result.instances;
   });
 
   const getProjectGeneration = Effect.fn("ProjectServiceWorkClient.getProjectGeneration")(

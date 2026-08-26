@@ -387,12 +387,45 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.delete": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
       const occurredAt = yield* nowIso;
+      // The opt-in idle precondition (automated retention deletes): the same
+      // safety invariant thread.settle enforces, re-validated HERE — the
+      // delete decision point — so a turn start, approval, or user-input
+      // request that lands between a settle and its trailing delete rejects
+      // the delete itself instead of riding an idle check that went stale.
+      // The guard and the event emission are one decider pass, so no command
+      // can interleave between the check and the commit.
+      if (command.requireIdle === true) {
+        if (thread.session?.status === "starting" || thread.session?.status === "running") {
+          return yield* Effect.fail(
+            new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: `thread ${command.threadId} has an active session and cannot be deleted while idle-required`,
+            }),
+          );
+        }
+        if (hasOpenBlockingRequest(thread)) {
+          return yield* Effect.fail(
+            new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: `thread ${command.threadId} has a pending approval or user-input request and cannot be deleted while idle-required`,
+            }),
+          );
+        }
+        if (threadHasQueuedTurnStart(thread, occurredAt)) {
+          return yield* Effect.fail(
+            new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: `thread ${command.threadId} has a queued turn start and cannot be deleted while idle-required`,
+            }),
+          );
+        }
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",

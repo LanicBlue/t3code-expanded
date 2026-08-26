@@ -259,6 +259,7 @@ const ReactorLayerLive = Layer.empty.pipe(
     ProjectConsumerRuntime.layer.pipe(
       Layer.provide(ProjectServiceWorkClient.layer),
       Layer.provide(ProjectFlowFinalizationStore.layer),
+      Layer.provide(ProjectFlowFinalizationStore.sessionRouteLayer),
     ),
   ),
 );

@@ -2,10 +2,13 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
+  MessageId,
   ProjectId,
   ThreadId,
   type OrchestrationCommand,
   type OrchestrationEvent,
+  type OrchestrationReadModel,
+  type OrchestrationThread,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -213,5 +216,177 @@ it.layer(NodeServices.layer)("decider deletion flows", (it) => {
 
       expect(normalizeDeleteEvent(forcedResult)).toEqual(normalizeDeleteEvent(sequentialEvents));
     }),
+  );
+});
+
+// ── Idle-required delete (flow-instance retention) ───────────────
+
+const IDLE_NOW = "2026-01-01T00:00:00.000Z";
+
+function makeIdleGuardReadModel(input: {
+  readonly sessionStatus?: "starting" | "running" | "stopped" | null;
+  readonly activities?: OrchestrationThread["activities"];
+  readonly messages?: OrchestrationThread["messages"];
+}): OrchestrationReadModel {
+  return {
+    snapshotSequence: 0,
+    projects: [],
+    threads: [
+      {
+        id: asThreadId("thread-idle-guard"),
+        projectId: asProjectId("project-delete"),
+        title: "Flow Instance Session",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        branch: null,
+        worktreePath: "/wt/instance",
+        latestTurn: null,
+        createdAt: IDLE_NOW,
+        updatedAt: IDLE_NOW,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        snoozedUntil: null,
+        snoozedAt: null,
+        pinnedAt: null,
+        deletedAt: null,
+        messages: input.messages ?? [],
+        proposedPlans: [],
+        activities: input.activities ?? [],
+        checkpoints: [],
+        session:
+          input.sessionStatus === null || input.sessionStatus === undefined
+            ? null
+            : {
+                threadId: asThreadId("thread-idle-guard"),
+                status: input.sessionStatus,
+                providerName: "Codex",
+                runtimeMode: "full-access",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: IDLE_NOW,
+              },
+      },
+    ],
+    updatedAt: IDLE_NOW,
+  };
+}
+
+const guardActivity = (
+  kind: string,
+  requestId: string,
+): OrchestrationThread["activities"][number] =>
+  ({
+    id: asEventId(`activity-${requestId}-${kind}`),
+    tone: "approval" as const,
+    kind,
+    summary: kind,
+    payload: { requestId },
+    turnId: null,
+    createdAt: IDLE_NOW,
+  }) as OrchestrationThread["activities"][number];
+
+const guardUserMessage = (createdAt: string): OrchestrationThread["messages"][number] =>
+  ({
+    id: MessageId.make(`message-${createdAt}`),
+    role: "user",
+    text: "one more thing",
+    turnId: null,
+    streaming: false,
+    createdAt,
+    updatedAt: createdAt,
+  }) as OrchestrationThread["messages"][number];
+
+it.layer(NodeServices.layer)("decider idle-required thread delete", (it) => {
+  it.effect("rejects an idle-required delete into a running or starting session", () =>
+    Effect.gen(function* () {
+      for (const status of ["starting", "running"] as const) {
+        const error = yield* Effect.flip(
+          decideOrchestrationCommand({
+            command: {
+              type: "thread.delete",
+              commandId: asCommandId(`cmd-idle-delete-${status}`),
+              threadId: asThreadId("thread-idle-guard"),
+              requireIdle: true,
+            },
+            readModel: makeIdleGuardReadModel({ sessionStatus: status }),
+          }),
+        );
+        expect(error._tag).toBe("OrchestrationCommandInvariantError");
+        expect(error.message).toContain("cannot be deleted while idle-required");
+      }
+    }),
+  );
+
+  it.effect("rejects an idle-required delete behind an open human request or queued turn", () =>
+    Effect.gen(function* () {
+      // Open approval request.
+      const approvalError = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "thread.delete",
+            commandId: asCommandId("cmd-idle-delete-approval"),
+            threadId: asThreadId("thread-idle-guard"),
+            requireIdle: true,
+          },
+          readModel: makeIdleGuardReadModel({
+            activities: [guardActivity("approval.requested", "req-1")],
+          }),
+        }),
+      );
+      expect(approvalError._tag).toBe("OrchestrationCommandInvariantError");
+
+      // A queued turn start: a user message no turn has picked up yet, inside
+      // the adoption grace window (the decider's clock here is the Effect
+      // test clock, pinned to the epoch).
+      const queuedError = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "thread.delete",
+            commandId: asCommandId("cmd-idle-delete-queued"),
+            threadId: asThreadId("thread-idle-guard"),
+            requireIdle: true,
+          },
+          readModel: makeIdleGuardReadModel({
+            messages: [guardUserMessage("1969-12-31T23:59:30.000Z")],
+          }),
+        }),
+      );
+      expect(queuedError._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
+  it.effect(
+    "deletes an idle thread when the precondition passes, and keeps plain deletes unconditional",
+    () =>
+      Effect.gen(function* () {
+        // Idle: a stopped session, no open requests, no queued turn — the
+        // precondition passes and the delete lands.
+        const decided = yield* decideOrchestrationCommand({
+          command: {
+            type: "thread.delete",
+            commandId: asCommandId("cmd-idle-delete-ok"),
+            threadId: asThreadId("thread-idle-guard"),
+            requireIdle: true,
+          },
+          readModel: makeIdleGuardReadModel({ sessionStatus: "stopped" }),
+        });
+        const decidedEvents = Array.isArray(decided) ? decided : [decided];
+        expect(decidedEvents[0]?.type).toBe("thread.deleted");
+
+        // A plain (user-driven) delete stays UNCONDITIONAL: deleting a stuck
+        // running thread remains the user's escape hatch.
+        const userDelete = yield* decideOrchestrationCommand({
+          command: {
+            type: "thread.delete",
+            commandId: asCommandId("cmd-user-delete"),
+            threadId: asThreadId("thread-idle-guard"),
+          },
+          readModel: makeIdleGuardReadModel({ sessionStatus: "running" }),
+        });
+        const userDeleteEvents = Array.isArray(userDelete) ? userDelete : [userDelete];
+        expect(userDeleteEvents[0]?.type).toBe("thread.deleted");
+      }),
   );
 });

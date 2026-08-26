@@ -2,27 +2,36 @@
  * FlowSessionFinalization — the flow-end intake and pending-finalization
  * driver (Project Service flow session finalization design).
  *
- * Project Service 0.11.0 has no push notification for a flow instance
- * reaching a terminal state, so the terminal notification is DERIVED exactly
- * the way work notices already are (a trigger, never a verbatim payload):
- * each sweep queries the authoritative instance list, and an instance whose
- * terminal marker (`ended`) has appeared since the last observation IS the
- * notification. Its event identity is deterministic —
- * `flow-ended:<instanceId>:<completedByEventId>` — so re-observing the same
- * terminal instance (duplicate sweeps, restarts) is the duplicate
- * notification the eventId idempotency absorbs: the durable
- * (instanceId, agentId) ledger row is the ACK state, written BEFORE anything
- * is driven, so a process exit after the ACK can never lose the finalization
- * — the pending row replays at the next startup sweep.
+ * Project Service 0.11.0 has no push surface for a flow instance reaching a
+ * terminal state, so the terminal observation is the authoritative instance
+ * LIST itself (the formal contract, not a degraded fallback): each sweep
+ * polls `GET /:id/flow/instances`, and an instance whose terminal marker
+ * (`ended`) appears IS the event. Its identity is deterministic —
+ * `flow-ended:<instanceId>:<completedByEventId>` — so a re-observation
+ * (duplicate sweeps, restarts) is the SAME event, and the ledger's
+ * (event_id, agent_id) uniqueness absorbs it: the durable row, written
+ * BEFORE anything is driven, is the commit point (no PS ACK exists or is
+ * required); a process exit after it cannot lose the finalization — the
+ * pending row replays at the next startup sweep.
  *
- * Intake associates the instance with this consumer's sessions two ways: the
- * live routing registry (the in-memory per-key session), and — because a
- * restart empties that registry — the instance's managed worktree: the runs
- * PS still reports for the instance name the worktree, and the thread bound
- * to it (with the agent stamped) is the session that ran the instance's
- * work. No session at all records the event as a successful no-op — but only
- * when both association paths were actually readable; a degraded read skips
- * (the next sweep retries) rather than recording a premature no-op.
+ * Intake associates the instance with this consumer's sessions in restart-
+ * safe order:
+ *
+ * 1. the live routing registry (the in-memory per-key session);
+ * 2. the persistent instance→thread association ledger, recorded by the
+ *    routing path while the instance's work was still open — the Project
+ *    Service's run lists only answer OPEN runs, so after the run closes no
+ *    live API can recover this fact. The persisted thread is corrected
+ *    against current facts (it must still exist and carry this agent's
+ *    stamp) before it is trusted;
+ * 3. the open-run worktree scan, which only ever fires when a run is
+ *    genuinely still open (a terminal observation racing live work).
+ *
+ * No association fact at all records the event as a successful no-op — but
+ * only when every path was actually readable; a degraded read skips (the
+ * next sweep retries) rather than recording a premature no-op, and a
+ * recorded no-op stays overturnable: a late association fact upgrades the
+ * same event's row back to pending and re-drives it.
  *
  * @module FlowSessionFinalization
  */
@@ -86,13 +95,13 @@ export interface FlowSessionFinalizationDeps {
       readonly eventId: string;
       readonly threadId: string | null;
       readonly createdAt: string;
-    }) => Effect.Effect<"recorded" | "exists", FlowFinalizationDependencyError>;
+    }) => Effect.Effect<"recorded" | "exists" | "upgraded", FlowFinalizationDependencyError>;
     readonly listPending: () => Effect.Effect<
       ReadonlyArray<ProjectFlowFinalizationRecord>,
       FlowFinalizationDependencyError
     >;
     readonly markDone: (input: {
-      readonly instanceId: string;
+      readonly eventId: string;
       readonly agentId: string;
       readonly resolvedAt: string;
     }) => Effect.Effect<void, FlowFinalizationDependencyError>;
@@ -103,11 +112,19 @@ export interface FlowSessionFinalizationDeps {
     ReadonlyArray<ProjectWorkSessionSnapshot>,
     FlowFinalizationDependencyError
   >;
-  /** All thread shells (the restart-safe worktree→session association scan). */
+  /** All thread shells (current-fact correction of persisted associations). */
   readonly readThreadShells: Effect.Effect<
     ReadonlyArray<OrchestrationThreadShell>,
     FlowFinalizationDependencyError
   >;
+  /**
+   * The persistent instance→thread association ledger — the restart-safe
+   * association fact the routing path recorded while the work was open.
+   */
+  readonly resolveSessionRoute: (input: {
+    readonly instanceId: string;
+    readonly agentId: string;
+  }) => Effect.Effect<string | null, FlowFinalizationDependencyError>;
   /** The finalization drive itself (owned by the session router). */
   readonly finalizeFlowInstance: (
     input: FlowInstanceFinalizationInput,
@@ -119,7 +136,7 @@ export interface FlowSessionFinalizationDeps {
 export interface FlowSessionFinalization {
   /**
    * One intake pass (sweep cadence): enumerate Project Service projects,
-   * derive terminal notifications for instances whose `ended` marker
+   * derive terminal observations for instances whose `ended` marker
    * appeared, associate sessions, and record finalizations idempotently.
    * Never fails.
    */
@@ -136,12 +153,38 @@ const projectEnabledAgents = (settings: ServerSettings): ReadonlyArray<string> =
     .map(([agentId]) => agentId);
 
 /**
- * The session thread associated with a terminal instance for one agent: the
- * live registry entry first (the instance's own when one exists, else the
- * project-scope session that works every instance), then the worktree scan —
- * the instance's managed worktree, resolved from the runs PS still reports,
- * matches the thread bound to it with this agent stamped. That scan is what
- * survives a restart, which is exactly when the registry cannot help.
+ * Validate a persisted association against CURRENT facts: the recorded thread
+ * must still exist and still carry this agent's stamp. A deleted thread
+ * invalidates the association (the intake then records the no-op); an
+ * archived one stays associated — the drive itself treats gone/archived as
+ * completed. Rebinding needs no separate check here: the DRIVE recomputes
+ * the workspace binding from current open work, so a late old-flow
+ * association can never pull a re-bound session back.
+ */
+const persistedRouteThread = (
+  threadId: string | null,
+  agentId: string,
+  threadShells: ReadonlyArray<OrchestrationThreadShell>,
+): string | null => {
+  if (threadId === null) {
+    return null;
+  }
+  const shell = threadShells.find((candidate) => candidate.id === threadId);
+  if (shell === undefined) {
+    return null;
+  }
+  return shell.logicalAgentId === agentId ? shell.id : null;
+};
+
+/**
+ * The session thread associated with a terminal instance for one agent:
+ * the live registry entry first (the instance's own when one exists, else the
+ * project-scope session that works every instance), then the persisted
+ * instance→thread association corrected against current thread facts, then —
+ * only for genuinely still-open work racing the terminal observation — the
+ * open-run worktree scan. The persisted association is what survives a
+ * restart AND the run's closure, which is exactly when both other paths are
+ * empty.
  */
 const findAssociatedThread = (
   instanceId: string,
@@ -150,6 +193,7 @@ const findAssociatedThread = (
   sessions: ReadonlyArray<ProjectWorkSessionSnapshot>,
   threadShells: ReadonlyArray<OrchestrationThreadShell>,
   runs: ReadonlyArray<ProjectWorkRunRecord>,
+  persistedRoute: string | null,
 ): string | null => {
   const registryMatch =
     sessions.find(
@@ -166,6 +210,9 @@ const findAssociatedThread = (
     );
   if (registryMatch !== undefined) {
     return registryMatch.threadId;
+  }
+  if (persistedRoute !== null) {
+    return persistedRoute;
   }
   const instanceWorktree = runs.find(
     (run) =>
@@ -220,7 +267,7 @@ export const makeFlowSessionFinalization = (
     }
     const marked = yield* deps.store
       .markDone({
-        instanceId: row.instanceId,
+        eventId: row.eventId,
         agentId: row.agentId,
         resolvedAt: yield* deps.nowIso,
       })
@@ -254,16 +301,16 @@ export const makeFlowSessionFinalization = (
         yield* Effect.logDebug("flow finalization intake could not list Project Service projects");
         return;
       }
-      // The thread-shell scan is what makes intake restart-safe; without it a
-      // no-op record could strand a discoverable session, so a failed read
-      // skips the whole pass rather than recording premature no-ops.
+      // The thread-shell scan is what corrects persisted associations; and
+      // without it the worktree scan cannot run either — a failed read skips
+      // the whole pass rather than recording premature no-ops.
       const threadShells = yield* deps.readThreadShells.pipe(Effect.result);
       if (threadShells._tag === "Failure") {
         yield* Effect.logDebug("flow finalization intake could not read thread shells");
         return;
       }
       // The registry view is the fast path only; a failed read reads as "no
-      // registry" (the scan still associates).
+      // registry" (the persisted association still associates).
       const sessions = yield* deps.snapshotSessions.pipe(
         Effect.result,
         Effect.map((read) => (read._tag === "Success" ? read.success : [])),
@@ -280,7 +327,7 @@ export const makeFlowSessionFinalization = (
         }
         // `ended` is terminal — the instances to finalize. The eventId is
         // derived from the terminal marker, so every re-observation of the
-        // same ended instance is the SAME notification.
+        // same ended instance is the SAME event.
         const ended = instances.success.filter(
           (instance) => instance.ended !== null && instance.instanceId.trim().length > 0,
         );
@@ -307,6 +354,22 @@ export const makeFlowSessionFinalization = (
             continue;
           }
           for (const instance of ended) {
+            // The persisted association (restart-safe): read it, then correct
+            // it against the current thread facts. An unreadable ledger skips
+            // the instance — a missing row and a failed read must not blur.
+            const route = yield* deps
+              .resolveSessionRoute({
+                instanceId: instance.instanceId,
+                agentId,
+              })
+              .pipe(Effect.result);
+            if (route._tag === "Failure") {
+              yield* Effect.logDebug(
+                "flow finalization intake could not read the session-route ledger; retrying on the next sweep",
+                { instanceId: instance.instanceId, agentId },
+              );
+              continue;
+            }
             const threadId = findAssociatedThread(
               instance.instanceId,
               agentId,
@@ -314,10 +377,11 @@ export const makeFlowSessionFinalization = (
               sessions,
               threadShells.success,
               runs.success,
+              persistedRouteThread(route.success, agentId, threadShells.success),
             );
             // Record BEFORE driving (and before any no-op): the durable row
-            // is both the eventId idempotency and the ACK — once written, a
-            // process exit cannot lose the finalization.
+            // is both the eventId idempotency and the commit point — once
+            // written, a process exit cannot lose the finalization.
             const recorded = yield* deps.store
               .record({
                 instanceId: instance.instanceId,
@@ -333,6 +397,23 @@ export const makeFlowSessionFinalization = (
                 "flow finalization intake could not record its ledger row; retrying on the next sweep",
                 { instanceId: instance.instanceId, agentId },
               );
+            } else if (recorded.success === "upgraded") {
+              // A premature no-op just gained its session: drive it now
+              // rather than waiting for the next sweep tick.
+              yield* Effect.logInfo(
+                "flow finalization no-op overturned by a late session association",
+                { instanceId: instance.instanceId, agentId },
+              );
+              yield* driveRow({
+                instanceId: instance.instanceId,
+                agentId,
+                psProjectId: project.projectId,
+                eventId: flowInstanceEndedEventId(instance),
+                threadId,
+                state: "pending",
+                createdAt: "",
+                resolvedAt: null,
+              });
             }
           }
         }

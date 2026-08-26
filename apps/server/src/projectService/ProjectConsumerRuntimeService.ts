@@ -358,6 +358,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
     });
 
     const finalizationStore = yield* ProjectFlowFinalizationStore.ProjectFlowFinalizationStore;
+    const sessionRouteStore = yield* ProjectFlowFinalizationStore.ProjectFlowSessionRouteStore;
 
     // A Work-path credential rejection must reach the integration status
     // (the WS handshake may still succeed while facet calls are rejected).
@@ -438,13 +439,22 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
           });
           return runs.filter((run) => run.state === "open");
         }).pipe(Effect.tapError(noteWorkPathCredentialError), Effect.mapError(workQueryFailure)),
+      // The durable instance→thread association, written at every aggregate
+      // delivery (see deliverAggregate): the only association fact that
+      // survives the run's closure and a registry-emptying restart.
+      recordFlowSessionRoute: (input) =>
+        Effect.flatMap(Effect.map(DateTime.now, DateTime.formatIso), (updatedAt) =>
+          sessionRouteStore
+            .record({ ...input, updatedAt })
+            .pipe(Effect.mapError(() => internal("flow session route could not be persisted"))),
+        ),
       nowIso: Effect.map(DateTime.now, DateTime.formatIso),
       newId: crypto.randomUUIDv4.pipe(Effect.orDie),
     });
 
     // ── Flow session finalization (flow-end design) ────────────────
-    // The intake derives terminal notifications from the authoritative
-    // instance list; the durable ledger keeps ACKed finalizations across
+    // The intake derives terminal observations from the authoritative
+    // instance list; the durable ledger keeps recorded finalizations across
     // restarts. Drives ride the sweep cadence, thread events (turn ends),
     // and the first sweep tick after startup (the pending-row replay).
     const finalizationReadFailure =
@@ -477,6 +487,17 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
               ),
             ),
       },
+      // The restart-safe association read: the durable instance→thread row
+      // the routing path recorded while the instance's work was open. Read
+      // failures surface as store degradation so the intake skips (and
+      // retries) instead of recording an overturnable-but-premature no-op.
+      resolveSessionRoute: (input) =>
+        sessionRouteStore.find(input).pipe(
+          Effect.map((route) => (route === null ? null : route.threadId)),
+          Effect.mapError((error) =>
+            finalizationReadFailure("store")(`session route read failed (${error._tag})`),
+          ),
+        ),
       readSettings: serverSettings.getSettings.pipe(
         Effect.mapError(() => finalizationReadFailure("settings")("settings could not be read")),
       ),

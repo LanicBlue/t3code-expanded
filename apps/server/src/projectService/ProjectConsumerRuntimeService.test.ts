@@ -475,8 +475,22 @@ const makeFakes = (
       {
         record: (input: ProjectFlowFinalizationStore.RecordProjectFlowFinalizationInput) =>
           Effect.sync(() => {
-            const key = `${input.instanceId}\n${input.agentId}`;
-            if (finalizationRows.has(key)) {
+            const key = `${input.eventId}\n${input.agentId}`;
+            const existing = finalizationRows.get(key);
+            if (existing !== undefined) {
+              if (
+                input.threadId !== null &&
+                existing.threadId === null &&
+                existing.state === "done"
+              ) {
+                finalizationRows.set(key, {
+                  ...existing,
+                  threadId: input.threadId,
+                  state: "pending",
+                  resolvedAt: null,
+                });
+                return "upgraded" as const;
+              }
               return "exists" as const;
             }
             finalizationRows.set(key, {
@@ -490,13 +504,31 @@ const makeFakes = (
           Effect.succeed([...finalizationRows.values()].filter((row) => row.state === "pending")),
         markDone: (input: ProjectFlowFinalizationStore.MarkProjectFlowFinalizationDoneInput) =>
           Effect.sync(() => {
-            const key = `${input.instanceId}\n${input.agentId}`;
+            const key = `${input.eventId}\n${input.agentId}`;
             const row = finalizationRows.get(key);
             if (row !== undefined && row.state === "pending") {
               finalizationRows.set(key, { ...row, state: "done", resolvedAt: input.resolvedAt });
             }
           }),
       } as unknown as ProjectFlowFinalizationStore.ProjectFlowFinalizationStore["Service"],
+    );
+
+    // In-memory session-route ledger: the persisted instance→thread
+    // association the delivery path writes and the finalization intake reads.
+    const sessionRoutes = new Map<
+      string,
+      ProjectFlowFinalizationStore.ProjectFlowSessionRouteRecord
+    >();
+    const sessionRouteStoreLayer = Layer.succeed(
+      ProjectFlowFinalizationStore.ProjectFlowSessionRouteStore,
+      {
+        record: (input: ProjectFlowFinalizationStore.RecordProjectFlowSessionRouteInput) =>
+          Effect.sync(() => {
+            sessionRoutes.set(`${input.instanceId}\n${input.agentId}`, input);
+          }),
+        find: (input: ProjectFlowFinalizationStore.FindProjectFlowSessionRouteInput) =>
+          Effect.succeed(sessionRoutes.get(`${input.instanceId}\n${input.agentId}`) ?? null),
+      } as unknown as ProjectFlowFinalizationStore.ProjectFlowSessionRouteStore["Service"],
     );
 
     const configLayer = Layer.fresh(
@@ -519,6 +551,7 @@ const makeFakes = (
       Layer.provideMerge(registryLayer),
       Layer.provideMerge(workClientLayer),
       Layer.provideMerge(finalizationStoreLayer),
+      Layer.provideMerge(sessionRouteStoreLayer),
       Layer.provideMerge(settingsLayer),
       // Platform services folded in so each it.live test provides one layer.
       Layer.provideMerge(Layer.mergeAll(NodeServices.layer, FetchHttpClient.layer)),
