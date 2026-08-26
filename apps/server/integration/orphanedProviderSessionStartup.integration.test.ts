@@ -87,7 +87,12 @@ const startupDependencies = Layer.mergeAll(
       routeWake: () => Effect.die("unused"),
       onThreadEvent: () => Effect.void,
       reconcileOpenWork: () => Effect.void,
+      dropProjectSessions: () => Effect.void,
       snapshotSessions: Effect.succeed([]),
+    },
+    retirement: {
+      handleRetiredNotice: () => Effect.die("unused"),
+      resumePending: Effect.void,
     },
   }),
   ServerLifecycleEvents.layer,
