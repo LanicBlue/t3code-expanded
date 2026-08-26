@@ -88,12 +88,17 @@ const startupDependencies = Layer.mergeAll(
       onThreadEvent: () => Effect.void,
       reconcileOpenWork: () => Effect.void,
       finalizeFlowInstance: () => Effect.succeed({ kind: "completed" }),
+      dropProjectSessions: () => Effect.void,
       snapshotSessions: Effect.succeed([]),
     },
     finalization: {
       intakeSweep: () => Effect.void,
       drivePending: () => Effect.void,
       drivePendingForThread: () => Effect.void,
+    },
+    retirement: {
+      handleRetiredNotice: () => Effect.die("unused"),
+      resumePending: Effect.void,
     },
   }),
   ServerLifecycleEvents.layer,

@@ -53,6 +53,7 @@ import * as Stream from "effect/Stream";
 
 import packageJson from "../../package.json" with { type: "json" };
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ServerConfig from "../config.ts";
 import type { OrchestrationDispatchError } from "../orchestration/Errors.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -68,6 +69,12 @@ import {
   makeFlowSessionFinalization,
   type FlowSessionFinalization,
 } from "./FlowSessionFinalization.ts";
+import {
+  makeFileProjectRetirementLedgerStore,
+  makeProjectRetirementHandler,
+  type ProjectRetiredNoticeInput,
+  type ProjectRetirementHandler,
+} from "./ProjectRetirement.ts";
 import * as ProjectServiceWorkClient from "./ProjectServiceWorkClient.ts";
 import {
   makeProjectWorkSessionRouter,
@@ -152,6 +159,8 @@ export interface ProjectConsumerRuntimeServiceShape {
    * and the startup replay of the durable pending ledger.
    */
   readonly finalization: FlowSessionFinalization;
+  /** The `project.retired` cleanup; intake goes through the SDK adapter. */
+  readonly retirement: ProjectRetirementHandler;
 }
 
 export class ProjectConsumerRuntimeService extends Context.Service<
@@ -256,12 +265,47 @@ const routeProjectConsumerWake = Effect.fn("ProjectConsumerRuntime.wakeAgent")(f
     .pipe(Effect.mapError((error) => new RuntimeConsumerWakeError(error.code, error.detail)));
 });
 
+/**
+ * The `project.retired` intake. Resolving is the ACK — only a fully cleaned
+ * project resolves. A `waiting` outcome (a session has not reached a safe
+ * idle state yet) rejects with AGENT_BUSY so the Project Service redelivers;
+ * the local resume pass finishes the cleanup on its own in the meantime.
+ */
+const routeProjectConsumerRetirement = Effect.fn("ProjectConsumerRuntime.projectRetired")(
+  function* (retirement: ProjectRetirementHandler, input: ProjectRetiredNoticeInput) {
+    const outcome = yield* retirement
+      .handleRetiredNotice(input)
+      .pipe(Effect.mapError((error) => new RuntimeConsumerWakeError(error.code, error.detail)));
+    if (outcome.status === "waiting") {
+      return yield* Effect.fail(
+        new RuntimeConsumerWakeError(
+          "AGENT_BUSY",
+          `Project Service project ${input.projectId} still has work sessions that have not reached a safe idle state`,
+        ),
+      );
+    }
+  },
+);
+
+/**
+ * The SDK's adapter surface plus the retirement hook this server is ready to
+ * answer. The vendored SDK generation does not call `projectRetired` yet —
+ * the Project Service side of the notice (and the SDK delivery/ACK frames
+ * for it) is tracked separately; the method is in place so that upgrade is a
+ * no-op here.
+ */
+type RetirementAwareConsumerAdapter = RuntimeConsumerAdapter & {
+  readonly projectRetired: (input: ProjectRetiredNoticeInput) => Promise<void>;
+};
+
 const consumerAdapter = (
   serverSettings: ServerSettings.ServerSettingsService["Service"],
   router: ProjectWorkSessionRouter,
-): RuntimeConsumerAdapter => ({
+  retirement: ProjectRetirementHandler,
+): RetirementAwareConsumerAdapter => ({
   listAgents: () => Effect.runPromise(listProjectConsumerAgents(serverSettings)),
   wakeAgent: (input) => Effect.runPromise(routeProjectConsumerWake(router, input)),
+  projectRetired: (input) => Effect.runPromise(routeProjectConsumerRetirement(retirement, input)),
 });
 
 // ── Runtime status callbacks (module-level: Effect.runSync stays outside Effect code) ──
@@ -336,6 +380,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
   Effect.gen(function* () {
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const secretStore = yield* ServerSecretStore.ServerSecretStore;
+    const serverConfig = yield* ServerConfig.ServerConfig;
     const engine = yield* OrchestrationEngine.OrchestrationEngineService;
     const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
     const instanceRegistry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
@@ -554,11 +599,81 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       },
     });
 
+    // ── Project retirement cleanup (`project.retired`) ─────────────
+    // Same seam vocabulary as the router above; the ledger is the local
+    // durable commit point (a pending record survives a restart and resumes
+    // without the notice ever re-firing).
+    const retirementLedger = yield* makeFileProjectRetirementLedgerStore(
+      pathService.join(serverConfig.stateDir, "project-service", "retirement-ledger.json"),
+    ).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, pathService),
+    );
+    const retirement = yield* makeProjectRetirementHandler({
+      loadLedger: retirementLedger.load,
+      storeLedger: retirementLedger.store,
+      // The plan includes archived shells, so the executor must read them too
+      // — a None here must genuinely mean the thread is gone, or an archived
+      // session would be ACKed as deleted without ever dispatching
+      // thread.delete.
+      readThreadShell: (threadId) =>
+        snapshotQuery
+          .getThreadShellByIdIncludingArchived(threadId)
+          .pipe(Effect.mapError(() => internal("thread projection could not be read"))),
+      // The durable session scan: routed shells (logicalAgentId set) in the
+      // resolved T3 project, archived ones included.
+      listProjectThreadShells: (projectId) =>
+        Effect.gen(function* () {
+          const active = yield* snapshotQuery.getShellSnapshot();
+          const archived = yield* snapshotQuery.getArchivedShellSnapshot();
+          return [...active.threads, ...archived.threads].filter(
+            (thread) => thread.projectId === projectId,
+          );
+        }).pipe(Effect.mapError(() => internal("thread projection could not be read"))),
+      routingSessions: router.snapshotSessions,
+      dropProjectSessions: router.dropProjectSessions,
+      listProjectServiceProjects: workClient.listProjects().pipe(
+        Effect.map((projects) =>
+          projects.map((project) => ({
+            projectId: project.projectId,
+            workspaceDir: project.workspaceDir,
+          })),
+        ),
+        Effect.mapError(workQueryFailure),
+      ),
+      normalizeWorkspaceDir: (workspaceDir) =>
+        workspacePaths.normalizeWorkspaceRoot(workspaceDir).pipe(
+          Effect.flatMap((normalized) => canonicalWorkspaceDir(normalized)),
+          Effect.mapError(workspaceDirFailure),
+        ),
+      getActiveProjectByWorkspaceRoot: (workspaceRoot) =>
+        snapshotQuery
+          .getActiveProjectByWorkspaceRoot(workspaceRoot)
+          .pipe(Effect.mapError(() => internal("project projection could not be read"))),
+      canonicalizeWorkspaceRoot: (workspaceRoot) => canonicalWorkspaceDir(workspaceRoot),
+      listActiveProjectRoots: () =>
+        snapshotQuery.getSnapshot().pipe(
+          Effect.map((snapshot) =>
+            snapshot.projects
+              .filter((project) => project.deletedAt === null)
+              .map((project) => ({
+                projectId: project.id,
+                workspaceRoot: project.workspaceRoot,
+              })),
+          ),
+          Effect.mapError(() => internal("project projection could not be read")),
+        ),
+      dispatchCommand: (command) =>
+        engine.dispatch(command).pipe(Effect.asVoid, Effect.mapError(dispatchFailure)),
+      nowIso: Effect.map(DateTime.now, DateTime.formatIso),
+      newId: crypto.randomUUIDv4.pipe(Effect.orDie),
+    });
+
     // ── SDK runtime lifecycle ─────────────────────────────────────
 
     const runtimeRef = yield* Ref.make<ProjectConsumerRuntime | null>(null);
     const runtimeSignatureRef = yield* Ref.make<string | null>(null);
-    const adapter = consumerAdapter(serverSettings, router);
+    const adapter = consumerAdapter(serverSettings, router, retirement);
 
     // Set while the SERVICE closes a runtime itself (replace, disable,
     // finalizer) so the runtime's synchronous `stopped` callback can tell an
@@ -774,6 +889,9 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
           });
         }
       }
+      // Retirement cleanups blocked on a safe idle state also get their
+      // retry here — the sweep is the backstop when no thread event fires.
+      yield* retirement.resumePending;
     });
 
     const statusCallbacks = runtimeStatusCallbacks(statusRef, {
@@ -802,15 +920,29 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         // need no restart — inventory is answered live from settings.
         const changes = yield* serverSettings.subscribeChanges;
         yield* forkParked(Stream.runForEach(changes, () => syncRuntime));
+        // Restart recovery for retirement cleanups: a pending ledger record
+        // predates this process and its notice may never re-fire. The pass is
+        // local-only (deletions and the ledger), so it runs regardless of the
+        // channel state.
+        yield* retirement.resumePending.pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Project retirement resume failed at startup", {
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
         // Turn-finish observation: the engine's domain events drive the
-        // coalesced post-turn aggregate deliveries, and wake pending flow
-        // finalizations whose session was waiting on the turn's end.
+        // coalesced post-turn aggregate deliveries, wake pending flow
+        // finalizations whose session was waiting on the turn's end, and
+        // retry a retirement blocked on a session's safe idle state the
+        // moment that turn ends.
         yield* forkParked(
           Stream.runForEach(engine.streamDomainEvents, (event) =>
             event.aggregateKind === "thread"
               ? Effect.gen(function* () {
                   yield* router.onThreadEvent(ThreadId.make(event.aggregateId));
                   yield* finalization.drivePendingForThread(event.aggregateId);
+                  yield* retirement.resumePending;
                 })
               : Effect.void,
           ),
@@ -836,6 +968,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       getStatus: Ref.get(statusRef),
       router,
       finalization,
+      retirement,
     } satisfies ProjectConsumerRuntimeServiceShape;
   });
 

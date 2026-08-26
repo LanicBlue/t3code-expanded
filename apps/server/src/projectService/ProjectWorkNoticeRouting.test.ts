@@ -827,6 +827,31 @@ it.effect("second wake REUSES the created project — no second create", () =>
   }),
 );
 
+it.effect(
+  "dropProjectSessions clears one project's routing; the next wake starts a new session",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(makeSettings());
+      yield* wake(harness.router);
+      const [created] = threadCreates(harness.commands);
+      const firstThreadId = created?.type === "thread.create" ? created.threadId : undefined;
+      assert.isDefined(firstThreadId);
+
+      // The retirement wipe: every entry for the Project Service project is
+      // gone, exactly as a restart would leave the registry.
+      yield* harness.router.dropProjectSessions(PS_PROJECT_ID);
+      assert.isEmpty(yield* harness.router.snapshotSessions);
+
+      // Work arriving afterwards routes into a FRESH session thread.
+      yield* wake(harness.router);
+      const [, second] = threadCreates(harness.commands);
+      const secondThreadId = second?.type === "thread.create" ? second.threadId : undefined;
+      assert.isDefined(secondThreadId);
+      assert.notStrictEqual(secondThreadId, firstThreadId);
+      assert.lengthOf(projectCreates(harness.commands), 1);
+    }),
+);
+
 it.effect("existing active project at the root is REUSED across wakes", () =>
   Effect.gen(function* () {
     const harness = yield* makeHarness(makeSettings());

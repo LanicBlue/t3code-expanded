@@ -1,6 +1,7 @@
 import {
   CheckpointRef,
   EventId,
+  LogicalAgentId,
   MessageId,
   ProjectId,
   ThreadId,
@@ -591,6 +592,165 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       );
       assert.equal(archivedShellSnapshot.threads[0]?.archivedAt, "2026-04-06T00:00:06.000Z");
     }),
+  );
+
+  it.effect(
+    "reads archived thread shells for the retirement executor while navigation reads stay hidden",
+    () =>
+      Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+
+        yield* sql`DELETE FROM projection_projects`;
+        yield* sql`DELETE FROM projection_threads`;
+        yield* sql`DELETE FROM projection_state`;
+
+        yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'project-retire-test',
+          'Retire Test',
+          '/tmp/retire-test',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          '[]',
+          '2026-04-06T00:00:00.000Z',
+          '2026-04-06T00:00:01.000Z',
+          NULL
+        )
+      `;
+
+        yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          logical_agent_id,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          latest_user_message_at,
+          pending_approval_count,
+          pending_user_input_count,
+          has_actionable_proposed_plan,
+          created_at,
+          updated_at,
+          archived_at,
+          deleted_at
+        )
+        VALUES
+          (
+            'thread-routed-active',
+            'project-retire-test',
+            'Active Routed',
+            'ag_primary',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            '2026-04-06T00:00:02.000Z',
+            '2026-04-06T00:00:03.000Z',
+            NULL,
+            NULL
+          ),
+          (
+            'thread-routed-archived',
+            'project-retire-test',
+            'Archived Routed',
+            'ag_primary',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            '2026-04-06T00:00:04.000Z',
+            '2026-04-06T00:00:05.000Z',
+            '2026-04-06T00:00:06.000Z',
+            NULL
+          ),
+          (
+            'thread-routed-deleted',
+            'project-retire-test',
+            'Deleted Routed',
+            'ag_primary',
+            '{"provider":"codex","model":"gpt-5-codex"}',
+            'full-access',
+            'default',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            '2026-04-06T00:00:07.000Z',
+            '2026-04-06T00:00:08.000Z',
+            NULL,
+            '2026-04-06T00:00:09.000Z'
+          )
+      `;
+
+        // Navigation semantics unchanged: the active-only read hides the
+        // archived shell.
+        const activeById = yield* snapshotQuery.getThreadShellById(
+          ThreadId.make("thread-routed-archived"),
+        );
+        assert.equal(activeById._tag, "None");
+
+        // The retirement executor's read sees the archived shell — shell facts
+        // (archivedAt, the routed logical agent binding) intact.
+        const archivedById = yield* snapshotQuery.getThreadShellByIdIncludingArchived(
+          ThreadId.make("thread-routed-archived"),
+        );
+        assert.equal(archivedById._tag, "Some");
+        if (archivedById._tag === "Some") {
+          assert.equal(archivedById.value.archivedAt, "2026-04-06T00:00:06.000Z");
+          assert.equal(archivedById.value.logicalAgentId, LogicalAgentId.make("ag_primary"));
+          assert.equal(archivedById.value.projectId, asProjectId("project-retire-test"));
+        }
+
+        // Active threads read through both seams; deleted threads through
+        // neither — a miss must prove the thread gone for the executor.
+        assert.equal(
+          (yield* snapshotQuery.getThreadShellById(ThreadId.make("thread-routed-active")))._tag,
+          "Some",
+        );
+        const activeIncluding = yield* snapshotQuery.getThreadShellByIdIncludingArchived(
+          ThreadId.make("thread-routed-active"),
+        );
+        assert.equal(activeIncluding._tag, "Some");
+        if (activeIncluding._tag === "Some") {
+          assert.equal(activeIncluding.value.archivedAt, null);
+        }
+        assert.equal(
+          (yield* snapshotQuery.getThreadShellByIdIncludingArchived(
+            ThreadId.make("thread-routed-deleted"),
+          ))._tag,
+          "None",
+        );
+      }),
   );
 
   it.effect("keeps settled threads in the shell snapshot with non-null settlement fields", () =>

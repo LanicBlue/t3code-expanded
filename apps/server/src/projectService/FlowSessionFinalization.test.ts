@@ -104,6 +104,7 @@ const registrySession = (
   phase: "idle",
   pendingWork: false,
   boundWorktreePath: null,
+  workspaceDir: null,
 });
 
 const settings = (): ServerSettings =>

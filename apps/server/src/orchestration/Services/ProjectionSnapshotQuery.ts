@@ -164,6 +164,18 @@ export interface ProjectionSnapshotQueryShape {
   ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
 
   /**
+   * Read a single thread shell row by id, archived threads included.
+   *
+   * Deletion planners that sweep archived shells (the Project Service
+   * retirement cleanup) must still see them to delete them; the plain
+   * `getThreadShellById` hides archived threads from navigation callers.
+   * Deleted threads stay invisible — a None here is a proven-gone thread.
+   */
+  readonly getThreadShellByIdIncludingArchived: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<OrchestrationThreadShell>, ProjectionRepositoryError>;
+
+  /**
    * Read a single active thread detail snapshot by id.
    */
   readonly getThreadDetailById: (

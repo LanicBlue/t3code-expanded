@@ -94,6 +94,8 @@ const snapshotQueryLayer = Layer.succeed(ProjectionSnapshotQuery.ProjectionSnaps
   getFullThreadDiffContext: () => Effect.die("unused"),
   getThreadShellById: (id) =>
     Effect.succeed(id === threadId ? Option.some(threadShell) : Option.none()),
+  getThreadShellByIdIncludingArchived: (id) =>
+    Effect.succeed(id === threadId ? Option.some(threadShell) : Option.none()),
   getThreadDetailById: () => Effect.die("unused"),
   getThreadDetailSnapshot: () => Effect.die("unused"),
   searchThreads: () => Effect.die("unused"),

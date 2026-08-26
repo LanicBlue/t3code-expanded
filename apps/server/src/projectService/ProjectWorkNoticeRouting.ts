@@ -454,6 +454,8 @@ export interface ProjectWorkSessionSnapshot {
   readonly pendingWork: boolean;
   /** The worktree the session's thread is bound to (null = project root). */
   readonly boundWorktreePath: string | null;
+  /** The notice workspace directory the session was routed under, if any. */
+  readonly workspaceDir: string | null;
 }
 
 /** Facts one recorded flow-instance finalization carries into its drive. */
@@ -527,6 +529,13 @@ export interface ProjectWorkSessionRouter {
   readonly finalizeFlowInstance: (
     input: FlowInstanceFinalizationInput,
   ) => Effect.Effect<FlowInstanceFinalizationOutcome>;
+  /**
+   * Clear EVERY registry entry routed for one Project Service project — the
+   * retirement cleanup's routing wipe. The next wake for the project then
+   * starts a fresh session (the missing-session path), exactly as it would
+   * after a restart. Never fails.
+   */
+  readonly dropProjectSessions: (projectId: string) => Effect.Effect<void>;
   /** Test/observability view of the current-session registry. */
   readonly snapshotSessions: Effect.Effect<ReadonlyArray<ProjectWorkSessionSnapshot>>;
 }
@@ -1833,9 +1842,27 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         phase: session.phase,
         pendingWork: session.pendingWork,
         boundWorktreePath: session.boundWorktreePath,
+        workspaceDir: session.input.workspaceDir ?? null,
       })),
     ),
   );
 
-  return { routeWake, onThreadEvent, reconcileOpenWork, finalizeFlowInstance, snapshotSessions };
+  const dropProjectSessions = (projectId: string): Effect.Effect<void> =>
+    Ref.modify(sessionsRef, (sessions) => {
+      for (const [key, session] of sessions.entries()) {
+        if (session.input.projectId === projectId) {
+          sessions.delete(key);
+        }
+      }
+      return [undefined, sessions];
+    });
+
+  return {
+    routeWake,
+    onThreadEvent,
+    reconcileOpenWork,
+    finalizeFlowInstance,
+    dropProjectSessions,
+    snapshotSessions,
+  };
 });
