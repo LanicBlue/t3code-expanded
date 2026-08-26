@@ -13,6 +13,7 @@ import {
   type CodexSettings,
   ProviderDriverKind,
   type ProviderEvent,
+  EventId,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
   type ProviderRequestKind,
@@ -24,10 +25,14 @@ import {
   type RuntimeTaskUsage,
   ProviderApprovalDecision,
   ThreadId,
+  TurnId,
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -60,6 +65,7 @@ import {
   makeCodexSessionRuntime,
   type CodexSessionRuntimeError,
   type CodexSessionRuntimeOptions,
+  type CodexSessionRuntimeSendTurnInput,
   type CodexSessionRuntimeShape,
 } from "./CodexSessionRuntime.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -95,6 +101,114 @@ interface CodexAdapterSessionContext {
   /** Bound logical agent's role directive from session start, if any. */
   readonly agentPersona?: string | undefined;
   stopped: boolean;
+  /**
+   * Usage-limit recovery state (mirrors Claude's five-hour wait): the latest
+   * account rate-limit snapshot (the resetsAt source), the in-flight turns'
+   * inputs keyed by the turn id their lifecycle events carry, the active
+   * wait, and the re-send count since the last successful turn.
+   */
+  rateLimits: CodexRateLimitSnapshot | undefined;
+  heldTurnInputs: CodexHeldTurnInputById[];
+  usageLimitWait: CodexUsageLimitWait | undefined;
+  usageLimitResends: number;
+  /**
+   * A retried turn runs under a NEW provider turn id; the adapter re-maps its
+   * events back to the held turn's id so the orchestration lifecycle guard
+   * (which rejects unknown turn ids on a busy thread) sees one continuous
+   * turn — exactly how the Claude retry stays under its own id.
+   */
+  retryTurnIdRemap: { readonly from: TurnId; readonly to: TurnId } | undefined;
+  /** True between the wait clearing and the retry's turn/start response. */
+  retryInFlight: boolean;
+  /** An interrupt that landed inside the retryInFlight window. */
+  interruptAfterRetry: boolean;
+}
+
+/** The exact runtime.sendTurn input of a turn, held for a usage-limit retry. */
+type CodexHeldTurnInput = CodexSessionRuntimeSendTurnInput;
+
+/** A turn input keyed by the id its lifecycle events carry. */
+interface CodexHeldTurnInputById {
+  readonly turnId: TurnId;
+  readonly input: CodexHeldTurnInput;
+}
+
+/** The account rate-limit snapshot — the resetsAt source for the recovery. */
+type CodexRateLimitSnapshot = Schema.Schema.Type<
+  typeof EffectCodexSchema.V2AccountRateLimitsUpdatedNotification
+>;
+
+/**
+ * A held-open turn waiting out a Codex usage limit. The failed turn.completed
+ * is suppressed (the T3 turn stays open — which also keeps the session reaper
+ * and the PS work router at bay); one fiber sleeps to the reset and re-sends
+ * the failed turn's input plus everything deferred during the wait, merged as
+ * one continuation. Other turns still in flight when the wait armed are NOT
+ * re-sent — they keep running on their own. Lost on restart by design.
+ */
+interface CodexUsageLimitWait {
+  readonly turnId: TurnId | undefined;
+  readonly retryAtMs: number;
+  readonly heldInput: CodexHeldTurnInput;
+  /** Sends that arrived while the wait was active — merged into the retry. */
+  readonly deferredInputs: CodexHeldTurnInput[];
+  /** The suppressed turn.completed mapping, replayed when the wait settles. */
+  readonly failureEvents: readonly ProviderRuntimeEvent[];
+  fiber: Fiber.Fiber<void, unknown> | undefined;
+}
+
+/** Grace after a usage-limit window resets before the turn is re-sent. */
+const USAGE_LIMIT_RETRY_GRACE_MS = 5_000;
+/** Floor so a bad resetsAt can never hot-loop the retry. */
+const USAGE_LIMIT_MIN_RETRY_DELAY_MS = 30_000;
+/** No wait may exceed six hours (a corrupt resetsAt cannot pin the session). */
+const USAGE_LIMIT_MAX_RETRY_DELAY_MS = 6 * 60 * 60_000;
+/** After this many re-sends the turn settles failed instead of waiting again. */
+const USAGE_LIMIT_MAX_RESENDS = 3;
+/** No usable resetsAt: wait this long per re-send attempt (index = resends). */
+const USAGE_LIMIT_FALLBACK_DELAYS_MS = [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000] as const;
+
+/**
+ * The app-server reports resetsAt as Unix SECONDS; accept milliseconds too so
+ * a unit change degrades to a slightly-off wait instead of a hot loop.
+ */
+function normalizeResetsAtMs(resetsAt: number | null | undefined): number | undefined {
+  if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt) || resetsAt <= 0) return undefined;
+  return resetsAt > 1e12 ? resetsAt : resetsAt * 1000;
+}
+
+/** The latest still-future reset across the rate-limit windows, if any. */
+function usageLimitResetMs(
+  snapshot: CodexRateLimitSnapshot | undefined,
+  nowMs: number,
+): number | undefined {
+  const candidates = [
+    snapshot?.rateLimits.primary?.resetsAt,
+    snapshot?.rateLimits.secondary?.resetsAt,
+  ]
+    .map(normalizeResetsAtMs)
+    .filter((ms): ms is number => ms !== undefined && ms > nowMs);
+  return candidates.length > 0 ? Math.max(...candidates) : undefined;
+}
+
+/**
+ * Merge held + deferred turn inputs into the single re-send: the first input's
+ * options win; every present prompt text joins with a blank line (the retried
+ * turn sees the follow-ups as one continuation, like the Claude adapter's
+ * promptMessages re-send — a text-less input such as an image-only steer
+ * contributes its attachments without dropping the others' text); attachments
+ * concatenate.
+ */
+function mergeHeldTurnInputs(inputs: readonly CodexHeldTurnInput[]): CodexHeldTurnInput {
+  const [first, ...rest] = inputs;
+  if (first === undefined || rest.length === 0) return first!;
+  const texts = inputs.map((item) => item.input).filter((t): t is string => typeof t === "string");
+  const anyAttachments = inputs.some((item) => item.attachments !== undefined);
+  return {
+    ...first,
+    ...(texts.length > 0 ? { input: texts.join("\n\n") } : {}),
+    ...(anyAttachments ? { attachments: inputs.flatMap((item) => item.attachments ?? []) } : {}),
+  };
 }
 
 function mapCodexRuntimeError(
@@ -1736,9 +1850,32 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // this a child of `startSession`, and Effect interrupts a fiber's
         // children when it completes, so the consumer died on return and every
         // runtime event the session emitted afterwards was dropped.
-        const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
+        // The consumer also drives the usage-limit recovery: it captures the
+        // rate-limit snapshot and intercepts terminal usage-limit failures
+        // before they settle the turn. The session context is created after
+        // this fiber (it needs the fiber handle), so the closure reads it
+        // through a holder — events cannot flow before `runtime.start()` and
+        // the holder is assigned before that call.
+        let sessionContext: CodexAdapterSessionContext | undefined;
+        const eventFiber = yield* Stream.runForEach(runtime.events, (rawEvent) =>
           Effect.gen(function* () {
-            yield* writeNativeEvent(event);
+            yield* writeNativeEvent(rawEvent);
+            const context = sessionContext;
+            // A usage-limit retry runs under a new provider turn id; re-map its
+            // events to the held turn's id BEFORE anything else looks at them.
+            const remap = context?.retryTurnIdRemap;
+            const event =
+              remap && rawEvent.turnId === remap.from
+                ? { ...rawEvent, turnId: remap.to }
+                : rawEvent;
+            if (context && event.method === "account/rateLimits/updated") {
+              // The resetsAt source for the usage-limit recovery wait.
+              const snapshot = readPayload(
+                EffectCodexSchema.V2AccountRateLimitsUpdatedNotification,
+                event.payload,
+              );
+              if (snapshot) context.rateLimits = snapshot;
+            }
             const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
@@ -1749,9 +1886,86 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               });
               return;
             }
+            if (context && (event.method === "turn/completed" || event.method === "turn/aborted")) {
+              let completedSucceeded = false;
+              if (event.method === "turn/completed") {
+                const payload = readPayload(
+                  EffectCodexSchema.V2TurnCompletedNotification,
+                  event.payload,
+                );
+                completedSucceeded = payload?.turn.status !== "failed";
+                if (
+                  payload?.turn.status === "failed" &&
+                  payload.turn.error?.codexErrorInfo === "usageLimitExceeded" &&
+                  !context.stopped &&
+                  context.usageLimitWait === undefined
+                ) {
+                  // Only the FAILED turn's own input is re-sent — turns still
+                  // queued behind it keep running on their own.
+                  const failed =
+                    event.turnId === undefined
+                      ? undefined
+                      : context.heldTurnInputs.find((held) => held.turnId === event.turnId);
+                  if (failed) {
+                    // The failed turn's input moves into the wait (or retires
+                    // with the settlement if scheduling declines).
+                    context.heldTurnInputs = context.heldTurnInputs.filter(
+                      (held) => held.turnId !== event.turnId,
+                    );
+                    // Scheduling failure (e.g. the warning could not be
+                    // emitted) must never kill the event consumer — degrade to
+                    // settling.
+                    const held = yield* scheduleCodexUsageLimitWait(
+                      context,
+                      runtimeEvents,
+                      event.turnId,
+                      failed.input,
+                    ).pipe(Effect.catch(() => Effect.succeed(false)));
+                    if (held) return;
+                  }
+                }
+              }
+              // Whatever settles a turn retires its replayable input; the
+              // re-send set only ever holds turns still in flight.
+              const settledTurnId = event.turnId;
+              if (settledTurnId !== undefined) {
+                context.heldTurnInputs = context.heldTurnInputs.filter(
+                  (held) => held.turnId !== settledTurnId,
+                );
+              }
+              if (completedSucceeded) {
+                context.usageLimitResends = 0;
+              }
+            }
+            if (
+              context &&
+              event.method === "turn/completed" &&
+              context.retryTurnIdRemap !== undefined &&
+              (event.turnId === context.retryTurnIdRemap.to ||
+                event.turnId === context.retryTurnIdRemap.from)
+            ) {
+              // The re-mapped retry turn ended — its provider id is retired.
+              context.retryTurnIdRemap = undefined;
+            }
             yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
           }),
         ).pipe(Effect.forkIn(sessionScope));
+        const context: CodexAdapterSessionContext = {
+          threadId: input.threadId,
+          scope: sessionScope,
+          runtime,
+          eventFiber,
+          agentPersona: input.agentPersona,
+          stopped: false,
+          rateLimits: undefined,
+          heldTurnInputs: [],
+          usageLimitWait: undefined,
+          usageLimitResends: 0,
+          retryTurnIdRemap: undefined,
+          retryInFlight: false,
+          interruptAfterRetry: false,
+        };
+        sessionContext = context;
 
         const started = yield* runtime.start().pipe(
           Effect.mapError(
@@ -1772,17 +1986,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
-        sessions.set(input.threadId, {
-          threadId: input.threadId,
-          scope: sessionScope,
-          runtime,
-          eventFiber,
-          stopped: false,
-          // The bound logical agent's role directive, resolved at start; it
-          // rides every turn's developer instructions (Codex has no
-          // session-level system-prompt channel).
-          agentPersona: input.agentPersona,
-        });
+        sessions.set(input.threadId, context);
         sessionScopeTransferred = true;
 
         return started;
@@ -1821,6 +2025,160 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     };
   });
 
+  const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const randomUUIDv4 = crypto.randomUUIDv4.pipe(
+    Effect.mapError(
+      (cause) =>
+        new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "crypto/randomUUIDv4",
+          detail: "Failed to generate Codex runtime identifier.",
+          cause,
+        }),
+    ),
+  );
+  const nextEventId = Effect.map(randomUUIDv4, (id) => EventId.make(id));
+  const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
+
+  const emitUsageLimitWarning = Effect.fn("emitCodexUsageLimitWarning")(function* (
+    session: CodexAdapterSessionContext,
+    turnId: TurnId | undefined,
+    message: string,
+  ) {
+    const stamp = yield* makeEventStamp();
+    yield* Queue.offer(runtimeEventQueue, {
+      type: "runtime.warning",
+      eventId: stamp.eventId,
+      provider: PROVIDER,
+      createdAt: stamp.createdAt,
+      threadId: session.threadId,
+      ...(turnId !== undefined ? { turnId } : {}),
+      payload: { message },
+    } satisfies ProviderRuntimeEvent);
+  });
+
+  /**
+   * Hold the failed turn open and wait out the usage limit (Claude/OpenCode
+   * parity). Returns false when the wait cannot be scheduled (nothing
+   * replayable, or the re-send cap is spent) — the caller then settles the
+   * turn by offering the failure events it already mapped.
+   */
+  const scheduleCodexUsageLimitWait = Effect.fn("scheduleCodexUsageLimitWait")(function* (
+    session: CodexAdapterSessionContext,
+    failureEvents: readonly ProviderRuntimeEvent[],
+    failedTurnId: TurnId | undefined,
+    failedInput: CodexHeldTurnInput,
+  ) {
+    if (session.usageLimitResends >= USAGE_LIMIT_MAX_RESENDS) {
+      return false;
+    }
+    const nowMs = yield* Clock.currentTimeMillis;
+    const resetMs = usageLimitResetMs(session.rateLimits, nowMs);
+    const fallbackMs =
+      USAGE_LIMIT_FALLBACK_DELAYS_MS[
+        Math.min(session.usageLimitResends, USAGE_LIMIT_FALLBACK_DELAYS_MS.length - 1)
+      ]!;
+    const delayMs = Math.min(
+      Math.max(
+        resetMs !== undefined ? resetMs - nowMs + USAGE_LIMIT_RETRY_GRACE_MS : fallbackMs,
+        USAGE_LIMIT_MIN_RETRY_DELAY_MS,
+      ),
+      USAGE_LIMIT_MAX_RETRY_DELAY_MS,
+    );
+    const retryAtMs = nowMs + delayMs;
+    const wait: CodexUsageLimitWait = {
+      turnId: failedTurnId,
+      retryAtMs,
+      heldInput: failedInput,
+      deferredInputs: [],
+      failureEvents: [...failureEvents],
+      fiber: undefined,
+    };
+    session.usageLimitWait = wait;
+    yield* emitUsageLimitWarning(
+      session,
+      failedTurnId,
+      `Codex usage limit wait until ${DateTime.formatIso(DateTime.makeUnsafe(retryAtMs))}; the turn will be re-sent automatically.`,
+    );
+    const retryTurn = Effect.gen(function* () {
+      yield* Effect.sleep(Duration.millis(delayMs));
+      // The wait may have been cancelled (interrupt/stop) while we slept; only
+      // a still-pending wait may re-send.
+      if (session.stopped || session.usageLimitWait !== wait) {
+        return;
+      }
+      session.usageLimitWait = undefined;
+      session.usageLimitResends += 1;
+      yield* emitUsageLimitWarning(
+        session,
+        wait.turnId,
+        wait.deferredInputs.length > 0
+          ? "Codex usage limit wait ended; re-sending the turn and the messages that arrived while waiting."
+          : "Codex usage limit wait ended; re-sending the turn.",
+      );
+      const merged = mergeHeldTurnInputs([wait.heldInput, ...wait.deferredInputs]);
+      // Between clearing the wait and the turn/start response there is no
+      // active provider turn yet — remember an interrupt that lands in that
+      // window and honor it as soon as the re-sent turn exists.
+      session.retryInFlight = true;
+      const started = yield* session.runtime.sendTurn(merged).pipe(
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            yield* emitUsageLimitWarning(
+              session,
+              wait.turnId,
+              `Codex usage-limit retry failed: ${cause.message}`,
+            );
+            // The held turn settles with the failure it really had.
+            yield* Queue.offerAll(runtimeEventQueue, wait.failureEvents);
+            return null;
+          }),
+        ),
+      );
+      session.retryInFlight = false;
+      if (started === null) {
+        return;
+      }
+      // The re-sent turn runs under a NEW provider turn id: re-map its events
+      // to the held turn's id (the orchestration lifecycle guard rejects
+      // unknown turn ids on a busy thread), and re-register the merged input
+      // under that effective id so a SECOND usage-limit failure re-arms the
+      // wait with the full set (resend ladder stays reachable).
+      if (wait.turnId !== undefined) {
+        session.retryTurnIdRemap = { from: started.turnId, to: wait.turnId };
+      }
+      session.heldTurnInputs = [{ turnId: wait.turnId ?? started.turnId, input: merged }];
+      if (session.interruptAfterRetry) {
+        session.interruptAfterRetry = false;
+        yield* session.runtime.interruptTurn(started.turnId).pipe(Effect.ignore);
+      }
+    }).pipe(Effect.ignore);
+    wait.fiber = yield* Effect.forkIn(session.scope)(retryTurn);
+    return true;
+  });
+
+  /** Cancel an active wait. "interrupt" settles the held turn with its
+   * suppressed failure; "stop" leaves settlement to the session-exit path. */
+  const cancelCodexUsageLimitWait = (
+    session: CodexAdapterSessionContext,
+    reason: "interrupt" | "stop",
+  ): Effect.Effect<void> => {
+    const wait = session.usageLimitWait;
+    if (!wait) return Effect.void;
+    session.usageLimitWait = undefined;
+    const interruptFiber = wait.fiber
+      ? Fiber.interrupt(wait.fiber).pipe(Effect.ignore)
+      : Effect.void;
+    return interruptFiber.pipe(
+      Effect.andThen(
+        reason === "interrupt"
+          ? Queue.offerAll(runtimeEventQueue, wait.failureEvents)
+          : Effect.void,
+      ),
+      Effect.asVoid,
+    );
+  };
+
   const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const codexAttachments = yield* Effect.forEach(
       input.attachments ?? [],
@@ -1837,23 +2195,47 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       input.modelSelection?.instanceId === boundInstanceId
         ? getCodexServiceTierOptionValue(input.modelSelection)
         : undefined;
-    return yield* session.runtime
-      .sendTurn({
-        ...(input.input !== undefined ? { input: input.input } : {}),
-        ...(input.modelSelection?.instanceId === boundInstanceId
-          ? { model: input.modelSelection.model }
-          : {}),
-        ...(reasoningEffort
-          ? {
-              effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
-            }
-          : {}),
-        ...(serviceTier ? { serviceTier } : {}),
-        ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
-        ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
-        ...(session.agentPersona !== undefined ? { agentPersona: session.agentPersona } : {}),
-      })
+    const turnInput = {
+      ...(input.input !== undefined ? { input: input.input } : {}),
+      ...(input.modelSelection?.instanceId === boundInstanceId
+        ? { model: input.modelSelection.model }
+        : {}),
+      ...(reasoningEffort
+        ? {
+            effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
+          }
+        : {}),
+      ...(serviceTier ? { serviceTier } : {}),
+      ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
+      ...(session.agentPersona !== undefined ? { agentPersona: session.agentPersona } : {}),
+    };
+    const wait = session.usageLimitWait;
+    if (wait) {
+      // A send inside the limit window DEFERS instead of burning a rejection:
+      // it merges into the automatic retry (Claude-supersede semantics without
+      // the wasted API call).
+      wait.deferredInputs.push(turnInput);
+      yield* emitUsageLimitWarning(
+        session,
+        wait.turnId,
+        `Codex usage limit wait active until ${DateTime.formatIso(DateTime.makeUnsafe(wait.retryAtMs))}; the message was deferred and will be delivered with the automatic retry.`,
+      );
+      // The deferred send joins the held turn — its provider turn materializes
+      // with the retry.
+      return {
+        threadId: input.threadId,
+        turnId: wait.turnId ?? TurnId.make(yield* randomUUIDv4),
+      };
+    }
+    // Register the exact input under the turn id its lifecycle events will
+    // carry, so a usage-limit retry can re-send it verbatim; a turn that
+    // settles (completed/aborted/failed) retires its entry.
+    const started = yield* session.runtime
+      .sendTurn(turnInput)
       .pipe(Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)));
+    session.heldTurnInputs.push({ turnId: started.turnId, input: turnInput });
+    return started;
   });
 
   const requireSession = Effect.fn("requireSession")(function* (threadId: ThreadId) {
@@ -1869,7 +2251,21 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const interruptTurn: CodexAdapterShape["interruptTurn"] = (threadId, turnId) =>
     requireSession(threadId).pipe(
-      Effect.flatMap((session) => session.runtime.interruptTurn(turnId)),
+      Effect.flatMap((session) =>
+        session.usageLimitWait
+          ? // The provider turn already died with the usage limit; interrupting
+            // the corpse is meaningless. Settle the held turn with its
+            // suppressed failure instead.
+            cancelCodexUsageLimitWait(session, "interrupt")
+          : session.retryInFlight
+            ? // The retry fiber is between the wait and the turn/start
+              // response — there is no provider turn to interrupt yet. Flag
+              // it; the retry interrupts the turn as soon as it exists.
+              Effect.sync(() => {
+                session.interruptAfterRetry = true;
+              })
+            : session.runtime.interruptTurn(turnId),
+      ),
       Effect.mapError((cause) =>
         cause._tag === "ProviderAdapterSessionNotFoundError"
           ? cause
@@ -1954,6 +2350,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       return;
     }
     session.stopped = true;
+    // An in-flight usage-limit wait dies with the session; the session-exit
+    // path settles whatever the turn projection still holds open.
+    yield* cancelCodexUsageLimitWait(session, "stop");
     sessions.delete(session.threadId);
     yield* session.runtime.close.pipe(Effect.ignore);
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));

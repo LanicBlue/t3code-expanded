@@ -271,7 +271,9 @@ interface ClaudeTaskAgentState {
 interface UsageLimitWait {
   readonly turnId: TurnId;
   readonly retryAtMs: number;
-  readonly messages: ReadonlyArray<SDKUserMessage>;
+  /** The re-send set: the turn's original inputs plus every message deferred
+   * into the wait while it was active (mutable by design). */
+  messages: SDKUserMessage[];
   readonly failure: {
     readonly errorMessage: string | undefined;
     readonly result: SDKResultMessage;
@@ -4619,9 +4621,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
   const sendTurn: ClaudeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
-    // A user message supersedes any pending usage-limit retry: the turn
-    // continues with the new input instead of re-sending the old one.
-    yield* cancelUsageLimitWait(context, "superseded");
+    // A send while a usage-limit wait is pending DEFERS into the retry (see
+    // the tail of this function) instead of superseding it — the old
+    // supersede-and-send steamed straight into a fresh rejection inside the
+    // window. The full option/steer handling still runs on the way there, so
+    // a deferred send keeps its model/permission-mode side effects.
+    const deferWait = context.usageLimitWait;
     const boundTurnModelSelection =
       input.modelSelection !== undefined && input.modelSelection.instanceId === boundInstanceId
         ? input.modelSelection
@@ -4726,6 +4731,25 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     // Remember the turn's input so a usage-limit retry can re-send it.
     context.turnState?.promptMessages.push(message);
+
+    if (deferWait !== undefined && context.usageLimitWait === deferWait) {
+      // Still armed after the (suspending) message build: the message rides
+      // the automatic retry instead of steaming into a fresh rejection. The
+      // identity check also covers the race where the retry fired while we
+      // built — then this falls through and sends normally.
+      deferWait.messages.push(message);
+      yield* emitRuntimeWarning(
+        context,
+        `Claude usage limit wait active until ${DateTime.formatIso(DateTime.makeUnsafe(deferWait.retryAtMs))}; the message was deferred and will be delivered with the automatic retry.`,
+      );
+      return {
+        threadId: context.session.threadId,
+        turnId: deferWait.turnId,
+        ...(context.session.resumeCursor !== undefined
+          ? { resumeCursor: context.session.resumeCursor }
+          : {}),
+      };
+    }
 
     yield* Queue.offer(context.promptQueue, {
       type: "message",

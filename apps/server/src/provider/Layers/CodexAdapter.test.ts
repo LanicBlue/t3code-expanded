@@ -76,12 +76,17 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     } satisfies ProviderSession),
   );
 
+  public sendTurnCount = 0;
   public readonly sendTurnImpl = vi.fn(
-    (_input: CodexSessionRuntimeSendTurnInput): Promise<ProviderTurnStartResult> =>
-      Promise.resolve({
+    (_input: CodexSessionRuntimeSendTurnInput): Promise<ProviderTurnStartResult> => {
+      // Every turn/start mints a FRESH provider turn id — the usage-limit
+      // retry must re-map its events back to the held turn's id.
+      this.sendTurnCount += 1;
+      return Promise.resolve({
         threadId: this.options.threadId,
-        turnId: asTurnId("turn-1"),
-      }),
+        turnId: asTurnId(`turn-${this.sendTurnCount}`),
+      });
+    },
   );
 
   public readonly interruptTurnImpl = vi.fn(
@@ -759,6 +764,274 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       }
       NodeAssert.equal(firstEvent.value.turnId, "turn-1");
       NodeAssert.equal(firstEvent.value.payload.message, "Reconnecting... 2/5");
+    }),
+  );
+
+  // ── usage-limit recovery (Claude/OpenCode parity): hold the failed turn
+  // open, wait out the reset, re-send — and DEFER sends that arrive meanwhile
+  // instead of burning rejections inside the window. ──
+
+  const usageLimitTurnCompleted = {
+    id: asEventId("evt-usage-limit-failed"),
+    kind: "notification" as const,
+    provider: ProviderDriverKind.make("codex"),
+    threadId: asThreadId("thread-1"),
+    createdAt: "2026-01-01T00:00:00.000Z",
+    method: "turn/completed",
+    turnId: asTurnId("turn-1"),
+    payload: {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        status: "failed",
+        items: [],
+        error: {
+          message: "You've hit your usage limit; it resets at 01:00.",
+          codexErrorInfo: "usageLimitExceeded",
+        },
+      },
+    },
+  } satisfies ProviderEvent;
+
+  const rateLimitsSnapshot = {
+    id: asEventId("evt-rate-limits"),
+    kind: "notification" as const,
+    provider: ProviderDriverKind.make("codex"),
+    threadId: asThreadId("thread-1"),
+    createdAt: "2026-01-01T00:00:00.000Z",
+    method: "account/rateLimits/updated",
+    payload: {
+      rateLimits: { primary: { resetsAt: 3600, usedPercent: 100 } },
+    },
+  } satisfies ProviderEvent;
+
+  it.effect("holds a usage-limit-failed turn open and re-sends it after the reset", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      yield* adapter.sendTurn({ threadId: asThreadId("thread-1"), input: "do the thing" });
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 1);
+
+      yield* runtime.emit(rateLimitsSnapshot);
+      // The snapshot's mapped runtime event lands asynchronously — swallow it
+      // first so the collector below sees only recovery events.
+      const snapshotEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (snapshotEvent?._tag === "Some") {
+        NodeAssert.equal(snapshotEvent.value.type, "account.rate-limits.updated");
+      }
+      // Two stream events: the wait warning, then (after the clock passes the
+      // reset) the retry warning. The failed turn.completed must NEVER appear —
+      // the turn stays open through the wait.
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+        Effect.forkChild,
+      );
+      yield* runtime.emit(usageLimitTurnCompleted);
+
+      yield* TestClock.adjust(3_666_000);
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["runtime.warning", "runtime.warning"],
+      );
+      if (events[0]?.type !== "runtime.warning" || events[1]?.type !== "runtime.warning") {
+        return;
+      }
+      NodeAssert.match(events[0].payload.message, /usage limit wait until/);
+      NodeAssert.equal(
+        events[1].payload.message,
+        "Codex usage limit wait ended; re-sending the turn.",
+      );
+      // The retry re-sent the turn verbatim.
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 2);
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls[1]?.[0].input, "do the thing");
+    }),
+  );
+
+  it.effect("defers sends that arrive during the wait and merges them into the retry", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      yield* adapter.sendTurn({ threadId: asThreadId("thread-1"), input: "first message" });
+      yield* runtime.emit(rateLimitsSnapshot);
+      const snapshotEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (snapshotEvent?._tag === "Some") {
+        NodeAssert.equal(snapshotEvent.value.type, "account.rate-limits.updated");
+      }
+      yield* runtime.emit(usageLimitTurnCompleted);
+      // Wait for the wait to EXIST before sending into it.
+      const waitEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (waitEvent?._tag === "Some" && waitEvent.value.type === "runtime.warning") {
+        NodeAssert.match(waitEvent.value.payload.message, /usage limit wait until/);
+      }
+
+      // A send inside the window defers — no provider write, no rejection.
+      const deferred = yield* adapter.sendTurn({
+        threadId: asThreadId("thread-1"),
+        input: "second message",
+      });
+      NodeAssert.ok(deferred.turnId);
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 1);
+      const deferredEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (deferredEvent?._tag === "Some" && deferredEvent.value.type === "runtime.warning") {
+        NodeAssert.match(deferredEvent.value.payload.message, /was deferred/);
+      }
+
+      yield* TestClock.adjust(3_666_000);
+      const endedEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (endedEvent?._tag === "Some" && endedEvent.value.type === "runtime.warning") {
+        NodeAssert.equal(
+          endedEvent.value.payload.message,
+          "Codex usage limit wait ended; re-sending the turn and the messages that arrived while waiting.",
+        );
+      }
+      // One re-send carrying BOTH messages as a single continuation.
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 2);
+      NodeAssert.equal(
+        runtime.sendTurnImpl.mock.calls[1]?.[0].input,
+        "first message\n\nsecond message",
+      );
+    }),
+  );
+
+  it.effect("interrupt during the wait settles the held turn with its suppressed failure", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      yield* adapter.sendTurn({ threadId: asThreadId("thread-1"), input: "doomed" });
+      yield* runtime.emit(rateLimitsSnapshot);
+      const snapshotEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (snapshotEvent?._tag === "Some") {
+        NodeAssert.equal(snapshotEvent.value.type, "account.rate-limits.updated");
+      }
+      yield* runtime.emit(usageLimitTurnCompleted);
+      const waitEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (waitEvent?._tag === "Some" && waitEvent.value.type === "runtime.warning") {
+        NodeAssert.match(waitEvent.value.payload.message, /usage limit wait until/);
+      }
+
+      yield* adapter.interruptTurn(asThreadId("thread-1"), asTurnId("turn-1"));
+      const settled = yield* Stream.runHead(adapter.streamEvents);
+      if (settled?._tag !== "Some" || settled.value.type !== "turn.completed") {
+        NodeAssert.fail(
+          `expected the suppressed turn.completed, got ${settled?._tag === "Some" ? settled.value.type : "nothing"}`,
+        );
+        return;
+      }
+      NodeAssert.equal(settled.value.payload.state, "failed");
+      NodeAssert.equal(
+        settled.value.payload.errorMessage,
+        "You've hit your usage limit; it resets at 01:00.",
+      );
+
+      // The wait is gone: advancing past the reset re-sends nothing.
+      yield* TestClock.adjust(3_666_000);
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 1);
+      NodeAssert.equal(runtime.interruptTurnImpl.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("the retried turn's events arrive under the held turn's id (remap)", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      yield* adapter.sendTurn({ threadId: asThreadId("thread-1"), input: "do the thing" });
+      yield* runtime.emit(rateLimitsSnapshot);
+      const snapshotEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (snapshotEvent?._tag === "Some") {
+        NodeAssert.equal(snapshotEvent.value.type, "account.rate-limits.updated");
+      }
+      yield* runtime.emit(usageLimitTurnCompleted);
+      const waitEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (waitEvent?._tag === "Some" && waitEvent.value.type === "runtime.warning") {
+        NodeAssert.match(waitEvent.value.payload.message, /usage limit wait until/);
+      }
+
+      yield* TestClock.adjust(3_666_000);
+      const endedEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (endedEvent?._tag === "Some" && endedEvent.value.type === "runtime.warning") {
+        NodeAssert.match(endedEvent.value.payload.message, /wait ended/);
+      }
+      // The retry ran as provider turn "turn-2" (fresh id from turn/start).
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 2);
+
+      // Its lifecycle events must surface under the HELD turn's id ("turn-1")
+      // — the orchestration lifecycle guard rejects unknown turn ids on a
+      // busy thread, so an unmapped retry would wedge the session forever.
+      yield* runtime.emit({
+        id: asEventId("evt-retry-started"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "turn/started",
+        turnId: asTurnId("turn-2"),
+      });
+      const startedEvent = yield* Stream.runHead(adapter.streamEvents);
+      NodeAssert.equal(startedEvent?._tag, "Some");
+      if (startedEvent?._tag === "Some") {
+        NodeAssert.equal(startedEvent.value.type, "turn.started");
+        NodeAssert.equal(String(startedEvent.value.turnId), "turn-1");
+      }
+
+      yield* runtime.emit({
+        id: asEventId("evt-retry-completed"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "turn/completed",
+        turnId: asTurnId("turn-2"),
+        payload: {
+          threadId: "thread-1",
+          turn: { id: "turn-2", status: "completed", items: [] },
+        },
+      } satisfies ProviderEvent);
+      const completedEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (completedEvent?._tag !== "Some" || completedEvent.value.type !== "turn.completed") {
+        NodeAssert.fail(
+          `expected the retried turn.completed, got ${completedEvent?._tag === "Some" ? completedEvent.value.type : "nothing"}`,
+        );
+        return;
+      }
+      NodeAssert.equal(String(completedEvent.value.turnId), "turn-1");
+      NodeAssert.equal(completedEvent.value.payload.state, "completed");
+
+      // The remap retired with the turn: a LATER provider turn keeps its own id.
+      yield* adapter.sendTurn({ threadId: asThreadId("thread-1"), input: "next task" });
+      yield* runtime.emit({
+        id: asEventId("evt-next-completed"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "turn/completed",
+        turnId: asTurnId("turn-3"),
+        payload: {
+          threadId: "thread-1",
+          turn: { id: "turn-3", status: "completed", items: [] },
+        },
+      } satisfies ProviderEvent);
+      const nextEvent = yield* Stream.runHead(adapter.streamEvents);
+      if (nextEvent?._tag === "Some" && nextEvent.value.type === "turn.completed") {
+        NodeAssert.equal(String(nextEvent.value.turnId), "turn-3");
+      }
+    }),
+  );
+
+  it.effect("without a rate-limit snapshot the wait falls back to the five-minute ladder", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      yield* adapter.sendTurn({ threadId: asThreadId("thread-1"), input: "retry me" });
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 2)).pipe(
+        Effect.forkChild,
+      );
+      yield* runtime.emit(usageLimitTurnCompleted);
+
+      // Not yet: the fallback delay is 5 minutes.
+      yield* TestClock.adjust(240_000);
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 1);
+
+      yield* TestClock.adjust(120_000);
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.equal(events[1]?.type, "runtime.warning");
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 2);
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls[1]?.[0].input, "retry me");
     }),
   );
 

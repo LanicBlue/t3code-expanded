@@ -89,14 +89,19 @@ type OpenCodePromptPayload = Omit<
  * In-memory wait between a terminal rate-limit rejection and the automatic
  * re-send of the held turn's prompt. The failed turn is held open (not
  * settled) so the session stays alive and the resend continues the same
- * turn; an interrupt, a stop, or a new user message cancels the wait and
- * settles the turn as the failure it already is. Lost on restart by design.
+ * turn; an interrupt or a stop cancels the wait and settles the turn as the
+ * failure it already is. A new user message DEFERS into the wait (it rides
+ * the re-send) instead of superseding it — sending inside the window would
+ * only collect a fresh rejection. Lost on restart by design.
  */
 interface OpenCodeRateLimitWait {
   readonly turnId: TurnId;
   readonly retryAtMs: number;
   readonly failureMessage: string;
   readonly prompt: OpenCodePromptPayload;
+  /** Sends that arrived while the wait was active — re-sent after the held
+   * prompt, in arrival order (mutable by design). */
+  deferredPrompts: OpenCodePromptPayload[];
   fiber: Fiber.Fiber<void> | undefined;
 }
 
@@ -285,9 +290,18 @@ interface OpenCodeSessionContext {
   /**
    * The prompt payload of the last sendTurn (latest steer wins). Held so the
    * rate-limit resend can replay exactly what the user sent once the
-   * provider's limit window resets.
+   * provider's limit window resets. A send DEFERRED into an active wait does
+   * NOT overwrite this — the wait's re-arm source stays the original held
+   * prompt, with the deferred messages tracked alongside.
    */
   heldPrompt: OpenCodePromptPayload | undefined;
+  /**
+   * Messages deferred into waits since the last fresh send / re-arm: the
+   * re-arm source for a SECOND rate-limit window, so a replayed-then-rejected
+   * chain re-sends the full conversation tail rather than only the newest
+   * message.
+   */
+  heldDeferredPrompts: OpenCodePromptPayload[];
   /** Pending rate-limit resend of the held turn, if any. */
   rateLimitWait: OpenCodeRateLimitWait | undefined;
   /** Resends already consumed by the current turn chain (reset on completion). */
@@ -1005,8 +1019,12 @@ export function makeOpenCodeAdapter(
         retryAtMs,
         failureMessage: sessionErrorMessage(error),
         prompt,
+        // Messages deferred since the last fresh send ride the re-send, so a
+        // replayed-then-rejected chain keeps the whole conversation tail.
+        deferredPrompts: [...context.heldDeferredPrompts],
         fiber: undefined,
       };
+      context.heldDeferredPrompts = [];
       context.rateLimitWait = wait;
       context.rateLimitResends = resends + 1;
       const retryAtIso = DateTime.formatIso(DateTime.makeUnsafe(retryAtMs));
@@ -1039,45 +1057,83 @@ export function makeOpenCodeAdapter(
           })),
           type: "runtime.warning",
           payload: {
-            message: "OpenCode rate limit wait ended; re-sending the turn.",
+            message:
+              wait.deferredPrompts.length > 0
+                ? "OpenCode rate limit wait ended; re-sending the turn and the messages that arrived while waiting."
+                : "OpenCode rate limit wait ended; re-sending the turn.",
             detail: { resend: resends + 1 },
           },
         });
-        yield* runOpenCodeSdk("session.promptAsync", () =>
-          context.client.session.promptAsync({
-            sessionID: context.openCodeSessionId,
-            ...wait.prompt,
-          }),
-        ).pipe(
-          Effect.mapError(toRequestError),
-          // A failed re-send settles the held turn as the failure it is; the
-          // session flips to error exactly like a fresh-turn send failure.
-          Effect.tapError((requestError) =>
-            Effect.gen(function* () {
-              context.activeTurnId = undefined;
-              yield* updateProviderSession(
-                context,
-                {
-                  status: "error",
-                  lastError: requestError.detail,
-                },
-                { clearActiveTurnId: true },
-              );
-              yield* emit({
-                ...(yield* buildEventBase({
-                  threadId: context.session.threadId,
-                  turnId: wait.turnId,
-                })),
-                type: "turn.completed",
-                payload: {
-                  state: "failed",
-                  errorMessage: requestError.detail,
-                },
-              });
+        // The held prompt first, then every deferred message in arrival order
+        // (OpenCode queues follow-up prompts into a busy session). Only a
+        // failure of the HELD send settles the turn — by then nothing was
+        // queued; a deferred send failing after the held send landed just
+        // drops the remaining backlog with a warning, since the server is
+        // already processing the held prompt.
+        const replayPrompts: Array<OpenCodePromptPayload> = [wait.prompt, ...wait.deferredPrompts];
+        let lastSent: OpenCodePromptPayload | undefined;
+        for (let index = 0; index < replayPrompts.length; index += 1) {
+          const prompt = replayPrompts[index]!;
+          const isHeld = index === 0;
+          const outcome = yield* runOpenCodeSdk("session.promptAsync", () =>
+            context.client.session.promptAsync({
+              sessionID: context.openCodeSessionId,
+              ...prompt,
             }),
-          ),
-          Effect.ignore,
-        );
+          ).pipe(
+            Effect.mapError(toRequestError),
+            Effect.tapError((requestError) =>
+              Effect.gen(function* () {
+                if (isHeld) {
+                  context.activeTurnId = undefined;
+                  yield* updateProviderSession(
+                    context,
+                    {
+                      status: "error",
+                      lastError: requestError.detail,
+                    },
+                    { clearActiveTurnId: true },
+                  );
+                  yield* emit({
+                    ...(yield* buildEventBase({
+                      threadId: context.session.threadId,
+                      turnId: wait.turnId,
+                    })),
+                    type: "turn.completed",
+                    payload: {
+                      state: "failed",
+                      errorMessage: requestError.detail,
+                    },
+                  });
+                  return;
+                }
+                yield* emit({
+                  ...(yield* buildEventBase({
+                    threadId: context.session.threadId,
+                    turnId: wait.turnId,
+                  })),
+                  type: "runtime.warning",
+                  payload: {
+                    message:
+                      "OpenCode rate-limit re-send delivered the turn, but a message deferred during the wait could not be delivered and was dropped.",
+                    detail: { error: requestError.detail },
+                  },
+                });
+              }),
+            ),
+            Effect.exit,
+          );
+          if (outcome._tag === "Failure") {
+            break;
+          }
+          lastSent = prompt;
+        }
+        // The delivered tail becomes the re-arm source for a possible next
+        // window (latest unit wins; nothing re-sends twice).
+        if (lastSent !== undefined) {
+          context.heldPrompt = lastSent;
+          context.heldDeferredPrompts = [];
+        }
       }).pipe(Effect.ignore);
       const fiber = yield* Effect.forkIn(resend, context.sessionScope);
       wait.fiber = fiber;
@@ -1701,6 +1757,7 @@ export function makeOpenCodeAdapter(
           activeVariant: undefined,
           agentPersona: input.agentPersona,
           heldPrompt: undefined,
+          heldDeferredPrompts: [],
           rateLimitWait: undefined,
           rateLimitResends: 0,
           stopped: yield* Ref.make(false),
@@ -1730,13 +1787,6 @@ export function makeOpenCodeAdapter(
 
     const sendTurn: OpenCodeAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
       const context = yield* ensureSessionContext(sessions, input.threadId);
-      // A new user message while a rate-limit wait is pending supersedes it:
-      // the held turn settles as its failure and this message opens a fresh
-      // turn (the OpenCode session is idle server-side, so this is not a
-      // steer — the held turn's prompt was never processed to completion).
-      if (context.rateLimitWait) {
-        yield* cancelRateLimitWait(context, "superseded");
-      }
       // A sendTurn while a turn is active is a steer: OpenCode queues the
       // prompt into the busy session and the work continues as one turn, so
       // the active turn id is reused instead of opening a new turn.
@@ -1819,7 +1869,38 @@ export function makeOpenCodeAdapter(
         ...(context.agentPersona ? { system: context.agentPersona } : {}),
         parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
       };
+      const pendingWait = context.rateLimitWait;
+      if (pendingWait) {
+        // A send inside the limit window DEFERS: it re-sends with the held
+        // turn after the reset (OpenCode queues follow-up prompts into a busy
+        // session, so arrival order is preserved) instead of collecting a
+        // fresh rejection. The held turn stays open — no supersede settle,
+        // and heldPrompt keeps the ORIGINAL prompt so a re-armed wait replays
+        // the full tail, not just this newest message.
+        pendingWait.deferredPrompts.push(promptPayload);
+        context.heldDeferredPrompts.push(promptPayload);
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId: pendingWait.turnId,
+          })),
+          type: "runtime.warning",
+          payload: {
+            message: `OpenCode rate limit wait active until ${new Date(pendingWait.retryAtMs).toISOString()}; the message was deferred and will be delivered with the automatic re-send.`,
+          },
+        });
+        return {
+          threadId: input.threadId,
+          turnId: pendingWait.turnId,
+          ...(context.session.resumeCursor !== undefined
+            ? { resumeCursor: context.session.resumeCursor }
+            : {}),
+        };
+      }
+      // A fresh send unit (turn or steer): latest prompt wins and the
+      // deferred tail resets — a future wait re-arms from exactly this send.
       context.heldPrompt = promptPayload;
+      context.heldDeferredPrompts = [];
       yield* runOpenCodeSdk("session.promptAsync", () =>
         context.client.session.promptAsync({
           sessionID: context.openCodeSessionId,

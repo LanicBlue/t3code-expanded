@@ -1799,8 +1799,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }).pipe(Effect.provide(isolatedAdapterLayer(4323)));
   });
 
-  it.effect("a new user message supersedes the held rate-limit turn", () => {
-    const threadId = asThreadId("thread-rate-limit-supersede");
+  it.effect("a message during the rate-limit wait defers into the automatic re-send", () => {
+    const threadId = asThreadId("thread-rate-limit-defer");
     return Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       yield* adapter.startSession({
@@ -1830,17 +1830,49 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       });
       yield* settleEventPump;
 
-      // The new message opens a FRESH turn — the OpenCode session is idle
-      // server-side, so this is not a steer.
-      const fresh = yield* adapter.sendTurn({ threadId, input: "second task" });
-      NodeAssert.notEqual(String(fresh.turnId), String(held.turnId));
-      NodeAssert.equal(runtimeMock.state.promptCalls.length, 2);
+      // A send inside the window DEFERS — no fresh promptAsync, no fresh
+      // rejection; it rides the held turn.
+      const deferred = yield* adapter.sendTurn({ threadId, input: "second task" });
+      NodeAssert.equal(String(deferred.turnId), String(held.turnId));
+      const deferredToo = yield* adapter.sendTurn({ threadId, input: "third task" });
+      NodeAssert.equal(String(deferredToo.turnId), String(held.turnId));
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 1);
       const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
-      NodeAssert.equal(String(session?.activeTurnId), String(fresh.turnId));
+      NodeAssert.equal(String(session?.activeTurnId), String(held.turnId));
 
-      // No third promptAsync once the cancelled wait's delay elapses.
+      // After the window: the held prompt re-sends first, then every deferred
+      // message in arrival order.
       yield* advanceTestClock(6 * 60 * 60_000);
-      NodeAssert.equal(runtimeMock.state.promptCalls.length, 2);
+      yield* settleEventPump;
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 4);
+      const promptText = (call: unknown): string => {
+        const parts = (call as { parts?: Array<{ type: string; text?: string }> }).parts ?? [];
+        return parts.find((part) => part.type === "text")?.text ?? "";
+      };
+      NodeAssert.equal(promptText(runtimeMock.state.promptCalls[1]), "first task");
+      NodeAssert.equal(promptText(runtimeMock.state.promptCalls[2]), "second task");
+      NodeAssert.equal(promptText(runtimeMock.state.promptCalls[3]), "third task");
+
+      // The window is still limiting: the replay is rejected again and a NEW
+      // wait arms. Its re-send is the LATEST delivered unit (the earlier
+      // messages are already in the server-side conversation — re-sending
+      // them would duplicate), tracked through the wait rather than clobbered
+      // by the deferred sends.
+      runtimeMock.pushEvent({
+        type: "session.error",
+        properties: {
+          sessionID: "http://127.0.0.1:4324/session",
+          error: {
+            name: "APIError",
+            data: { message: "rate limited", statusCode: 429, isRetryable: true },
+          },
+        },
+      });
+      yield* settleEventPump;
+      yield* advanceTestClock(6 * 60 * 60_000);
+      yield* settleEventPump;
+      NodeAssert.equal(runtimeMock.state.promptCalls.length, 5);
+      NodeAssert.equal(promptText(runtimeMock.state.promptCalls[4]), "third task");
     }).pipe(Effect.provide(isolatedAdapterLayer(4324)));
   });
 

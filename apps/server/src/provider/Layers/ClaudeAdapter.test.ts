@@ -5084,7 +5084,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("supersedes the usage-limit retry when a new message steers the turn", () => {
+  it.effect("defers a message that arrives during the wait and re-sends both at the retry", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
@@ -5105,6 +5105,9 @@ describe("ClaudeAdapterLive", () => {
         input: "hello",
         attachments: [],
       });
+      const firstPrompt = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
 
       emitFiveHourRejection(harness.query, 60_000, "rate-limit-steer");
       emitUsageLimitResult(
@@ -5114,29 +5117,41 @@ describe("ClaudeAdapterLive", () => {
       );
       yield* drainRuntimeEvents;
 
-      // The user talks again while the wait is pending: the steer takes over
-      // the held turn and the automatic retry is dropped.
+      // The user talks again while the wait is pending: the message DEFERS —
+      // no fresh rejection inside the window, the held turn stays put.
       yield* TestClock.adjust("10 seconds");
-      yield* adapter.sendTurn({
+      const steerTurn = yield* adapter.sendTurn({
         threadId: THREAD_ID,
         input: "actually, keep going",
         attachments: [],
       });
+      assert.equal(String(steerTurn.turnId), String(turn.turnId));
       yield* drainRuntimeEvents;
-      yield* TestClock.adjust("60 seconds");
-      yield* drainRuntimeEvents;
-
-      assert.isUndefined(
+      assert.isDefined(
         runtimeEvents.find(
           (event) =>
-            event.type === "runtime.warning" && event.payload.message.includes("retrying the turn"),
+            event.type === "runtime.warning" && event.payload.message.includes("was deferred"),
         ),
       );
-      assert.isUndefined(
+
+      // Past the reset: the retry delivers BOTH messages, in order, on the
+      // same session and turn.
+      yield* TestClock.adjust("60 seconds");
+      yield* drainRuntimeEvents;
+      assert.isDefined(
         runtimeEvents.find(
-          (event) => event.type === "turn.started" && String(event.turnId) !== String(turn.turnId),
+          (event) =>
+            event.type === "runtime.warning" &&
+            event.payload.message === "Claude usage limit wait ended; retrying the turn.",
         ),
       );
+      const retriedFirst = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      // The original input re-sends verbatim (the deferred message rides the
+      // same wait.messages array; input-level merge coverage lives in the
+      // CodexAdapter recovery tests, where the runtime mock captures sends).
+      assert.deepEqual(retriedFirst, firstPrompt);
 
       emitSuccessResult(harness.query, "result-steer");
       yield* drainRuntimeEvents;
