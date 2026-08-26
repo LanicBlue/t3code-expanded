@@ -623,7 +623,7 @@ describe("ProjectConsumerRuntimeService", () => {
         const turn = turnStartCommands(fakes.commands)[0];
         assert.strictEqual(
           turn?.type === "thread.turn.start" && turn.message.text,
-          "Your current work: work item 1. 1 more item waiting behind it. Use the Project tools to inspect and complete the current work first.",
+          "Your current work: work item 1. 1 more item waiting behind it. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
         );
 
         // ACK means routed: exactly one, after the wake settled.
@@ -1094,7 +1094,7 @@ describe("ProjectConsumerRuntimeService", () => {
           turns[1]?.type === "thread.turn.start" && turns[1]?.message.text,
           `Your current work: work item 1. ${
             fakes.openRunCount() - 1
-          } more item${fakes.openRunCount() - 1 === 1 ? "" : "s"} waiting behind it. Use the Project tools to inspect and complete the current work first.`,
+          } more item${fakes.openRunCount() - 1 === 1 ? "" : "s"} waiting behind it. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.`,
         );
         assert.isEmpty(gateway.recording.failures);
       }).pipe(Effect.provide(fakes.layer), Effect.scoped);

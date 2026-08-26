@@ -103,13 +103,10 @@ export const runsForFlowInstance = (
  * A compact one-line summary of a work task payload for wake messages. The
  * task is the run's free-form snapshot record; prefer its `prompt` value,
  * falling back to the remaining string values, then trimmed JSON. Collapse
- * whitespace, and cap the length so the notification stays a glance, not a
- * document — the authoritative task is always a project_work_list away.
+ * whitespace; the prompt is passed IN FULL — its tail carries the completion
+ * rules the woken agent needs before its first tool call.
  */
-export const assignedWorkTaskSummary = (
-  task: Readonly<Record<string, unknown>>,
-  maxLength = 200,
-): string => {
+export const assignedWorkTaskSummary = (task: Readonly<Record<string, unknown>>): string => {
   // The wire `task` is the run's full snapshot (workDefinitionId, owner,
   // prompt, semanticFingerprint, …) — NOT a prompt record. Prefer the task
   // text explicitly: joining every string value would lead with opaque
@@ -137,7 +134,11 @@ export const assignedWorkTaskSummary = (
   if (flat.length === 0) {
     return "no task text";
   }
-  return flat.length > maxLength ? `${flat.slice(0, maxLength - 1).trimEnd()}…` : flat;
+  // NO length cap: the work prompt's tail carries the completion rules
+  // (which verdicts to submit, what to write) — truncating it mid-sentence
+  // sent agents to work half-instructed. Whitespace is still collapsed so
+  // the message stays one line.
+  return flat;
 };
 
 /** What a wake message says: the current work, plus how deep the queue is. */
@@ -150,5 +151,5 @@ export const assignedWorkWakeMessage = (input: {
     input.queued > 0
       ? ` ${input.queued} more item${input.queued === 1 ? "" : "s"} waiting behind it.`
       : "";
-  return `Your current work: ${summary}.${waiting} Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.`;
+  return `Your current work: ${summary}.${waiting} Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.`;
 };

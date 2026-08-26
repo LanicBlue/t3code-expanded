@@ -81,7 +81,13 @@ export class ProjectServiceWorkTransportError extends Schema.TaggedErrorClass<Pr
 /** The service rejected the call with a typed envelope; `code`/`status` are preserved verbatim. */
 export class ProjectServiceWorkServiceRejectedError extends Schema.TaggedErrorClass<ProjectServiceWorkServiceRejectedError>()(
   "ProjectServiceWorkServiceRejectedError",
-  { code: Schema.String, status: Schema.Int, message: Schema.String },
+  {
+    code: Schema.String,
+    status: Schema.Int,
+    message: Schema.String,
+    /** Structured facts the service attached (allowed fields, permitted transitions, …). */
+    details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  },
 ) {}
 
 export type ProjectServiceWorkClientError =
@@ -158,6 +164,7 @@ const ServiceErrorEnvelope = Schema.Struct({
   category: Schema.String,
   code: Schema.String,
   message: Schema.String,
+  details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
 });
 
 const EnvelopeError = Schema.Struct({
@@ -226,6 +233,15 @@ export const ProjectFlowDocumentWriteRecord = Schema.Struct({
   displayPath: Schema.String,
 });
 export type ProjectFlowDocumentWriteRecord = typeof ProjectFlowDocumentWriteRecord.Type;
+
+/** A notarized edit: the write receipt plus how many replacements landed. */
+export const ProjectFlowDocumentEditRecord = Schema.Struct({
+  documentReceiptId: Schema.String,
+  revision: Schema.NullOr(Schema.String),
+  displayPath: Schema.String,
+  replacements: Schema.Int,
+});
+export type ProjectFlowDocumentEditRecord = typeof ProjectFlowDocumentEditRecord.Type;
 
 export const ProjectWorkOperationRecord = Schema.Union([
   Schema.Struct({
@@ -395,6 +411,8 @@ export class ProjectServiceWorkClient extends Context.Service<
      * Notarized document write: returns the durable documentReceiptId to hand
      * to project_work_submit's result (documentReceiptIds) — the completion
      * validates it against the run's slot rights; only this path can mint one.
+     * "write" is the upsert (create-or-overwrite, PS apiMinor 1): send it
+     * instead of guessing create vs update.
      */
     readonly writeFlowDocument: (input: {
       readonly projectId: string;
@@ -402,7 +420,7 @@ export class ProjectServiceWorkClient extends Context.Service<
       readonly agentId: string;
       readonly idempotencyKey: string;
       readonly path: string;
-      readonly operation: "create" | "update" | "delete";
+      readonly operation: "write" | "create" | "update" | "delete";
       readonly data?: string;
     }) => Effect.Effect<ProjectFlowDocumentWriteRecord, ProjectServiceWorkClientError>;
   }
@@ -547,6 +565,9 @@ export const make = Effect.gen(function* () {
         code: error.code,
         status: error.status,
         message: error.message,
+        ...(error.details === undefined
+          ? {}
+          : { details: error.details as Record<string, unknown> }),
       });
     }
     if (isTransport(error) && operation === undefined) {
@@ -722,7 +743,7 @@ export const make = Effect.gen(function* () {
     readonly agentId: string;
     readonly idempotencyKey: string;
     readonly path: string;
-    readonly operation: "create" | "update" | "delete";
+    readonly operation: "write" | "create" | "update" | "delete";
     readonly data?: string;
   }) =>
     ({

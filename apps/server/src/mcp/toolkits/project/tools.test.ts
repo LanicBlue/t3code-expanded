@@ -3,6 +3,11 @@ import * as Schema from "effect/Schema";
 import { Tool } from "effect/unstable/ai";
 
 import {
+  ProjectDocDeleteInput,
+  ProjectDocEditInput,
+  ProjectDocReadInput,
+  ProjectDocWriteInput,
+  ProjectFlowStartInput,
   ProjectOperationGetInput,
   ProjectWorkGetInput,
   ProjectWorkListInput,
@@ -77,6 +82,11 @@ it("never accepts an identity or credential field in any tool input", () => {
     project_work_get: ProjectWorkGetInput,
     project_work_submit: ProjectWorkSubmitInput,
     project_operation_get: ProjectOperationGetInput,
+    project_flow_start: ProjectFlowStartInput,
+    project_doc_read: ProjectDocReadInput,
+    project_doc_write: ProjectDocWriteInput,
+    project_doc_edit: ProjectDocEditInput,
+    project_doc_delete: ProjectDocDeleteInput,
   } as const;
   for (const [name, input] of Object.entries(inputs)) {
     const schema = Tool.getJsonSchemaFromSchema(input) as {

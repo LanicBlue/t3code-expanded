@@ -96,10 +96,15 @@ export class ProjectWorkIncompatibleError extends Schema.TaggedErrorClass<Projec
 /** Any other typed service rejection; code and status preserved verbatim. */
 export class ProjectWorkRejectedError extends Schema.TaggedErrorClass<ProjectWorkRejectedError>()(
   "ProjectWorkRejectedError",
-  { code: Schema.String, status: Schema.Int, serviceMessage: Schema.String },
+  {
+    code: Schema.String,
+    status: Schema.Int,
+    serviceMessage: Schema.String,
+    details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  },
 ) {
   override get message(): string {
-    return this.serviceMessage;
+    return `${this.serviceMessage}${renderDetails(this.details)}`;
   }
 }
 
@@ -124,12 +129,88 @@ export class ProjectFlowSpawnRefusedError extends Schema.TaggedErrorClass<Projec
  */
 export class ProjectFlowDocumentDeniedError extends Schema.TaggedErrorClass<ProjectFlowDocumentDeniedError>()(
   "ProjectFlowDocumentDeniedError",
-  { code: Schema.String, serviceMessage: Schema.String },
+  {
+    code: Schema.String,
+    serviceMessage: Schema.String,
+    details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  },
 ) {
   override get message(): string {
-    return `${this.serviceMessage} The run's slot rights do not cover this document operation.`;
+    return `${this.serviceMessage} The run's slot rights do not cover this document operation.${renderDetails(this.details)}`;
   }
 }
+
+/**
+ * A flow document path the service cannot resolve (absent, undeclared, or a
+ * directory) — the message tells the model whether the path is wrong or the
+ * document just is not written yet, and points at the read tool to check.
+ */
+export class ProjectFlowDocumentNotFoundError extends Schema.TaggedErrorClass<ProjectFlowDocumentNotFoundError>()(
+  "ProjectFlowDocumentNotFoundError",
+  {
+    code: Schema.String,
+    path: Schema.String,
+    serviceMessage: Schema.String,
+    details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  },
+) {
+  override get message(): string {
+    return `${this.serviceMessage} Call project_doc_read on "${this.path}" to confirm the path and contents.${renderDetails(this.details)}`;
+  }
+}
+
+/**
+ * A flow-document write conflict (idempotency digest mismatch or authority
+ * CAS) — the correct recovery is a fresh tool call, never project_work_list
+ * (work revisions are unrelated to document revisions).
+ */
+export class ProjectFlowDocumentConflictError extends Schema.TaggedErrorClass<ProjectFlowDocumentConflictError>()(
+  "ProjectFlowDocumentConflictError",
+  {
+    code: Schema.String,
+    serviceMessage: Schema.String,
+    details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  },
+) {
+  override get message(): string {
+    return `${this.serviceMessage} The document changed or the retry reused a spent idempotency key; call project_doc_read for the current revision, then repeat the tool call (it mints a fresh key).${renderDetails(this.details)}`;
+  }
+}
+
+/** project_doc_edit found no occurrence of old_string in the document. */
+export class ProjectDocEditNoMatchError extends Schema.TaggedErrorClass<ProjectDocEditNoMatchError>()(
+  "ProjectDocEditNoMatchError",
+  { path: Schema.String, documentLines: Schema.Int },
+) {
+  override get message(): string {
+    return `old_string was not found in "${this.path}" (the document currently has ${this.documentLines} lines). Call project_doc_read and copy old_string exactly, including whitespace and indentation.`;
+  }
+}
+
+/** project_doc_edit found old_string more than once and replace_all was not set. */
+export class ProjectDocEditAmbiguousMatchError extends Schema.TaggedErrorClass<ProjectDocEditAmbiguousMatchError>()(
+  "ProjectDocEditAmbiguousMatchError",
+  { path: Schema.String, matchCount: Schema.Int },
+) {
+  override get message(): string {
+    return `old_string matches ${this.matchCount} places in "${this.path}". Include more surrounding lines to make it unique, or pass replace_all: true to replace every occurrence.`;
+  }
+}
+
+/**
+ * Renders structured service details into the model-visible message text —
+ * the MCP boundary sends only `message` on failure, so the facts must ride in
+ * the string. Key=value pairs, capped so long lists cannot blow the envelope.
+ */
+export const renderDetails = (details: Readonly<Record<string, unknown>> | undefined): string => {
+  if (details === undefined) return "";
+  const entries = Object.entries(details)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(", ") : String(value)}`);
+  if (entries.length === 0) return "";
+  const rendered = ` Details: ${entries.join("; ")}.`;
+  return rendered.length > 600 ? `${rendered.slice(0, 599)}…` : rendered;
+};
 
 /**
  * The addressed run is not the CURRENT work (the head of the agent's queue):
@@ -158,6 +239,10 @@ export const ProjectWorkError = Schema.Union([
   ProjectWorkIncompatibleError,
   ProjectFlowSpawnRefusedError,
   ProjectFlowDocumentDeniedError,
+  ProjectFlowDocumentNotFoundError,
+  ProjectFlowDocumentConflictError,
+  ProjectDocEditNoMatchError,
+  ProjectDocEditAmbiguousMatchError,
   ProjectWorkNotCurrentError,
   ProjectWorkRejectedError,
 ]);
@@ -332,15 +417,44 @@ export const ProjectDocWriteInput = Schema.Struct({
     description:
       'The instance-relative document path, e.g. "decision.md". Must be a document the flow definition declares.',
   }),
-  operation: Schema.Literals(["create", "update", "delete"]).annotate({
-    description: "create requires the file to be absent; update/delete require it to exist.",
+  content: Schema.String.annotate({
+    description:
+      "The FULL document content as UTF-8 text. Write is an upsert: it creates the document when absent and overwrites it when present — no create/update choice, no existence guessing. (A document cannot be emptied; use project_doc_delete instead.)",
   }),
-  content: Schema.optional(
-    Schema.String.annotate({
-      description:
-        "The full document content as UTF-8 text — REQUIRED for create/update, must be ABSENT for delete.",
+});
+
+export const ProjectDocEditInput = Schema.Struct({
+  runId: Schema.String.annotate({
+    description:
+      "The CURRENT work run from project_work_list (work is handled strictly in order) — its slot grants the WRITE rights for this operation.",
+  }),
+  path: Schema.String.annotate({
+    description: 'The instance-relative document path of an EXISTING document, e.g. "decision.md".',
+  }),
+  old_string: Schema.String.annotate({
+    description:
+      "The exact text to replace — copied verbatim from project_doc_read, including whitespace and indentation. It must match exactly ONE place in the document unless replace_all is true.",
+  }),
+  new_string: Schema.String.annotate({
+    description:
+      "The replacement text. May be empty (a deletion) as long as the document does not become empty — use project_doc_delete for that.",
+  }),
+  replaceAll: Schema.optional(
+    Schema.Boolean.annotate({
+      description: "Replace EVERY occurrence of old_string instead of requiring a unique match.",
     }),
   ),
+});
+
+export const ProjectDocDeleteInput = Schema.Struct({
+  runId: Schema.String.annotate({
+    description:
+      "The CURRENT work run from project_work_list (work is handled strictly in order) — its slot grants the WRITE rights for this operation.",
+  }),
+  path: Schema.String.annotate({
+    description:
+      "The instance-relative document path of the document to delete; it must already exist.",
+  }),
 });
 
 export const ProjectDocReadTool = Tool.make("project_doc_read", {
@@ -359,13 +473,37 @@ export const ProjectDocReadTool = Tool.make("project_doc_read", {
 
 export const ProjectDocWriteTool = Tool.make("project_doc_write", {
   description:
-    "Write a flow document of the session project through one of your open work runs (notarized): returns a documentReceiptId you then pass in project_work_submit's result as documentReceiptIds — the submit validates it against the run's slot rights. This is how work hands its output to later works (e.g. the triage decision the dispatcher reads). Write the FULL content; the operation is create (file absent) or update. The disk file itself is not the contract — without the receipt the completion does not count.",
+    "Write a flow document of the session project through one of your open work runs (notarized), like a normal file Write: send the FULL content and it creates the document when absent or overwrites it when present — there is no create/update choice to make. Returns a documentReceiptId you then pass in project_work_submit's result as documentReceiptIds — the submit validates it against the run's slot rights. This is how work hands its output to later works. The disk file itself is not the contract — without the receipt the completion does not count.",
   parameters: ProjectDocWriteInput,
   success: ProjectServiceWorkClient.ProjectFlowDocumentWriteRecord,
   failure: ProjectWorkError,
   dependencies,
 })
   .annotate(Tool.Title, "Write a Project flow document (notarized)")
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true);
+
+export const ProjectDocEditTool = Tool.make("project_doc_edit", {
+  description:
+    "Edit a flow document through one of your open work runs (notarized), like a normal file Edit: old_string must match exactly one place in the document (or set replace_all to replace every occurrence); the replacement is written back through the notary path and returns the fresh documentReceiptId to pass in project_work_submit's documentReceiptIds. Prefer this over project_doc_write when changing part of a large document. The document must already exist — call project_doc_read first to copy old_string exactly.",
+  parameters: ProjectDocEditInput,
+  success: ProjectServiceWorkClient.ProjectFlowDocumentEditRecord,
+  failure: ProjectWorkError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Edit a Project flow document (notarized)")
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true);
+
+export const ProjectDocDeleteTool = Tool.make("project_doc_delete", {
+  description:
+    "Delete a flow document through one of your open work runs (notarized). The document must already exist; the receipt handed back carries no successor revision. Use this instead of writing empty content — a document cannot be emptied by write.",
+  parameters: ProjectDocDeleteInput,
+  success: ProjectServiceWorkClient.ProjectFlowDocumentWriteRecord,
+  failure: ProjectWorkError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Delete a Project flow document (notarized)")
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
 
@@ -377,4 +515,6 @@ export const ProjectWorkToolkit = Toolkit.make(
   ProjectFlowStartTool,
   ProjectDocReadTool,
   ProjectDocWriteTool,
+  ProjectDocEditTool,
+  ProjectDocDeleteTool,
 );

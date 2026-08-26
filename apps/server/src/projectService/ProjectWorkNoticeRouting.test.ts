@@ -531,11 +531,11 @@ it("notification message and session title formats", () => {
   // deep the queue is behind it — the agent wakes already knowing its work.
   assert.strictEqual(
     assignedWorkWakeMessage({ current: head("分诊：修复登录", "2026-08-21T00:00:01Z"), queued: 2 }),
-    "Your current work: 分诊：修复登录. 2 more items waiting behind it. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
+    "Your current work: 分诊：修复登录. 2 more items waiting behind it. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
   );
   assert.strictEqual(
     assignedWorkWakeMessage({ current: head("分诊：修复登录", "2026-08-21T00:00:01Z"), queued: 0 }),
-    "Your current work: 分诊：修复登录. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
+    "Your current work: 分诊：修复登录. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
   );
   // The agent name alone titles the session — the UI already groups sessions
   // by project, so same-project sessions stay distinguishable by agent.

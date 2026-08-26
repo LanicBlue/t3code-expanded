@@ -63,15 +63,53 @@ export const mapProjectServiceError = (
           })
         : new Tools.ProjectWorkUnavailableError({ reason: "service-unreachable" });
     case "ProjectServiceWorkServiceRejectedError": {
-      const { code, status, message } = error;
+      const { code, status, message, details } = error;
       // Spawn refusal is about the DEFINITION's opt-in, not the credential —
       // mapping it to the 403 authentication bucket would misdirect the agent.
       if (code === "PROJECT_CONSUMER_SPAWN_NOT_AUTHORIZED") {
         return new Tools.ProjectFlowSpawnRefusedError({ code, serviceMessage: message });
       }
-      // Document denial is about the run's SLOT RIGHTS, not the credential.
-      if (code === "FLOW_DOCUMENT_PERMISSION_DENIED") {
-        return new Tools.ProjectFlowDocumentDeniedError({ code, serviceMessage: message });
+      // Flow-document failures are their own bucket BEFORE the generic
+      // NOT_FOUND/CONFLICT classes: the right recovery reads the DOCUMENT —
+      // the generic project_work_list hint would misdirect the agent.
+      if (code.startsWith("FLOW_DOCUMENT_")) {
+        const detailFields =
+          details === undefined ? {} : { details: details as Record<string, unknown> };
+        if (code === "FLOW_DOCUMENT_PERMISSION_DENIED") {
+          return new Tools.ProjectFlowDocumentDeniedError({
+            code,
+            serviceMessage: message,
+            ...detailFields,
+          });
+        }
+        if (code.endsWith("_NOT_FOUND")) {
+          const path = typeof details?.path === "string" ? details.path : "the document";
+          return new Tools.ProjectFlowDocumentNotFoundError({
+            code,
+            path,
+            serviceMessage: message,
+            ...detailFields,
+          });
+        }
+        if (isConflict(code, status)) {
+          // An old PS predating the native write op answers REQUEST_FAILED on
+          // "write" — name the upgrade instead of probing or retrying.
+          const upgrade =
+            code === "FLOW_DOCUMENT_REQUEST_FAILED"
+              ? " This Project Service may predate the native write operation; ask the operator to upgrade Project Service."
+              : "";
+          return new Tools.ProjectFlowDocumentConflictError({
+            code,
+            serviceMessage: message + upgrade,
+            ...detailFields,
+          });
+        }
+        return new Tools.ProjectWorkRejectedError({
+          code,
+          status,
+          serviceMessage: message,
+          ...detailFields,
+        });
       }
       if (isAuthenticationStatus(status)) {
         return new Tools.ProjectWorkAuthenticationError({ code, status });
@@ -107,7 +145,12 @@ export const mapProjectServiceError = (
       if (code.includes("VERSION") || code.includes("PROTOCOL")) {
         return new Tools.ProjectWorkIncompatibleError({ code });
       }
-      return new Tools.ProjectWorkRejectedError({ code, status, serviceMessage: message });
+      return new Tools.ProjectWorkRejectedError({
+        code,
+        status,
+        serviceMessage: message,
+        ...(details === undefined ? {} : { details: details as Record<string, unknown> }),
+      });
     }
   }
 };
@@ -336,7 +379,7 @@ const handlers = {
       const generation = yield* client
         .getProjectGeneration(context.projectServiceProjectId)
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, operation)));
-      return yield* client
+      const record = yield* client
         .submitRun(
           {
             projectId: context.projectServiceProjectId,
@@ -350,6 +393,21 @@ const handlers = {
           operation,
         )
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, operation)));
+      // A rejected submit reaches the model as a FAILURE, not a success-shaped
+      // record: only failure message text is guaranteed model-visible at the
+      // MCP boundary, and the envelope now carries the field-level why.
+      // project_operation_get keeps returning raw records for recovery.
+      if (record.status === "rejected") {
+        return yield* new Tools.ProjectWorkRejectedError({
+          code: record.error.code,
+          status: 409,
+          serviceMessage: `The submission was rejected (${record.error.code}): ${record.error.message} Call project_work_list for the current revisions and contract, then resubmit.`,
+          ...(record.error.details === undefined
+            ? {}
+            : { details: record.error.details as Record<string, unknown> }),
+        });
+      }
+      return record;
     }),
   project_operation_get: (input: { readonly operationId: string }) =>
     Effect.gen(function* () {
@@ -406,24 +464,16 @@ const handlers = {
   project_doc_write: (input: {
     readonly runId: string;
     readonly path: string;
-    readonly operation: "create" | "update" | "delete";
-    readonly content?: string | undefined;
+    readonly content: string;
   }) =>
     Effect.gen(function* () {
-      // The notary's own contract: data for create/update, none for delete —
-      // reject the mismatch HERE with a typed error, before any key is minted.
-      if (
-        input.operation === "delete"
-          ? input.content !== undefined
-          : typeof input.content !== "string" || input.content.length === 0
-      ) {
+      // The notary's own contract: non-empty UTF-8 data — reject the mismatch
+      // HERE with a typed error, before any key is minted.
+      if (typeof input.content !== "string" || input.content.length === 0) {
         return yield* new Tools.ProjectWorkRejectedError({
           code: "PROJECT_DOC_CONTENT_INVALID",
           status: 0,
-          serviceMessage:
-            input.operation === "delete"
-              ? "delete must not carry content"
-              : "content (non-empty UTF-8 text) is required for create/update",
+          serviceMessage: "content (non-empty UTF-8 text) is required",
         });
       }
       const context = yield* resolveContext("project.work.write");
@@ -434,6 +484,8 @@ const handlers = {
       // Fresh key per call: a retried write is a new notarized write (the
       // receipt layer replays only same-key+same-digest), never a silent replay.
       const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      // "write" is the PS-native upsert (apiMinor 1): create-or-overwrite in
+      // one server-side step — no existence probing, no create/update guess.
       return yield* client
         .writeFlowDocument({
           projectId: context.projectServiceProjectId,
@@ -441,10 +493,92 @@ const handlers = {
           agentId: context.logicalAgentId,
           idempotencyKey,
           path: input.path,
-          operation: input.operation,
-          ...(input.operation === "delete"
-            ? {}
-            : { data: Buffer.from(input.content ?? "", "utf8").toString("base64") }),
+          operation: "write",
+          data: Buffer.from(input.content, "utf8").toString("base64"),
+        })
+        .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+    }),
+  project_doc_edit: (input: {
+    readonly runId: string;
+    readonly path: string;
+    readonly old_string: string;
+    readonly new_string: string;
+    readonly replaceAll?: boolean | undefined;
+  }) =>
+    Effect.gen(function* () {
+      const context = yield* resolveContext("project.work.write");
+      const current = yield* resolveCurrentWorkRun(context);
+      yield* requireCurrentRun(current, input.runId);
+      const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+      const crypto = yield* Crypto.Crypto;
+      // Read → exact-match replace → notarized write-back. The match rules
+      // are the general Edit semantics: exactly one occurrence, or
+      // replace_all; the errors carry the document size so the model knows
+      // what it is matching against.
+      const document = yield* client
+        .readFlowDocument({
+          projectId: context.projectServiceProjectId,
+          runId: input.runId,
+          agentId: context.logicalAgentId,
+          path: input.path,
+        })
+        .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+      const lines = document.content.split("\n").length;
+      const occurrences = document.content.split(input.old_string).length - 1;
+      if (occurrences === 0) {
+        return yield* new Tools.ProjectDocEditNoMatchError({
+          path: input.path,
+          documentLines: lines,
+        });
+      }
+      if (occurrences > 1 && input.replaceAll !== true) {
+        return yield* new Tools.ProjectDocEditAmbiguousMatchError({
+          path: input.path,
+          matchCount: occurrences,
+        });
+      }
+      const content =
+        input.replaceAll === true
+          ? document.content.split(input.old_string).join(input.new_string)
+          : document.content.replace(input.old_string, input.new_string);
+      if (content.length === 0) {
+        return yield* new Tools.ProjectWorkRejectedError({
+          code: "PROJECT_DOC_CONTENT_INVALID",
+          status: 0,
+          serviceMessage:
+            "the edit would empty the document; a flow document cannot be empty — use project_doc_delete instead",
+        });
+      }
+      const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      const written = yield* client
+        .writeFlowDocument({
+          projectId: context.projectServiceProjectId,
+          runId: input.runId,
+          agentId: context.logicalAgentId,
+          idempotencyKey,
+          path: input.path,
+          operation: "write",
+          data: Buffer.from(content, "utf8").toString("base64"),
+        })
+        .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+      return { ...written, replacements: input.replaceAll === true ? occurrences : 1 };
+    }),
+  project_doc_delete: (input: { readonly runId: string; readonly path: string }) =>
+    Effect.gen(function* () {
+      const context = yield* resolveContext("project.work.write");
+      const current = yield* resolveCurrentWorkRun(context);
+      yield* requireCurrentRun(current, input.runId);
+      const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+      const crypto = yield* Crypto.Crypto;
+      const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      return yield* client
+        .writeFlowDocument({
+          projectId: context.projectServiceProjectId,
+          runId: input.runId,
+          agentId: context.logicalAgentId,
+          idempotencyKey,
+          path: input.path,
+          operation: "delete",
         })
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
     }),

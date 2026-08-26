@@ -71,28 +71,30 @@ describe("AssignedWorkQueue", () => {
     NodeAssert.equal(assignedWorkTaskSummary({ count: 3 }), '"count":3');
     NodeAssert.equal(assignedWorkTaskSummary({}), "no task text");
     NodeAssert.equal(assignedWorkTaskSummary({ prompt: "   " }), "no task text");
-    // Whitespace collapses; long prompts truncate with an ellipsis marker.
+    // Whitespace collapses; the prompt passes through IN FULL — its tail
+    // carries the completion rules, so nothing is truncated.
     NodeAssert.equal(
       assignedWorkTaskSummary({ prompt: "line one\n  line two" }),
       "line one line two",
     );
-    NodeAssert.equal(assignedWorkTaskSummary({ prompt: "x".repeat(250) }).length, 200);
-    NodeAssert.equal(assignedWorkTaskSummary({ prompt: "x".repeat(250) }).endsWith("…"), true);
+    const long = "x".repeat(250);
+    NodeAssert.equal(assignedWorkTaskSummary({ prompt: long }), long);
+    NodeAssert.equal(assignedWorkTaskSummary({ prompt: long }).includes("…"), false);
   });
 
   it("the wake message names the current work and the queue depth behind it", () => {
     const current = run({ task: { prompt: "分诊：修复登录" } });
     NodeAssert.equal(
       assignedWorkWakeMessage({ current, queued: 0 }),
-      "Your current work: 分诊：修复登录. Use the Project tools to inspect and complete the current work first.",
+      "Your current work: 分诊：修复登录. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
     );
     NodeAssert.equal(
       assignedWorkWakeMessage({ current, queued: 1 }),
-      "Your current work: 分诊：修复登录. 1 more item waiting behind it. Use the Project tools to inspect and complete the current work first.",
+      "Your current work: 分诊：修复登录. 1 more item waiting behind it. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
     );
     NodeAssert.equal(
       assignedWorkWakeMessage({ current, queued: 3 }),
-      "Your current work: 分诊：修复登录. 3 more items waiting behind it. Use the Project tools to inspect and complete the current work first.",
+      "Your current work: 分诊：修复登录. 3 more items waiting behind it. Use the t3-code Agent Project tools (project_work_list, project_doc_read, project_doc_write, project_doc_edit, and project_work_submit) to inspect and complete the current work first. Do not use human PS Control tools for Agent Work.",
     );
   });
 

@@ -158,8 +158,10 @@ interface CapturedSpawn {
   readonly name: string;
 }
 
-const docWritesRef: { path: string; operation: string }[] = [];
+const docWritesRef: { path: string; operation: string; data?: string }[] = [];
+const docReadsRef: { path: string }[] = [];
 let docWriteError: ProjectServiceWorkClient.ProjectServiceWorkClientError | undefined;
+let documentContent = "decision: ship it";
 
 const makeWorkClientLayer = (overrides?: {
   readonly runs?: readonly ProjectServiceWorkClient.ProjectWorkRunRecord[];
@@ -169,11 +171,15 @@ const makeWorkClientLayer = (overrides?: {
   readonly spawnError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
   readonly spawnPending?: boolean;
   readonly documentWriteError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
+  readonly submitResult?: ProjectServiceWorkClient.ProjectWorkOperationRecord;
+  readonly content?: string;
 }) => {
   docWriteError = overrides?.documentWriteError;
+  documentContent = overrides?.content ?? "decision: ship it";
   const submitted: CapturedSubmit[] = [];
   const spawned: CapturedSpawn[] = [];
   const docWrites = docWritesRef;
+  const docReads = docReadsRef;
   const service = ProjectServiceWorkClient.ProjectServiceWorkClient.of({
     // The directory-keyed mapping: one service project registered at the
     // thread project's workspace root.
@@ -206,18 +212,24 @@ const makeWorkClientLayer = (overrides?: {
         idempotencyKey: operation.idempotencyKey,
       });
       return Effect.succeed<ProjectServiceWorkClient.ProjectWorkOperationRecord>(
-        COMMITTED_OPERATION,
+        overrides?.submitResult ?? COMMITTED_OPERATION,
       );
     },
     getOperation: () => Effect.succeed(COMMITTED_OPERATION),
-    readFlowDocument: (input: { readonly path: string }) =>
-      Effect.succeed({
-        content: "decision: ship it",
+    readFlowDocument: (input: { readonly path: string }) => {
+      docReads.push({ ...input });
+      return Effect.succeed({
+        content: documentContent,
         revision: "doc:1",
         displayPath: `flow://project/fi_1/${input.path}`,
-        size: 16,
-      }),
-    writeFlowDocument: (input: { readonly path: string; readonly operation: string }) => {
+        size: documentContent.length,
+      });
+    },
+    writeFlowDocument: (input: {
+      readonly path: string;
+      readonly operation: string;
+      readonly data?: string;
+    }) => {
       docWrites.push({ ...input });
       if (docWriteError !== undefined) {
         return Effect.fail(docWriteError);
@@ -250,6 +262,7 @@ const makeWorkClientLayer = (overrides?: {
     submitted,
     spawned,
     docWrites,
+    docReads,
     layer: Layer.succeed(ProjectServiceWorkClient.ProjectServiceWorkClient, service),
   };
 };
@@ -458,7 +471,7 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
   });
 
   it.effect(
-    "project_doc_write notarizes content and maps slot-right denial to the document error",
+    "project_doc_write always sends the native write upsert and maps slot-right denial to the document error",
     () => {
       const denied = new ProjectServiceWorkClient.ProjectServiceWorkServiceRejectedError({
         code: "FLOW_DOCUMENT_PERMISSION_DENIED",
@@ -471,7 +484,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         const failure = yield* ProjectWorkToolkitHandlers.project_doc_write({
           runId: "run_9",
           path: "decision.md",
-          operation: "update",
           content: "# decision\nship it\n",
         }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
 
@@ -482,41 +494,29 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
           code: "FLOW_DOCUMENT_PERMISSION_DENIED",
           serviceMessage: "slot rights do not cover this document",
         });
+        // The upsert operation reached the client — never a create/update guess.
+        assert.equal(docWrites[docWrites.length - 1]?.operation, "write");
       });
     },
   );
 
-  it.effect(
-    "project_doc_write rejects a delete that carries content and a create without it",
-    () => {
-      const { layer } = makeWorkClientLayer();
+  it.effect("project_doc_write rejects empty content before any key is minted", () => {
+    const { layer } = makeWorkClientLayer();
 
-      return Effect.gen(function* () {
-        const withContent = yield* ProjectWorkToolkitHandlers.project_doc_write({
-          runId: "run_9",
-          path: "decision.md",
-          operation: "delete",
-          content: "stale",
-        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
-        assert.deepEqual(plainError(withContent), {
-          _tag: "ProjectWorkRejectedError",
-          code: "PROJECT_DOC_CONTENT_INVALID",
-          status: 0,
-          serviceMessage: "delete must not carry content",
-        });
-
-        const withoutContent = yield* ProjectWorkToolkitHandlers.project_doc_write({
-          runId: "run_9",
-          path: "decision.md",
-          operation: "create",
-        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
-        assert.equal(
-          (plainError(withoutContent) as { serviceMessage?: string }).serviceMessage,
-          "content (non-empty UTF-8 text) is required for create/update",
-        );
+    return Effect.gen(function* () {
+      const failure = yield* ProjectWorkToolkitHandlers.project_doc_write({
+        runId: "run_9",
+        path: "decision.md",
+        content: "",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+      assert.deepEqual(plainError(failure), {
+        _tag: "ProjectWorkRejectedError",
+        code: "PROJECT_DOC_CONTENT_INVALID",
+        status: 0,
+        serviceMessage: "content (non-empty UTF-8 text) is required",
       });
-    },
-  );
+    });
+  });
 
   it.effect("project_doc_write base64-carries the content through the derived identity", () => {
     const { docWrites, layer } = makeWorkClientLayer();
@@ -525,11 +525,188 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       const receipt = yield* ProjectWorkToolkitHandlers.project_doc_write({
         runId: "run_9",
         path: "decision.md",
-        operation: "create",
         content: "# decision\nship it\n",
       }).pipe(withHandlerLayers({ workClientLayer: layer }));
 
       assert.match(receipt.documentReceiptId, /^document:[0-9a-f]{64}$/);
+      const sent = docWrites[docWrites.length - 1];
+      assert.equal(sent?.operation, "write");
+      assert.equal(sent?.data, Buffer.from("# decision\nship it\n", "utf8").toString("base64"));
+    });
+  });
+
+  it.effect("project_doc_edit replaces a unique match and notarizes the result", () => {
+    const { docReads, docWrites, layer } = makeWorkClientLayer({
+      content: "# decision\nship it\n",
+    });
+
+    return Effect.gen(function* () {
+      const edited = yield* ProjectWorkToolkitHandlers.project_doc_edit({
+        runId: "run_9",
+        path: "decision.md",
+        old_string: "ship it",
+        new_string: "ship it twice",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }));
+
+      assert.equal(edited.replacements, 1);
+      // The capture refs are module-level (shared across tests) — assert the
+      // LAST read is this edit's read of the document, not the global count.
+      assert.equal(docReads[docReads.length - 1]?.path, "decision.md");
+      const sent = docWrites[docWrites.length - 1];
+      assert.equal(sent?.operation, "write");
+      assert.equal(
+        sent?.data,
+        Buffer.from("# decision\nship it twice\n", "utf8").toString("base64"),
+      );
+    });
+  });
+
+  it.effect("project_doc_edit reports the document size when old_string does not match", () => {
+    const { layer } = makeWorkClientLayer({ content: "one\ntwo\nthree\n" });
+
+    return Effect.gen(function* () {
+      const failure = yield* ProjectWorkToolkitHandlers.project_doc_edit({
+        runId: "run_9",
+        path: "decision.md",
+        old_string: "no such line  ",
+        new_string: "x",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+
+      assert.equal((plainError(failure) as { _tag: string })._tag, "ProjectDocEditNoMatchError");
+      // The model-visible message names the tool call that fixes it.
+      assert.include(failure.message, 'old_string was not found in "decision.md"');
+      assert.include(failure.message, "Call project_doc_read");
+    });
+  });
+
+  it.effect(
+    "project_doc_edit demands a unique match unless replace_all replaces every occurrence",
+    () => {
+      const { docWrites, layer } = makeWorkClientLayer({
+        content: "same\nsame\nsame\n",
+      });
+
+      return Effect.gen(function* () {
+        const ambiguous = yield* ProjectWorkToolkitHandlers.project_doc_edit({
+          runId: "run_9",
+          path: "decision.md",
+          old_string: "same",
+          new_string: "other",
+        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+        assert.equal(
+          (plainError(ambiguous) as { _tag: string })._tag,
+          "ProjectDocEditAmbiguousMatchError",
+        );
+        assert.include(ambiguous.message, "matches 3 places");
+        assert.include(ambiguous.message, "replace_all: true");
+
+        const all = yield* ProjectWorkToolkitHandlers.project_doc_edit({
+          runId: "run_9",
+          path: "decision.md",
+          old_string: "same",
+          new_string: "other",
+          replaceAll: true,
+        }).pipe(withHandlerLayers({ workClientLayer: layer }));
+        assert.equal(all.replacements, 3);
+        assert.equal(
+          docWrites[docWrites.length - 1]?.data,
+          Buffer.from("other\nother\nother\n", "utf8").toString("base64"),
+        );
+      });
+    },
+  );
+
+  it.effect("project_doc_edit refuses to empty the document and points at delete", () => {
+    const { layer } = makeWorkClientLayer({ content: "everything" });
+
+    return Effect.gen(function* () {
+      const failure = yield* ProjectWorkToolkitHandlers.project_doc_edit({
+        runId: "run_9",
+        path: "decision.md",
+        old_string: "everything",
+        new_string: "",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+
+      assert.equal((plainError(failure) as { code?: string }).code, "PROJECT_DOC_CONTENT_INVALID");
+      assert.include(failure.message, "project_doc_delete");
+    });
+  });
+
+  it.effect("project_doc_delete sends the delete operation through the derived identity", () => {
+    const { docWrites, layer } = makeWorkClientLayer();
+
+    return Effect.gen(function* () {
+      const receipt = yield* ProjectWorkToolkitHandlers.project_doc_delete({
+        runId: "run_9",
+        path: "decision.md",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }));
+
+      assert.match(receipt.documentReceiptId, /^document:[0-9a-f]{64}$/);
+      const sent = docWrites[docWrites.length - 1];
+      assert.equal(sent?.operation, "delete");
+      assert.equal(sent?.data, undefined);
+    });
+  });
+
+  it.effect("flow-document conflicts recover via doc_read, never the work-list hint", () => {
+    const conflict = new ProjectServiceWorkClient.ProjectServiceWorkServiceRejectedError({
+      code: "FLOW_DOCUMENT_CONFLICT",
+      status: 409,
+      message:
+        'The idempotency key already recorded a different write for "decision.md"; repeat the tool call so it mints a fresh idempotency key.',
+      details: { path: "decision.md", operation: "write" },
+    });
+    const { layer } = makeWorkClientLayer({ documentWriteError: conflict });
+
+    return Effect.gen(function* () {
+      const failure = yield* ProjectWorkToolkitHandlers.project_doc_write({
+        runId: "run_9",
+        path: "decision.md",
+        content: "# decision\n",
+      }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+
+      assert.equal(
+        (plainError(failure) as { _tag: string })._tag,
+        "ProjectFlowDocumentConflictError",
+      );
+      // The wrong generic hint is gone, the right one is present, and the
+      // service's structured facts ride inside the model-visible message.
+      assert.notInclude(failure.message, "project_work_list");
+      assert.include(failure.message, "project_doc_read");
+      assert.include(failure.message, "path=decision.md");
+    });
+  });
+
+  it.effect("a rejected submit reaches the model as a failure with the envelope's why", () => {
+    const rejected: ProjectServiceWorkClient.ProjectWorkOperationRecord = {
+      status: "rejected",
+      operationId: "op_rejected_1",
+      kind: "work.run.submit",
+      requestDigest: "digest",
+      error: {
+        category: "CONFLICT",
+        code: "FLOW_TRANSITION_CONFLICT",
+        message:
+          'Transition "t_bogus" is not permitted from this work occurrence. Permitted: t_accept, t_rework.',
+        details: { permittedTransitions: ["t_accept", "t_rework"] },
+      },
+      createdAt: "2026-08-26T00:00:00.000Z",
+      resolvedAt: "2026-08-26T00:00:01.000Z",
+    };
+    const { layer } = makeWorkClientLayer({ submitResult: rejected });
+
+    return Effect.gen(function* () {
+      const failure = yield* ProjectWorkToolkitHandlers.project_work_submit({
+        runId: "run_9",
+        runRevision: "run:1",
+        assignmentRevision: "position:1",
+        result: { kind: "after", transitionId: "t_bogus" },
+      }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
+
+      assert.equal((plainError(failure) as { _tag: string })._tag, "ProjectWorkRejectedError");
+      assert.include(failure.message, "The submission was rejected (FLOW_TRANSITION_CONFLICT)");
+      assert.include(failure.message, "permittedTransitions=t_accept, t_rework");
+      assert.include(failure.message, "Call project_work_list");
     });
   });
 
@@ -688,11 +865,28 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         ProjectWorkToolkitHandlers.project_doc_write({
           runId: "run_tie_b",
           path: "decision.md",
-          operation: "update",
           content: "text",
         }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
       );
       assert.equal(writeFailure._tag, "ProjectWorkNotCurrentError");
+
+      const editFailure = yield* Effect.flip(
+        ProjectWorkToolkitHandlers.project_doc_edit({
+          runId: "run_tie_b",
+          path: "decision.md",
+          old_string: "a",
+          new_string: "b",
+        }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
+      );
+      assert.equal(editFailure._tag, "ProjectWorkNotCurrentError");
+
+      const deleteFailure = yield* Effect.flip(
+        ProjectWorkToolkitHandlers.project_doc_delete({
+          runId: "run_tie_b",
+          path: "decision.md",
+        }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
+      );
+      assert.equal(deleteFailure._tag, "ProjectWorkNotCurrentError");
 
       // The head flows through every tool unchanged.
       const document = yield* ProjectWorkToolkitHandlers.project_doc_read({
