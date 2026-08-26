@@ -38,6 +38,11 @@ const NOT_A_LIST_DETAIL = "Project list response was not a list";
 const HEALTH_FAILED_PREFIX = "Health check failed with status ";
 const SERVICE_ERROR_PREFIX = "Project list request failed with status ";
 const LOCAL_FAILURE_PREFIX = "Connection test could not run: ";
+/** Oldest Project Service this T3 speaks to: apiMinor 1 added the
+ * flow-document `write` upsert the doc tools send unconditionally. */
+const PROJECT_SERVICE_MIN_API_MINOR = 1;
+const TOO_OLD_PREFIX = "Project Service is too old for this T3 (apiMinor ";
+const TOO_OLD_SUFFIX = "); deploy Project Service first, then re-test";
 
 export class ProjectServiceConnectionTest extends Context.Service<
   ProjectServiceConnectionTest,
@@ -115,14 +120,28 @@ export const make = Effect.gen(function* () {
         return result(false, false, false, NON_LOCAL_BASE_URL_DETAIL);
       }
 
+      // The health probe also captures the advertised apiMinor for the
+      // compatibility check that follows authentication — a 200 body that
+      // will not parse degrades to "unknown", never to an error.
       const health = yield* probe(`${base}/project/v1/health`, (response) =>
-        Effect.succeed(response.status),
+        response.json.pipe(
+          Effect.map((body): { readonly status: number; readonly apiMinor: number | null } => ({
+            status: response.status,
+            apiMinor:
+              typeof body === "object" &&
+              body !== null &&
+              typeof (body as { readonly apiMinor?: unknown }).apiMinor === "number"
+                ? (body as { readonly apiMinor: number }).apiMinor
+                : null,
+          })),
+          Effect.catch(() => Effect.succeed({ status: response.status, apiMinor: null })),
+        ),
       );
       if (health === null) {
         return result(false, false, false, UNREACHABLE_DETAIL);
       }
-      if (health !== 200) {
-        return result(true, false, false, `${HEALTH_FAILED_PREFIX}${health}`);
+      if (health.status !== 200) {
+        return result(true, false, false, `${HEALTH_FAILED_PREFIX}${health.status}`);
       }
 
       if (!client.credentialSet) {
@@ -143,7 +162,16 @@ export const make = Effect.gen(function* () {
                 Effect.map(
                   (body): ProjectServiceConnectionTestResult =>
                     Array.isArray(body)
-                      ? result(true, true, true, OK_DETAIL)
+                      ? health.apiMinor !== null && health.apiMinor < PROJECT_SERVICE_MIN_API_MINOR
+                        ? result(
+                            true,
+                            true,
+                            false,
+                            `${TOO_OLD_PREFIX}${health.apiMinor}${TOO_OLD_SUFFIX}`,
+                          )
+                        : health.apiMinor === null
+                          ? result(true, true, false, `${TOO_OLD_PREFIX}unknown${TOO_OLD_SUFFIX}`)
+                          : result(true, true, true, OK_DETAIL)
                       : result(true, true, false, NOT_A_LIST_DETAIL),
                 ),
                 // An unparseable 200 body is a compatibility failure, not an

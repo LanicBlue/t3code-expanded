@@ -48,9 +48,10 @@ const transportFailure: Responder = (request) =>
   });
 
 // Health is unauthenticated; the project list requires the bearer credential.
+// apiMinor rides the health body — the compatibility gate reads it.
 const healthOk: Responder = (request) =>
   request.url.endsWith("/project/v1/health")
-    ? Response.json({ ok: true, status: "ok" })
+    ? Response.json({ ok: true, status: "ok", apiMajor: 1, apiMinor: 2 })
     : transportFailure(request);
 
 const makeLayer = (client: HttpClient.HttpClient) => {
@@ -92,6 +93,34 @@ it.layer(NodeServices.layer)("ProjectServiceConnectionTest", (it) => {
       assert.strictEqual(listRequest?.headers["authorization"], "Bearer psk_key-1.s3cret");
       const healthRequest = requests.find((request) => request.url.endsWith("/project/v1/health"));
       assert.strictEqual(healthRequest?.headers["authorization"], undefined);
+    }).pipe(Effect.provide(makeLayer(client)));
+  });
+
+  it.effect("flags an authenticated Project Service that predates apiMinor 1", () => {
+    // Old PS: health advertises apiMinor 0 (no `write` upsert) but otherwise
+    // round-trips fine — the failure must name the version, not the auth.
+    const healthOld: Responder = (request) =>
+      request.url.endsWith("/project/v1/health")
+        ? Response.json({ ok: true, status: "ok", apiMajor: 1, apiMinor: 0 })
+        : transportFailure(request);
+    const { client } = makeHttpClient((request) =>
+      request.url.endsWith("/project/v1/") ? Response.json([]) : healthOld(request),
+    );
+
+    return Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      yield* serverSettings.updateSettings({
+        projectServiceClient: { enabled: true, newCredential: "psk_key-1.s3cret" },
+      });
+      const connectionTest = yield* ProjectServiceConnectionTest.ProjectServiceConnectionTest;
+      const result = yield* connectionTest.testConnection;
+      assert.deepEqual(result, {
+        reachable: true,
+        authenticated: true,
+        apiCompatible: false,
+        detail:
+          "Project Service is too old for this T3 (apiMinor 0); deploy Project Service first, then re-test",
+      });
     }).pipe(Effect.provide(makeLayer(client)));
   });
 
