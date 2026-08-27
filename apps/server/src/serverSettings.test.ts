@@ -772,6 +772,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         baseUrl: DEFAULT_SERVER_SETTINGS.projectServiceClient.baseUrl,
         keyIdHint: "key-1",
         credentialSet: true,
+        missionsEnabled: false,
       });
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       assert.notInclude(JSON.stringify(next), "s3cret");
