@@ -121,10 +121,11 @@ export const ProjectServiceClientSettings = Schema.Struct({
    * Feature gate for the work-mission-v5 wire population (capability
    * `mission.v1`): while false T3 never declares the capability, never
    * receives mission frames, and rejects a `mission.ended` notice as
-   * not-activated. Flipped on only once the Project Service side ships the
-   * SDK 0.14 wire shapes (design work-mission-v5 §6.1). Absent = false.
+   * not-activated. work-mission-v5 Phase 7: the default is ON (the mission
+   * line is THE line — design §10 Phase 7 precondition ①). An explicit
+   * `false` remains the drain/rollback off-switch. Absent = true.
    */
-  missionsEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  missionsEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
 });
 export type ProjectServiceClientSettings = typeof ProjectServiceClientSettings.Type;
 

@@ -680,10 +680,15 @@ describe("ProjectConsumerRuntimeService", () => {
         yield* Effect.gen(function* () {
           const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
           yield* configureIntegration;
+          // work-mission-v5 Phase 7: the gate default is ON — the off-arm now
+          // pins the explicit off-switch instead of relying on the absent key.
+          yield* serverSettings.updateSettings({
+            projectServiceClient: { missionsEnabled: false },
+          });
           const service = yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService;
           yield* service.start();
 
-          // GATE OFF (the default): the SDK 0.14 registry carries mission.v1,
+          // GATE OFF (explicit): the SDK 0.14 registry carries mission.v1,
           // so the gate's job is to FILTER it out of the advertised set.
           let socket = gateway.recording.sockets[0];
           assert.isDefined(socket);
