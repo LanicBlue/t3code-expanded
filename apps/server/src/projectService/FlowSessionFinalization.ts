@@ -33,6 +33,31 @@
  * recorded no-op stays overturnable: a late association fact upgrades the
  * same event's row back to pending and re-drives it.
  *
+ * ── SCHEDULED FOR DELETION (work-mission-v5 Phase 7; do NOT extend) ────────
+ * This module (~450 lines here + its store + tests, the T3 half of the ~1,020
+ * finalization/instance→thread ledger lines) exists only for the FLOW
+ * population, which the work-mission-v5 drain period retires: mission work
+ * settles through MissionSessionSettlement (mission.ended push frames, SDK
+ * 0.14, capability mission.v1). Deletion preconditions (design §10 Phase 5
+ * record — verify ALL before deleting in Phase 7):
+ *
+ *   1. `projectServiceClient.missionsEnabled` has flipped its DEFAULT to true
+ *      (or the gate is removed), and PS's MISSION_V1 process flag is on in
+ *      every deployment this consumer connects to.
+ *   2. One full release cycle elapsed with the gate default flipped and NO
+ *      rollback to the flow path (no incident that re-enabled flow-instance
+ *      work as the primary population).
+ *   3. PS stopped emitting flow instances: no run in any connected project's
+ *      `task.instance` population remains OPEN (drain complete), and PS's
+ *      flow.ended (fen_) frames are no longer delivered to any connection.
+ *   4. The verification checklist at deletion time: mission.ended settlement
+ *      green in prod telemetry (mne_ deliveries acked, no pending-ledger
+ *      stalls); AssignedWorkQueue's flowInstanceKeyOf population unreachable
+ *      (every open run carries task.mission); ProjectRetirement and
+ *      MissionSessionSettlement suites green unchanged; the flow-finalization
+ *      + session-route LEDGER FILES retained read-only for audit (historical
+ *      rows reference them), only the drivers are deleted.
+ *
  * @module FlowSessionFinalization
  */
 import type { OrchestrationThreadShell, ServerSettings } from "@t3tools/contracts";

@@ -28,11 +28,11 @@ import {
   type ConsumerSocketLike,
   type RuntimeConsumerAdapter,
   CONSUMER_CAPABILITIES,
+  CONSUMER_CAPABILITY_MISSION_V1,
   CONSUMER_CLIENT_LATEST,
 } from "@lanicblue/project-consumer";
 import {
   isLocalProjectServiceBaseUrl,
-  MISSION_CAPABILITY_V1,
   type MissionEndedNoticeFacts,
   type OrchestrationCommand,
   ProviderInstanceId,
@@ -346,28 +346,21 @@ export const routeProjectConsumerMissionEnded = Effect.fn("ProjectConsumerRuntim
 );
 
 /**
- * The SDK's adapter surface plus the retirement and mission-ended hooks this
- * server is ready to answer. The vendored SDK generation calls neither yet —
- * the Project Service side of those frames (and the SDK delivery/ACK surface
- * for them, SDK 0.14 for mission.ended) is tracked separately; the methods
- * are in place so those upgrades are no-ops here. The mission-ended hook
- * carries its own gate (see routeProjectConsumerMissionEnded).
+ * The SDK's (0.14) adapter surface: listAgents + wakeAgent + the mission.ended
+ * RECORDING hook (onMissionEnded — fen_-twin ACK discipline: resolving means
+ * the settlement ledger durably recorded the notice; a throw reports
+ * delivery.failure so the Project Service redelivers, which is exactly how the
+ * settlement's `waiting` outcome keeps a not-yet-safe-idle session pending).
+ * The hook carries its own gate (see routeProjectConsumerMissionEnded).
  */
-type NoticeExtendedConsumerAdapter = RuntimeConsumerAdapter & {
-  readonly projectRetired: (input: ProjectRetiredNoticeInput) => Promise<void>;
-  readonly missionEnded: (input: MissionEndedNoticeFacts) => Promise<void>;
-};
-
 const consumerAdapter = (
   serverSettings: ServerSettings.ServerSettingsService["Service"],
   router: ProjectWorkSessionRouter,
-  retirement: ProjectRetirementHandler,
   missionSettlement: MissionSessionSettlementHandler,
-): NoticeExtendedConsumerAdapter => ({
+): RuntimeConsumerAdapter => ({
   listAgents: () => Effect.runPromise(listProjectConsumerAgents(serverSettings)),
   wakeAgent: (input) => Effect.runPromise(routeProjectConsumerWake(router, input)),
-  projectRetired: (input) => Effect.runPromise(routeProjectConsumerRetirement(retirement, input)),
-  missionEnded: (input) =>
+  onMissionEnded: (input) =>
     Effect.runPromise(routeProjectConsumerMissionEnded(missionSettlement, serverSettings, input)),
 });
 
@@ -782,7 +775,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
 
     const runtimeRef = yield* Ref.make<ProjectConsumerRuntime | null>(null);
     const runtimeSignatureRef = yield* Ref.make<string | null>(null);
-    const adapter = consumerAdapter(serverSettings, router, retirement, missionSettlement);
+    const adapter = consumerAdapter(serverSettings, router, missionSettlement);
 
     // Set while the SERVICE closes a runtime itself (replace, disable,
     // finalizer) so the runtime's synchronous `stopped` callback can tell an
@@ -895,16 +888,31 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         // ladder, which compares SDK versions — the t3 package version
         // (0.0.33) semantically ranks below SDK 0.1.0 and shows "unsupported".
         client: { name: "t3-code", version: CONSUMER_CLIENT_LATEST },
-        // The SDK's own capability set, plus mission.v1 while the gate is on
-        // (work-mission-v5 §6.1: connections that did not declare the token
-        // never receive mission frames — the visit/mission population stays
-        // inert until the Project Service side ships and the operator opts in).
+        // The SDK 0.14 capability registry INCLUDES mission.v1 — the gate is
+        // now a FILTER, not an append: on = the registry verbatim (declare
+        // mission.v1 so the server may send mission frames), off = the registry
+        // minus the mission token (work-mission-v5 §6.1: a connection that did
+        // not declare the token never meets a frame its decoder must handle).
         capabilities: desired.missions
-          ? [...CONSUMER_CAPABILITIES, MISSION_CAPABILITY_V1]
-          : CONSUMER_CAPABILITIES,
+          ? CONSUMER_CAPABILITIES
+          : CONSUMER_CAPABILITIES.filter((token) => token !== CONSUMER_CAPABILITY_MISSION_V1),
         adapter,
         serviceKey: desired.credential,
         runtime: process.version,
+        // project.retired (prn_) frames arrive as soon as the registry's
+        // project.retired.v1 token is declared — the SDK ACKs every frame
+        // regardless (idempotent server-side delivery), so this hook is a
+        // prompt KICK of the retirement cleanup whose failures the local
+        // pending ledger already retries on the sweep, thread events, and
+        // startup. Never throws into the SDK.
+        onProjectRetired: (notice) => {
+          void Effect.runPromise(
+            routeProjectConsumerRetirement(retirement, {
+              noticeId: notice.noticeId,
+              projectId: notice.projectId,
+            }),
+          ).catch(() => undefined);
+        },
         ...(overrides?.socketFactory !== undefined
           ? { socketFactory: overrides.socketFactory }
           : {}),
