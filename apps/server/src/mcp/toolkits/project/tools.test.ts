@@ -2,6 +2,8 @@ import { expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import { Tool } from "effect/unstable/ai";
 
+import { ProjectWorkVisitSubmitResult } from "@t3tools/contracts";
+
 import {
   ProjectDocDeleteInput,
   ProjectDocEditInput,
@@ -99,6 +101,70 @@ it("never accepts an identity or credential field in any tool input", () => {
       ).not.toContain(forbidden);
     }
   }
+});
+
+it("accepts the visit-population submit result vocabulary (outcome/nextNode/reason/feedback)", () => {
+  // The pinned §6.1 submit result for a visit run: outcome is required and
+  // picks from task.action.outcomes; nextNode is the agent's routing choice
+  // (candidates are a hint); reason/feedback/documentReceiptIds are optional
+  // riders — PS owns the off-contract reason REQUIREMENT, the tool boundary
+  // only carries the vocabulary.
+  const decode = Schema.decodeUnknownSync(ProjectWorkSubmitInput);
+  const decoded = decode({
+    runId: "run_v1",
+    runRevision: "run:4",
+    assignmentRevision: "position:2",
+    result: {
+      outcome: "implementation-defect",
+      nextNode: "implement",
+      reason: "validation found the edge case unsatisfied",
+      feedback: "re-run the auth suite after the fix",
+      documentReceiptIds: ["rcpt_1"],
+    },
+  });
+  expect(decoded.result).toEqual({
+    outcome: "implementation-defect",
+    nextNode: "implement",
+    reason: "validation found the edge case unsatisfied",
+    feedback: "re-run the auth suite after the fix",
+    documentReceiptIds: ["rcpt_1"],
+  });
+  // The minimal visit result: outcome alone (single-continuation or terminal).
+  const minimal = decode({
+    runId: "run_v1",
+    runRevision: "run:4",
+    assignmentRevision: "position:2",
+    result: { outcome: "implementation-ready" },
+  });
+  expect(minimal.result).toEqual({ outcome: "implementation-ready" });
+  // The typed visit vocabulary pins outcome as required…
+  expect(() =>
+    Schema.decodeUnknownSync(ProjectWorkVisitSubmitResult)({ nextNode: "implement" }),
+  ).toThrow();
+  // …and carries the same fields the tool description teaches.
+  expect(
+    Schema.decodeUnknownSync(ProjectWorkVisitSubmitResult)({
+      outcome: "design-clarification",
+      nextNode: "design",
+      reason: "the API contract is ambiguous about pagination",
+    }),
+  ).toEqual({
+    outcome: "design-clarification",
+    nextNode: "design",
+    reason: "the API contract is ambiguous about pagination",
+  });
+});
+
+it("the submit tool description teaches the visit contract: candidates hint, off-contract reason", () => {
+  const description = ProjectWorkToolkit.tools.project_work_submit.description ?? "";
+  // The visit population's submit semantics are agent-facing contract text:
+  // they must name the outcome domain, the candidates' hint-not-constraint
+  // status, and the off-contract reason requirement.
+  expect(description).toContain("VISIT work");
+  expect(description).toContain("task.action.outcomes");
+  expect(description).toContain("task.action.candidates");
+  expect(description).toContain("off-contract");
+  expect(description).toContain('"reason"');
 });
 
 it("strips identity keys an agent smuggles into business arguments", () => {

@@ -69,6 +69,7 @@ const makeSettings = (): ServerSettings => {
       baseUrl: "http://127.0.0.1:7600",
       keyIdHint: "key-1",
       credentialSet: true,
+      missionsEnabled: false,
     },
     logicalAgents: agents as ServerSettings["logicalAgents"],
   };

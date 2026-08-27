@@ -9,7 +9,11 @@
  *
  * @module ProjectServiceWorkClient
  */
-import { isLocalProjectServiceBaseUrl, PositiveInt } from "@t3tools/contracts";
+import {
+  isLocalProjectServiceBaseUrl,
+  PositiveInt,
+  ProjectWorkVisitView,
+} from "@t3tools/contracts";
 import {
   ProjectConsumerWorkClient,
   ProjectConsumerWorkClientError,
@@ -169,8 +173,39 @@ export const ProjectWorkRunRecord = Schema.Struct({
   workspacePolicy: Schema.optional(Schema.String),
   workspacePath: Schema.optional(Schema.String),
   action: Schema.optional(ProjectWorkActionRecord),
+  /**
+   * The decoded VISIT view of `task` (work-mission-v5 population, capability
+   * mission.v1): present iff the task carries a `mission` block — the
+   * discriminator against the legacy flow population (`task.instance`).
+   * Client-side projection: the wire carries the blocks inside `task`; this
+   * field is the same facts decoded once at the trust boundary.
+   */
+  visit: Schema.optional(ProjectWorkVisitView),
 });
 export type ProjectWorkRunRecord = typeof ProjectWorkRunRecord.Type;
+
+/**
+ * Decode the visit view out of a run's task snapshot: null when the task has
+ * no `mission` block (the flow population — `task.instance` — and standalone
+ * work), the decoded view when it does. The decode REBUILDS the record, so
+ * the view carries exactly the pinned §6.1 blocks — never the whole task
+ * (the prompt and other task facts stay on `task`, where they belong). A task
+ * that DECLARES the mission population but does not decode against the
+ * pinned shape is an incompatibility like any other bad shape — never a
+ * silently-ignored block.
+ */
+const decodeVisitView = Schema.decodeUnknownSync(ProjectWorkVisitView);
+const visitViewOfTask = (task: Readonly<Record<string, unknown>>): ProjectWorkVisitView | null => {
+  const mission = task.mission;
+  if (typeof mission !== "object" || mission === null) {
+    return null;
+  }
+  try {
+    return decodeVisitView(task);
+  } catch {
+    throw new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" });
+  }
+};
 
 /**
  * A Project Service project record (the ordinary-client-legal project info
@@ -342,21 +377,28 @@ export type ProjectWorkOperationRecord = typeof ProjectWorkOperationRecord.Type;
  * (projectId, executorRef, workspaceRef) the agent must never see, so records
  * are rebuilt field-by-field rather than passed through.
  */
-const projectRunRecord = (run: ProjectWorkRunRecord): ProjectWorkRunRecord => ({
-  runId: run.runId,
-  positionId: run.positionId,
-  runRevision: run.runRevision,
-  state: run.state,
-  ...(run.agentId === undefined ? {} : { agentId: run.agentId }),
-  task: run.task,
-  createdAt: run.createdAt,
-  ...(run.resolvedAt === undefined ? {} : { resolvedAt: run.resolvedAt }),
-  ...(run.workspacePolicy === undefined ? {} : { workspacePolicy: run.workspacePolicy }),
-  ...(run.workspacePath === undefined ? {} : { workspacePath: run.workspacePath }),
-  // The completion contract (PS apiMinor 2) is agent-facing like the rest of
-  // this projection — absent on older PS stays absent.
-  ...(run.action === undefined ? {} : { action: run.action }),
-});
+const projectRunRecord = (run: ProjectWorkRunRecord): ProjectWorkRunRecord => {
+  // The visit view derives from the task snapshot (the wire carries the
+  // mission blocks inside `task`); decoding here puts every later consumer
+  // — queue keys, session routing, the MCP tools — behind one boundary.
+  const visit = visitViewOfTask(run.task);
+  return {
+    runId: run.runId,
+    positionId: run.positionId,
+    runRevision: run.runRevision,
+    state: run.state,
+    ...(run.agentId === undefined ? {} : { agentId: run.agentId }),
+    task: run.task,
+    createdAt: run.createdAt,
+    ...(run.resolvedAt === undefined ? {} : { resolvedAt: run.resolvedAt }),
+    ...(run.workspacePolicy === undefined ? {} : { workspacePolicy: run.workspacePolicy }),
+    ...(run.workspacePath === undefined ? {} : { workspacePath: run.workspacePath }),
+    // The completion contract (PS apiMinor 2) is agent-facing like the rest of
+    // this projection — absent on older PS stays absent.
+    ...(run.action === undefined ? {} : { action: run.action }),
+    ...(visit === null ? {} : { visit }),
+  };
+};
 
 const projectPositionRecord = (position: ProjectWorkPositionRecord): ProjectWorkPositionRecord => ({
   positionId: position.positionId,

@@ -104,6 +104,38 @@ const POSITION_VIEW = {
   assignmentRevision: "position:5",
 };
 
+/**
+ * A visit-population run view per the pinned work-mission-v5 §6.1 contract:
+ * task.mission replaces task.instance, task.work carries the workspace group,
+ * and task.action is the visit completion contract (outcome vocabulary +
+ * candidate next stations). The run-level `action` of the flow population is
+ * absent on visits — its home is inside the task snapshot.
+ */
+const VISIT_RUN_VIEW = {
+  runId: "run_v1",
+  projectId: "proj_ps_1",
+  projectGeneration: 7,
+  positionId: "pos_implement",
+  workspaceRef: "wt-ms_a",
+  state: "open",
+  runRevision: "run:9",
+  agentId: "ag_one",
+  executorRef: "client-1:ag_one",
+  task: {
+    prompt: "以 design.md 为唯一需求 authority 实现登录修复",
+    mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
+    work: { group: "ms_a", workKey: "implement", iteration: 1 },
+    executor: { type: "agent", executorRef: "client-1:ag_one" },
+    action: {
+      kind: "visit",
+      outcomes: ["implementation-ready", "design-clarification"],
+      candidates: ["validation"],
+    },
+  },
+  createdAt: "2026-08-27T00:00:00.000Z",
+  resolvedAt: null,
+};
+
 const OPERATION_VIEW = {
   operationId: "op_123",
   kind: "work.execute",
@@ -193,6 +225,92 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
       assert.strictEqual(listMyRequest?.headers["authorization"], `Bearer ${CREDENTIAL}`);
       assert.match(listMyRequest?.url ?? "", /projectGeneration=7/);
       assert.match(listMyRequest?.url ?? "", /agentId=ag_one/);
+    }).pipe(Effect.provide(makeLayer(client)));
+  });
+
+  it.effect("decodes the mission visit view onto the run record", () => {
+    const visitByPath: Responder = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === "/project/v1/proj_ps_1/work-runs/my") return okBody([VISIT_RUN_VIEW]);
+      if (url.pathname === "/project/v1/proj_ps_1/work-runs/run_v1") return okBody(VISIT_RUN_VIEW);
+      return transportFailure(request);
+    };
+    const { client } = makeHttpClient(serviceByPath(visitByPath));
+
+    return Effect.gen(function* () {
+      yield* enableClient;
+      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+      const runs = yield* work.listMy({
+        projectId: "proj_ps_1",
+        projectGeneration: 7,
+        agentId: "ag_one",
+      });
+      // The visit view rides the record as the DECODED projection of the
+      // task's mission blocks; the raw task passes through untouched (the
+      // flow population's consumers keep their structural reads).
+      assert.deepEqual(runs, [
+        {
+          runId: "run_v1",
+          positionId: "pos_implement",
+          runRevision: "run:9",
+          state: "open",
+          agentId: "ag_one",
+          task: VISIT_RUN_VIEW.task,
+          createdAt: "2026-08-27T00:00:00.000Z",
+          resolvedAt: null,
+          visit: {
+            mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
+            work: { group: "ms_a", workKey: "implement", iteration: 1 },
+            action: {
+              kind: "visit",
+              outcomes: ["implementation-ready", "design-clarification"],
+              candidates: ["validation"],
+            },
+          },
+        },
+      ]);
+
+      const run = yield* work.getRun({
+        projectId: "proj_ps_1",
+        projectGeneration: 7,
+        runId: "run_v1",
+        agentId: "ag_one",
+      });
+      assert.deepEqual(run?.visit?.mission.id, "ms_a");
+      assert.deepEqual(run?.visit?.work.group, "ms_a");
+    }).pipe(Effect.provide(makeLayer(client)));
+  });
+
+  it.effect("a task that declares the mission population but fails the pinned shape is an incompatibility", () => {
+    const halfMission = {
+      ...VISIT_RUN_VIEW,
+      task: {
+        prompt: "x",
+        // mission present (the population discriminator) but the work block
+        // and the visit action are missing — not a silently-ignored block.
+        mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
+      },
+    };
+    const { client } = makeHttpClient(
+      serviceByPath((request) => {
+        const url = new URL(request.url);
+        if (url.pathname === "/project/v1/proj_ps_1/work-runs/my") return okBody([halfMission]);
+        return transportFailure(request);
+      }),
+    );
+
+    return Effect.gen(function* () {
+      yield* enableClient;
+      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+      const failure = yield* work
+        .listMy({ projectId: "proj_ps_1", projectGeneration: 7, agentId: "ag_one" })
+        .pipe(Effect.flip);
+      assert.deepEqual(plainError(failure), {
+        _tag: "ProjectServiceWorkApiIncompatibleError",
+        code: "PROJECT_WORK_RESPONSE_SHAPE",
+      });
     }).pipe(Effect.provide(makeLayer(client)));
   });
 

@@ -7,8 +7,11 @@ import {
   isLocalProjectServiceBaseUrl,
   LogicalAgentConfig,
   LogicalAgentId,
+  MissionEndedNoticeFacts,
   parseProjectServiceCredential,
   ProjectServiceClientSettings,
+  ProjectWorkVisitSubmitResult,
+  ProjectWorkVisitView,
 } from "./projectService.ts";
 import { DEFAULT_SERVER_SETTINGS, ServerSettings, ServerSettingsPatch } from "./settings.ts";
 
@@ -55,6 +58,71 @@ describe("ProjectServiceClientSettings", () => {
       baseUrl: DEFAULT_PROJECT_SERVICE_BASE_URL,
       keyIdHint: "",
       credentialSet: false,
+      // The mission.v1 gate: absent means OFF — a stored settings file from
+      // before the work-mission-v5 wire never activates mission frames.
+      missionsEnabled: false,
+    });
+  });
+
+  it("decodes an explicitly enabled mission gate", () => {
+    expect(
+      decodeClientSettings({ enabled: true, missionsEnabled: true, credentialSet: true }),
+    ).toEqual({
+      enabled: true,
+      baseUrl: DEFAULT_PROJECT_SERVICE_BASE_URL,
+      keyIdHint: "",
+      credentialSet: true,
+      missionsEnabled: true,
+    });
+  });
+});
+
+describe("work-mission-v5 wire types", () => {
+  const decodeVisitView = Schema.decodeUnknownSync(ProjectWorkVisitView);
+
+  it("decodes the pinned §6.1 visit view: mission, work, visit action", () => {
+    expect(
+      decodeVisitView({
+        mission: { id: "ms_abc", name: "Release v2", objective: "Ship the release" },
+        work: { group: "ms_abc", workKey: "implement", iteration: 2 },
+        action: { kind: "visit", outcomes: ["implementation-ready"], candidates: ["validation"] },
+      }),
+    ).toEqual({
+      mission: { id: "ms_abc", name: "Release v2", objective: "Ship the release" },
+      work: { group: "ms_abc", workKey: "implement", iteration: 2 },
+      action: { kind: "visit", outcomes: ["implementation-ready"], candidates: ["validation"] },
+    });
+  });
+
+  it("rejects a non-visit action kind and an outcomeless submit result", () => {
+    expect(() =>
+      decodeVisitView({
+        mission: { id: "ms_abc", name: "n", objective: "o" },
+        work: { group: "ms_abc", workKey: "implement", iteration: 1 },
+        action: { kind: "state", abandonAvailable: true },
+      }),
+    ).toThrow();
+    expect(() => Schema.decodeUnknownSync(ProjectWorkVisitSubmitResult)({ nextNode: "design" })).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(MissionEndedNoticeFacts)({
+        noticeId: "mne_x",
+        missionId: "ms_abc",
+        group: "ms_abc",
+        disposition: "exploded",
+      }),
+    ).toThrow();
+    expect(
+      Schema.decodeUnknownSync(MissionEndedNoticeFacts)({
+        noticeId: "mne_x",
+        missionId: "ms_abc",
+        group: "ms_abc",
+        disposition: "abandoned",
+      }),
+    ).toEqual({
+      noticeId: "mne_x",
+      missionId: "ms_abc",
+      group: "ms_abc",
+      disposition: "abandoned",
     });
   });
 });

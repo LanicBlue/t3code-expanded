@@ -44,7 +44,38 @@ export const currentAssignedWork = (
   runs: ReadonlyArray<AssignedWorkQueueEntry>,
 ): AssignedWorkQueueEntry | null => orderAssignedWorkQueue(runs).at(0) ?? null;
 
-// ── Flow-instance scoping ────────────────────────────────────────
+// ── Work-group scoping (drain-period dual population) ────────────
+
+/**
+ * The run's `task.mission` block when present — the work-mission-v5 visit
+ * population's discriminator (design §6.1: task.mission vs task.instance).
+ * Structural read only; the decoded contract view lives on the run record's
+ * `visit` field (ProjectServiceWorkClient).
+ */
+const missionBlockOf = (run: AssignedWorkQueueEntry): Record<string, unknown> | null => {
+  const mission = run.task.mission;
+  return typeof mission === "object" && mission !== null
+    ? (mission as Record<string, unknown>)
+    : null;
+};
+
+/** The run's `task.mission.id` when a non-blank string; "" without one. */
+export const missionKeyOf = (run: AssignedWorkQueueEntry): string => {
+  const mission = missionBlockOf(run);
+  if (mission === null) return "";
+  const id = mission.id;
+  return typeof id === "string" && id.trim().length > 0 ? id : "";
+};
+
+/** The run's `task.mission.name` trimmed; null when absent or blank. */
+export const missionNameOf = (run: AssignedWorkQueueEntry): string | null => {
+  const mission = missionBlockOf(run);
+  if (mission === null) return null;
+  const name = mission.name;
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
 
 /** The run's `task.instance.instanceId` when a non-blank string; "" without one. */
 export const flowInstanceKeyOf = (run: AssignedWorkQueueEntry): string => {
@@ -65,9 +96,26 @@ export const flowInstanceNameOf = (run: AssignedWorkQueueEntry): string | null =
 };
 
 /**
- * Open runs grouped by flow-instance key (same open-only discipline as
+ * The session-grouping key under the drain-period dual population (design
+ * §6.1, pinned): the mission population keys by `task.mission.id`, the flow
+ * population by `task.instance.instanceId` — this is not an API alias but the
+ * two populations' real coexistence, so one key function serves both and the
+ * mission ids and instance ids never collide (ms_ vs instance namespaces).
+ */
+export const workGroupKeyOf = (run: AssignedWorkQueueEntry): string =>
+  missionBlockOf(run) !== null ? missionKeyOf(run) : flowInstanceKeyOf(run);
+
+/**
+ * The display name of a run's group — the mission's name for the visit
+ * population, the instance's name for the flow population; null when absent.
+ */
+export const workGroupNameOf = (run: AssignedWorkQueueEntry): string | null =>
+  missionBlockOf(run) !== null ? missionNameOf(run) : flowInstanceNameOf(run);
+
+/**
+ * Open runs grouped by work-group key (same open-only discipline as
  * `orderAssignedWorkQueue`, so a partition of only settled runs never exists
- * and no key is ever minted for a dead instance). Map iteration order is the
+ * and no key is ever minted for a dead group). Map iteration order is the
  * keys' first appearance in the input.
  */
 export const partitionOpenWork = (
@@ -76,7 +124,7 @@ export const partitionOpenWork = (
   const partitions = new Map<string, Array<AssignedWorkQueueEntry>>();
   for (const run of runs) {
     if (run.state !== "open") continue;
-    const key = flowInstanceKeyOf(run);
+    const key = workGroupKeyOf(run);
     const partition = partitions.get(key);
     if (partition === undefined) {
       partitions.set(key, [run]);
@@ -89,15 +137,13 @@ export const partitionOpenWork = (
 
 /**
  * A session's run universe: null owns every run (project scope); a string
- * owns that instance's runs, with "" as the legacy no-instance bucket.
+ * owns that group's runs, with "" as the legacy no-instance bucket.
  */
-export const runsForFlowInstance = (
+export const runsForWorkGroup = (
   runs: ReadonlyArray<AssignedWorkQueueEntry>,
-  flowInstanceKey: string | null,
+  workGroupKey: string | null,
 ): Array<AssignedWorkQueueEntry> =>
-  flowInstanceKey === null
-    ? [...runs]
-    : runs.filter((run) => flowInstanceKeyOf(run) === flowInstanceKey);
+  workGroupKey === null ? [...runs] : runs.filter((run) => workGroupKeyOf(run) === workGroupKey);
 
 /**
  * A compact one-line summary of a work task payload for wake messages. The

@@ -1,4 +1,4 @@
-import { PositiveInt } from "@t3tools/contracts";
+import { PositiveInt, ProjectWorkVisitView } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -276,7 +276,8 @@ export const ProjectWorkSubmitInput = Schema.Struct({
       'The position\'s current assignment revision token from project_work_list (e.g. "position:2"); pass it back verbatim — a stale value is rejected as a conflict.',
   }),
   result: Schema.Record(Schema.String, Schema.Unknown).annotate({
-    description: "The work result payload; its shape is defined by the position's work definition.",
+    description:
+      'The work result payload — the shape the run\'s completion contract calls for. Flow-population runs (task.instance): {"kind":"after","transitionId"?,"message"?} for state work, {"kind":"terminal","message"?}, {"kind":"before","outcome":"accept"|"reject","feedback"?} for gates, {"kind":"abandon","message"} to abandon. Visit-population runs (task.mission): {"outcome": one of task.action.outcomes, "nextNode"?: a target workKey — task.action.candidates lists the in-contract ones, "reason": REQUIRED whenever nextNode is outside the candidates (off-contract needs its why), "feedback"?: context for a rework hop, "documentReceiptIds"?: receipts from project_doc_write/edit}. The server validates the result against the contract and rejects mismatches with a structured error.',
   }),
 });
 
@@ -319,6 +320,13 @@ const ProjectWorkListItem = Schema.Struct({
    * paths of the run's document rights. Absent on older PS deployments.
    */
   action: Schema.optional(ProjectServiceWorkClient.ProjectWorkActionRecord),
+  /**
+   * The decoded VISIT view of `task` (mission population, §6.1): mission /
+   * work-station facts plus the visit completion contract — the outcome
+   * vocabulary and the candidate next stations the submit hints below read.
+   * Absent on flow-population and standalone runs.
+   */
+  visit: Schema.optional(ProjectWorkVisitView),
 });
 
 const ProjectWorkPositionItem = Schema.Struct({
@@ -368,7 +376,7 @@ export const ProjectWorkGetTool = Tool.make("project_work_get", {
 
 export const ProjectWorkSubmitTool = Tool.make("project_work_submit", {
   description:
-    'Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Match the run\'s completion contract — the action field on the run project_work_list returns spells it out (kind, the transitions with their target states, the gate outcomes, the document paths). In short: a STATE work submits {"kind":"after", "message"?} — add "transitionId" only when action.transitions lists more than one — or {"kind":"abandon", "message"} to abandon the whole instance (the reason is mandatory; an abandon gate reviews it, and a rejection bounces the state for one more attempt); a TERMINAL work submits {"kind":"terminal", "message"?} which ends the instance; a GATE work submits {"kind":"before", "outcome":"accept"|"reject"} — reject REQUIRES "feedback" and sends the SAME instance back for rework (action.review.rejectTo names where): a fresh run re-delivers automatically, and its prompt carries a \'Rework context\' block (attempt ordinal + prior gate feedback) that the next attempt must address. Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
+    'Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Match the run\'s completion contract — the action field on the run project_work_list returns spells it out (kind, the transitions with their target states, the gate outcomes, the document paths). In short: a STATE work submits {"kind":"after", "message"?} — add "transitionId" only when action.transitions lists more than one — or {"kind":"abandon", "message"} to abandon the whole instance (the reason is mandatory; an abandon gate reviews it, and a rejection bounces the state for one more attempt); a TERMINAL work submits {"kind":"terminal", "message"?} which ends the instance; a GATE work submits {"kind":"before", "outcome":"accept"|"reject"} — reject REQUIRES "feedback" and sends the SAME instance back for rework (action.review.rejectTo names where): a fresh run re-delivers automatically, and its prompt carries a \'Rework context\' block (attempt ordinal + prior gate feedback) that the next attempt must address. A VISIT work (task.action.kind "visit", mission population) submits {"outcome": <one of task.action.outcomes>, "nextNode"?: <target workKey>, "reason"?, "feedback"?, "documentReceiptIds"?}: outcome picks from THIS station\'s vocabulary; nextNode is YOUR routing choice — task.action.candidates lists the in-contract targets as a hint, not a constraint, but a nextNode outside the candidates is off-contract and REQUIRES "reason" (the choice is semantics and gets recorded); omit nextNode only when the contract leaves exactly one continuation or the outcome is terminal; "feedback" carries rework context when the outcome sends the mission back. Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
   parameters: ProjectWorkSubmitInput,
   success: ProjectServiceWorkClient.ProjectWorkOperationRecord,
   failure: ProjectWorkError,

@@ -321,6 +321,7 @@ const handlers = {
                     ? {}
                     : { workspacePath: current.workspacePath }),
                   ...(current.action === undefined ? {} : { action: current.action }),
+                  ...(current.visit === undefined ? {} : { visit: current.visit }),
                 },
               ],
         queuedWorkCount: Math.max(0, queue.length - 1),

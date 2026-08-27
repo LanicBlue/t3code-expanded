@@ -117,6 +117,14 @@ export const ProjectServiceClientSettings = Schema.Struct({
   /** psk_ keyId prefix of the stored credential — a public lookup key. */
   keyIdHint: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   credentialSet: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * Feature gate for the work-mission-v5 wire population (capability
+   * `mission.v1`): while false T3 never declares the capability, never
+   * receives mission frames, and rejects a `mission.ended` notice as
+   * not-activated. Flipped on only once the Project Service side ships the
+   * SDK 0.14 wire shapes (design work-mission-v5 §6.1). Absent = false.
+   */
+  missionsEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ProjectServiceClientSettings = typeof ProjectServiceClientSettings.Type;
 
@@ -131,6 +139,7 @@ export const ProjectServiceClientSettingsPatch = Schema.Struct({
   baseUrl: Schema.optionalKey(TrimmedString),
   newCredential: Schema.optionalKey(TrimmedNonEmptyString),
   clearCredential: Schema.optionalKey(Schema.Boolean),
+  missionsEnabled: Schema.optionalKey(Schema.Boolean),
 });
 export type ProjectServiceClientSettingsPatch = typeof ProjectServiceClientSettingsPatch.Type;
 
@@ -225,6 +234,101 @@ export type LogicalAgentConfig = typeof LogicalAgentConfig.Type;
 /** Map shape for `ServerSettings.logicalAgents`, keyed by `LogicalAgentId`. */
 export const LogicalAgentConfigMap = Schema.Record(LogicalAgentId, LogicalAgentConfig);
 export type LogicalAgentConfigMap = typeof LogicalAgentConfigMap.Type;
+
+// ── work-mission-v5 visit view (capability `mission.v1`) ─────────
+
+/**
+ * The mission a visit run belongs to — the `task.mission` block of the
+ * work-mission-v5 visit view (design §6.1, SDK 0.14). Replaces the flow
+ * shape's `task.instance` as the run's task identity: `id` is the stable
+ * mission identity (also the workspace grouping key's source), `name` and
+ * `objective` are display/task text.
+ */
+export const ProjectWorkMissionRecord = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  objective: Schema.String,
+});
+export type ProjectWorkMissionRecord = typeof ProjectWorkMissionRecord.Type;
+
+/**
+ * The work-station facts of a visit run — the `task.work` block of the visit
+ * view. `group` is the workspace grouping key (missionId for mission work);
+ * `workKey` names the station; `iteration` is the visit's round at that
+ * station.
+ */
+export const ProjectWorkVisitWorkRecord = Schema.Struct({
+  group: Schema.String,
+  workKey: Schema.String,
+  iteration: Schema.Number,
+});
+export type ProjectWorkVisitWorkRecord = typeof ProjectWorkVisitWorkRecord.Type;
+
+/**
+ * The visit completion contract — the `task.action` block of the visit view:
+ * `outcomes` is THIS station's vocabulary (the submit `outcome` domain),
+ * `candidates` the in-contract target stations for the current pending state.
+ * Candidates are a choice HINT, not a constraint — off-contract targets are
+ * legal within the station's handoff permission and require a submit `reason`.
+ */
+export const ProjectWorkVisitActionRecord = Schema.Struct({
+  kind: Schema.Literals(["visit"]),
+  outcomes: Schema.Array(Schema.String),
+  candidates: Schema.Array(Schema.String),
+});
+export type ProjectWorkVisitActionRecord = typeof ProjectWorkVisitActionRecord.Type;
+
+/**
+ * The decoded visit view of a run's `task` snapshot (the work-mission-v5
+ * population). Present iff `task.mission` is — the discriminator between the
+ * visit population and the legacy flow population (`task.instance`); the two
+ * coexist for the migration drain period (design §6.1).
+ */
+export const ProjectWorkVisitView = Schema.Struct({
+  mission: ProjectWorkMissionRecord,
+  work: ProjectWorkVisitWorkRecord,
+  action: ProjectWorkVisitActionRecord,
+});
+export type ProjectWorkVisitView = typeof ProjectWorkVisitView.Type;
+
+/**
+ * The submit result vocabulary for a visit run (run.submit / user-complete
+ * result, envelope unchanged): `outcome` picks from the station's
+ * `action.outcomes`; `nextNode` is the agent-chosen next station (PS judges
+ * permission); `reason` is REQUIRED when `nextNode` is off-contract;
+ * `feedback` rides a rework hop; `documentReceiptIds` are the notarized write
+ * receipts. The flow population keeps its own result shapes ({"kind":"after"},
+ * gates, terminals) — the two never mix on one run.
+ */
+export const ProjectWorkVisitSubmitResult = Schema.Struct({
+  outcome: Schema.String,
+  nextNode: Schema.optional(Schema.String),
+  reason: Schema.optional(Schema.String),
+  feedback: Schema.optional(Schema.String),
+  documentReceiptIds: Schema.optional(Schema.Array(Schema.String)),
+});
+export type ProjectWorkVisitSubmitResult = typeof ProjectWorkVisitSubmitResult.Type;
+
+/**
+ * The `mission.ended` push frame's facts (minus the envelope `type`), as the
+ * settlement intake reads them: `group` is the workspace grouping key the
+ * sessions live under, `disposition` the mission's end state. The noticeId is
+ * the idempotency key; the durable local ledger record is the ACK commit
+ * point (same semantics as the fen_ flow-ended deliveries).
+ */
+export const MissionEndedNoticeFacts = Schema.Struct({
+  noticeId: Schema.String,
+  missionId: Schema.String,
+  group: Schema.String,
+  disposition: Schema.Literals(["completed", "abandoned", "deleted"]),
+  outcome: Schema.optional(Schema.NullOr(Schema.String)),
+  workspacePolicy: Schema.optional(Schema.String),
+  workspaceRef: Schema.optional(Schema.NullOr(Schema.String)),
+});
+export type MissionEndedNoticeFacts = typeof MissionEndedNoticeFacts.Type;
+
+/** The capability token gating every mission frame (design §6.1). */
+export const MISSION_CAPABILITY_V1 = "mission.v1";
 
 // ── Connection test ──────────────────────────────────────────────
 

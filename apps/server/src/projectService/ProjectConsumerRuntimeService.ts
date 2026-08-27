@@ -27,10 +27,13 @@ import {
   type ConsumerRuntimeState,
   type ConsumerSocketLike,
   type RuntimeConsumerAdapter,
+  CONSUMER_CAPABILITIES,
   CONSUMER_CLIENT_LATEST,
 } from "@lanicblue/project-consumer";
 import {
   isLocalProjectServiceBaseUrl,
+  MISSION_CAPABILITY_V1,
+  type MissionEndedNoticeFacts,
   type OrchestrationCommand,
   ProviderInstanceId,
   ThreadId,
@@ -69,6 +72,11 @@ import {
   makeFlowSessionFinalization,
   type FlowSessionFinalization,
 } from "./FlowSessionFinalization.ts";
+import {
+  makeFileMissionEndedLedgerStore,
+  makeMissionSessionSettlementHandler,
+  type MissionSessionSettlementHandler,
+} from "./MissionSessionSettlement.ts";
 import {
   makeFileProjectRetirementLedgerStore,
   makeProjectRetirementHandler,
@@ -161,6 +169,12 @@ export interface ProjectConsumerRuntimeServiceShape {
   readonly finalization: FlowSessionFinalization;
   /** The `project.retired` cleanup; intake goes through the SDK adapter. */
   readonly retirement: ProjectRetirementHandler;
+  /**
+   * The `mission.ended` settlement (work-mission-v5): intake goes through the
+   * SDK adapter behind the mission.v1 capability gate; the pending ledger
+   * replays on the sweep, thread events, and startup like retirement's.
+   */
+  readonly missionSettlement: MissionSessionSettlementHandler;
 }
 
 export class ProjectConsumerRuntimeService extends Context.Service<
@@ -288,24 +302,73 @@ const routeProjectConsumerRetirement = Effect.fn("ProjectConsumerRuntime.project
 );
 
 /**
- * The SDK's adapter surface plus the retirement hook this server is ready to
- * answer. The vendored SDK generation does not call `projectRetired` yet —
- * the Project Service side of the notice (and the SDK delivery/ACK frames
- * for it) is tracked separately; the method is in place so that upgrade is a
- * no-op here.
+ * The `mission.ended` intake (work-mission-v5 §6.1), GATED: the handler is
+ * attached only while the settings gate declares the `mission.v1` capability
+ * — the same flag that adds the token to the hello, so an activated intake
+ * always rides a connection that advertised for mission frames. A frame
+ * arriving while gated off (a mismatched server, or the toggle flipped
+ * mid-connection before the rebuild) is rejected as not-dispatchable so the
+ * Project Service redelivers rather than the notice being lost; resolving is
+ * the ACK, and a `waiting` outcome (a session has not reached a safe idle
+ * state yet) rejects with AGENT_BUSY the same way retirement does.
  */
-type RetirementAwareConsumerAdapter = RuntimeConsumerAdapter & {
+export const routeProjectConsumerMissionEnded = Effect.fn("ProjectConsumerRuntime.missionEnded")(
+  function* (
+    missionSettlement: MissionSessionSettlementHandler,
+    serverSettings: ServerSettings.ServerSettingsService["Service"],
+    input: MissionEndedNoticeFacts,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError(
+        () => new RuntimeConsumerWakeError("CONSUMER_INTERNAL", "settings could not be read"),
+      ),
+    );
+    if (!settings.projectServiceClient.missionsEnabled) {
+      return yield* Effect.fail(
+        new RuntimeConsumerWakeError(
+          "AGENT_NOT_DISPATCHABLE",
+          "mission frames are not activated on this consumer (projectServiceClient.missionsEnabled is off)",
+        ),
+      );
+    }
+    const outcome = yield* missionSettlement
+      .handleMissionEndedNotice(input)
+      .pipe(Effect.mapError((error) => new RuntimeConsumerWakeError(error.code, error.detail)));
+    if (outcome.status === "waiting") {
+      return yield* Effect.fail(
+        new RuntimeConsumerWakeError(
+          "AGENT_BUSY",
+          `mission ${input.missionId} still has work sessions that have not reached a safe idle state`,
+        ),
+      );
+    }
+  },
+);
+
+/**
+ * The SDK's adapter surface plus the retirement and mission-ended hooks this
+ * server is ready to answer. The vendored SDK generation calls neither yet —
+ * the Project Service side of those frames (and the SDK delivery/ACK surface
+ * for them, SDK 0.14 for mission.ended) is tracked separately; the methods
+ * are in place so those upgrades are no-ops here. The mission-ended hook
+ * carries its own gate (see routeProjectConsumerMissionEnded).
+ */
+type NoticeExtendedConsumerAdapter = RuntimeConsumerAdapter & {
   readonly projectRetired: (input: ProjectRetiredNoticeInput) => Promise<void>;
+  readonly missionEnded: (input: MissionEndedNoticeFacts) => Promise<void>;
 };
 
 const consumerAdapter = (
   serverSettings: ServerSettings.ServerSettingsService["Service"],
   router: ProjectWorkSessionRouter,
   retirement: ProjectRetirementHandler,
-): RetirementAwareConsumerAdapter => ({
+  missionSettlement: MissionSessionSettlementHandler,
+): NoticeExtendedConsumerAdapter => ({
   listAgents: () => Effect.runPromise(listProjectConsumerAgents(serverSettings)),
   wakeAgent: (input) => Effect.runPromise(routeProjectConsumerWake(router, input)),
   projectRetired: (input) => Effect.runPromise(routeProjectConsumerRetirement(retirement, input)),
+  missionEnded: (input) =>
+    Effect.runPromise(routeProjectConsumerMissionEnded(missionSettlement, serverSettings, input)),
 });
 
 // ── Runtime status callbacks (module-level: Effect.runSync stays outside Effect code) ──
@@ -374,7 +437,19 @@ type DesiredConnection =
       /** Read-failure closures are expected to be transient and retry. */
       readonly transient: boolean;
     }
-  | { readonly kind: "active"; readonly url: string; readonly credential: string };
+  | {
+      readonly kind: "active";
+      readonly url: string;
+      readonly credential: string;
+      /**
+       * The mission.v1 capability gate (work-mission-v5 §6.1): on = declare
+       * the token in the hello so the server may send mission frames, off =
+       * the SDK's own capability set only (a conforming server then never
+       * sends one). Rides the runtime signature so a toggle rebuilds the
+       * connection with the re-declared capabilities.
+       */
+      readonly missions: boolean;
+    };
 
 const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
   Effect.gen(function* () {
@@ -669,11 +744,45 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       newId: crypto.randomUUIDv4.pipe(Effect.orDie),
     });
 
+    // ── Mission-ended settlement (work-mission-v5 §6.1) ────────────
+    // Same ledger discipline as retirement: the local durable record is the
+    // ACK commit point (a pending settlement survives a restart without the
+    // notice ever re-firing). The intake rides the SDK adapter behind the
+    // mission.v1 capability gate; the drive reuses the router's existing
+    // finalization (safe-idle checks, settle/delete retention).
+    const missionEndedLedger = yield* makeFileMissionEndedLedgerStore(
+      pathService.join(serverConfig.stateDir, "project-service", "mission-ended-ledger.json"),
+    ).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, pathService),
+    );
+    const missionSettlement = yield* makeMissionSessionSettlementHandler({
+      loadLedger: missionEndedLedger.load,
+      storeLedger: missionEndedLedger.store,
+      readSettings: serverSettings.getSettings.pipe(
+        Effect.mapError(() => internal("Project Service settings could not be read")),
+      ),
+      routingSessions: router.snapshotSessions,
+      readThreadShell: (threadId) =>
+        snapshotQuery
+          .getThreadShellById(threadId)
+          .pipe(Effect.mapError(() => internal("thread projection could not be read"))),
+      resolveSessionRoute: (input) =>
+        sessionRouteStore.find(input).pipe(
+          Effect.map((route) =>
+            route === null ? null : { threadId: route.threadId, psProjectId: route.psProjectId },
+          ),
+          Effect.mapError(() => internal("session route read failed")),
+        ),
+      settleWorkGroupSession: router.finalizeFlowInstance,
+      nowIso: Effect.map(DateTime.now, DateTime.formatIso),
+    });
+
     // ── SDK runtime lifecycle ─────────────────────────────────────
 
     const runtimeRef = yield* Ref.make<ProjectConsumerRuntime | null>(null);
     const runtimeSignatureRef = yield* Ref.make<string | null>(null);
-    const adapter = consumerAdapter(serverSettings, router, retirement);
+    const adapter = consumerAdapter(serverSettings, router, retirement, missionSettlement);
 
     // Set while the SERVICE closes a runtime itself (replace, disable,
     // finalizer) so the runtime's synchronous `stopped` callback can tell an
@@ -730,6 +839,10 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         kind: "active",
         url,
         credential: new TextDecoder().decode(secret.value),
+        // The gate is read per sync: flipping it re-syncs the runtime (the
+        // signature below carries it) and the new hello declares — or stops
+        // declaring — mission.v1 on the rebuilt connection.
+        missions: client.missionsEnabled,
       } as const;
     });
 
@@ -766,7 +879,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         }
         return;
       }
-      const signature = `${desired.url}\n${desired.credential}`;
+      const signature = `${desired.url}\n${desired.credential}\nmissions=${desired.missions ? 1 : 0}`;
       const currentSignature = yield* Ref.get(runtimeSignatureRef);
       if (currentSignature === signature) {
         return;
@@ -782,6 +895,13 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         // ladder, which compares SDK versions — the t3 package version
         // (0.0.33) semantically ranks below SDK 0.1.0 and shows "unsupported".
         client: { name: "t3-code", version: CONSUMER_CLIENT_LATEST },
+        // The SDK's own capability set, plus mission.v1 while the gate is on
+        // (work-mission-v5 §6.1: connections that did not declare the token
+        // never receive mission frames — the visit/mission population stays
+        // inert until the Project Service side ships and the operator opts in).
+        capabilities: desired.missions
+          ? [...CONSUMER_CAPABILITIES, MISSION_CAPABILITY_V1]
+          : CONSUMER_CAPABILITIES,
         adapter,
         serviceKey: desired.credential,
         runtime: process.version,
@@ -889,9 +1009,11 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
           });
         }
       }
-      // Retirement cleanups blocked on a safe idle state also get their
-      // retry here — the sweep is the backstop when no thread event fires.
+      // Retirement cleanups and mission-ended settlements blocked on a safe
+      // idle state also get their retry here — the sweep is the backstop when
+      // no thread event fires.
       yield* retirement.resumePending;
+      yield* missionSettlement.resumePending;
     });
 
     const statusCallbacks = runtimeStatusCallbacks(statusRef, {
@@ -920,10 +1042,11 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
         // need no restart — inventory is answered live from settings.
         const changes = yield* serverSettings.subscribeChanges;
         yield* forkParked(Stream.runForEach(changes, () => syncRuntime));
-        // Restart recovery for retirement cleanups: a pending ledger record
-        // predates this process and its notice may never re-fire. The pass is
-        // local-only (deletions and the ledger), so it runs regardless of the
-        // channel state.
+        // Restart recovery for retirement cleanups and mission-ended
+        // settlements: a pending ledger record predates this process and its
+        // notice may never re-fire. The passes are local-only (deletions,
+        // settles, and the ledgers), so they run regardless of the channel
+        // state.
         yield* retirement.resumePending.pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("Project retirement resume failed at startup", {
@@ -931,11 +1054,18 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
             }),
           ),
         );
+        yield* missionSettlement.resumePending.pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Mission-ended settlement resume failed at startup", {
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        );
         // Turn-finish observation: the engine's domain events drive the
         // coalesced post-turn aggregate deliveries, wake pending flow
         // finalizations whose session was waiting on the turn's end, and
-        // retry a retirement blocked on a session's safe idle state the
-        // moment that turn ends.
+        // retry a retirement or mission-ended settlement blocked on a
+        // session's safe idle state the moment that turn ends.
         yield* forkParked(
           Stream.runForEach(engine.streamDomainEvents, (event) =>
             event.aggregateKind === "thread"
@@ -943,6 +1073,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
                   yield* router.onThreadEvent(ThreadId.make(event.aggregateId));
                   yield* finalization.drivePendingForThread(event.aggregateId);
                   yield* retirement.resumePending;
+                  yield* missionSettlement.resumePending;
                 })
               : Effect.void,
           ),
@@ -969,6 +1100,7 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       router,
       finalization,
       retirement,
+      missionSettlement,
     } satisfies ProjectConsumerRuntimeServiceShape;
   });
 
