@@ -187,16 +187,24 @@ export type ProjectWorkRunRecord = typeof ProjectWorkRunRecord.Type;
 /**
  * Decode the visit view out of a run's task snapshot: null when the task has
  * no `mission` block (the flow population — `task.instance` — and standalone
- * work), the decoded view when it does. A task that DECLARES the mission
- * population but does not decode against the pinned §6.1 shape is an
- * incompatibility like any other bad shape — never a silently-ignored block.
+ * work), the decoded view when it does. The decode REBUILDS the record, so
+ * the view carries exactly the pinned §6.1 blocks — never the whole task
+ * (the prompt and other task facts stay on `task`, where they belong). A task
+ * that DECLARES the mission population but does not decode against the
+ * pinned shape is an incompatibility like any other bad shape — never a
+ * silently-ignored block.
  */
+const decodeVisitView = Schema.decodeUnknownSync(ProjectWorkVisitView);
 const visitViewOfTask = (task: Readonly<Record<string, unknown>>): ProjectWorkVisitView | null => {
   const mission = task.mission;
   if (typeof mission !== "object" || mission === null) {
     return null;
   }
-  return decodeOrIncompatible(ProjectWorkVisitView, task);
+  try {
+    return decodeVisitView(task);
+  } catch {
+    throw new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" });
+  }
 };
 
 /**

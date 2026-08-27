@@ -66,6 +66,23 @@ describe("serverSettings helpers", () => {
     });
   });
 
+  it("applies the mission gate patch onto the Project Service client settings", () => {
+    // The work-mission-v5 feature gate rides the client patch like
+    // enabled/baseUrl; omitting it keeps the stored value.
+    expect(
+      applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+        projectServiceClient: { missionsEnabled: true },
+      }).projectServiceClient.missionsEnabled,
+    ).toBe(true);
+    expect(
+      applyServerSettingsPatch(
+        { ...DEFAULT_SERVER_SETTINGS, projectServiceClient: { ...DEFAULT_SERVER_SETTINGS.projectServiceClient, missionsEnabled: true } },
+        { projectServiceClient: { enabled: true } },
+      ).projectServiceClient.missionsEnabled,
+    ).toBe(true);
+    expect(DEFAULT_SERVER_SETTINGS.projectServiceClient.missionsEnabled).toBe(false);
+  });
+
   it("replaces text generation selection when provider/model are provided", () => {
     const current = {
       ...DEFAULT_SERVER_SETTINGS,
@@ -591,6 +608,7 @@ describe("project service + logical agents patching", () => {
       baseUrl: DEFAULT_SERVER_SETTINGS.projectServiceClient.baseUrl,
       keyIdHint: "",
       credentialSet: false,
+      missionsEnabled: false,
     });
     expect(JSON.stringify(next)).not.toContain("s3cret");
   });
