@@ -223,6 +223,9 @@ export function applyServerSettingsPatch(
           ...(projectServiceClientPatch.baseUrl !== undefined
             ? { baseUrl: projectServiceClientPatch.baseUrl }
             : {}),
+          ...(projectServiceClientPatch.missionsEnabled !== undefined
+            ? { missionsEnabled: projectServiceClientPatch.missionsEnabled }
+            : {}),
         }
       : undefined;
   const nextWithReplacementsBase = {
