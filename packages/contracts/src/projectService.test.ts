@@ -58,9 +58,9 @@ describe("ProjectServiceClientSettings", () => {
       baseUrl: DEFAULT_PROJECT_SERVICE_BASE_URL,
       keyIdHint: "",
       credentialSet: false,
-      // The mission.v1 gate: absent means OFF — a stored settings file from
-      // before the work-mission-v5 wire never activates mission frames.
-      missionsEnabled: false,
+      // work-mission-v5 Phase 7: the mission.v1 gate default is ON — the
+      // mission line is THE line; an explicit false is the off-switch.
+      missionsEnabled: true,
     });
   });
 
@@ -102,7 +102,9 @@ describe("work-mission-v5 wire types", () => {
         action: { kind: "state", abandonAvailable: true },
       }),
     ).toThrow();
-    expect(() => Schema.decodeUnknownSync(ProjectWorkVisitSubmitResult)({ nextNode: "design" })).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(ProjectWorkVisitSubmitResult)({ nextNode: "design" }),
+    ).toThrow();
     expect(() =>
       Schema.decodeUnknownSync(MissionEndedNoticeFacts)({
         noticeId: "mne_x",
