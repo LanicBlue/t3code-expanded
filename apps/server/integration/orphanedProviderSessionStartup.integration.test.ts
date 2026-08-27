@@ -100,6 +100,10 @@ const startupDependencies = Layer.mergeAll(
       handleRetiredNotice: () => Effect.die("unused"),
       resumePending: Effect.void,
     },
+    missionSettlement: {
+      handleMissionEndedNotice: () => Effect.die("unused"),
+      resumePending: Effect.void,
+    },
   }),
   ServerLifecycleEvents.layer,
   Layer.succeed(ServerEnvironment.ServerEnvironment, {
