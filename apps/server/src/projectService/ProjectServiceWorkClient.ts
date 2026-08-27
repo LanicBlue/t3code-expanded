@@ -529,6 +529,12 @@ export class ProjectServiceWorkClient extends Context.Service<
      * validates it against the run's slot rights; only this path can mint one.
      * "write" is the upsert (create-or-overwrite, PS apiMinor 1): send it
      * instead of guessing create vs update.
+     *
+     * work-mission-v5 Phase 6: a `vs_`-shaped runId addresses an OPEN mission
+     * visit — the write mints a receipt v3 (missionId-addressed, no
+     * instanceId) into the shared document registry and answers with
+     * `mission://` displayPaths; `wr_` runIds keep the flow behavior
+     * (`flow://` — the one-version compat read).
      */
     readonly writeFlowDocument: (input: {
       readonly projectId: string;

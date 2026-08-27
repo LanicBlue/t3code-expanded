@@ -302,7 +302,11 @@ export type ProjectWorkVisitView = typeof ProjectWorkVisitView.Type;
  * `action.outcomes`; `nextNode` is the agent-chosen next station (PS judges
  * permission); `reason` is REQUIRED when `nextNode` is off-contract;
  * `feedback` rides a rework hop; `documentReceiptIds` are the notarized write
- * receipts. The flow population keeps its own result shapes ({"kind":"after"},
+ * receipts (work-mission-v5 Phase 6 / SDK 0.15.0: real `document:<sha256>`
+ * ids minted by the by-run mission document notary — receipt v3,
+ * mission-addressed; PS validates each against the visit's frozen write
+ * domain and freezes {documentId,keyHash} rows onto the visit). The flow
+ * population keeps its own result shapes ({"kind":"after"},
  * gates, terminals) — the two never mix on one run.
  */
 export const ProjectWorkVisitSubmitResult = Schema.Struct({
