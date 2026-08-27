@@ -51,13 +51,14 @@ it.effect("vendored Project Consumer SDK matches its sha256 sidecar", () =>
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-// ── work-mission-v5 Phase 5: the vendored generation carries the mission line ──
-// The install must be the 0.14 artifact (mission.ended frames + the visit-view
-// types) — the runtime service's capability gate filters mission.v1 OUT of
-// CONSUMER_CAPABILITIES while the settings gate is off, which only works when
-// the vendored registry actually carries the token.
-it("vendored SDK is the 0.14 mission.v1 generation", () => {
-  expect(CONSUMER_CLIENT_LATEST).toBe("0.14.0");
+// ── work-mission-v5 Phase 5/6: the vendored generation carries the mission line ──
+// The install must be the 0.15 artifact (mission.ended frames + the visit-view
+// types + the opened documentReceiptIds vocabulary) — the runtime service's
+// capability gate filters mission.v1 OUT of CONSUMER_CAPABILITIES while the
+// settings gate is off, which only works when the vendored registry actually
+// carries the token.
+it("vendored SDK is the 0.15 mission document generation", () => {
+  expect(CONSUMER_CLIENT_LATEST).toBe("0.15.0");
   expect(CONSUMER_CAPABILITY_MISSION_V1).toBe("mission.v1");
   expect(CONSUMER_CAPABILITIES).toContain(CONSUMER_CAPABILITY_MISSION_V1);
 });
@@ -93,6 +94,9 @@ it("contracts' mission vocabulary stays shape-compatible with the vendored SDK",
   } satisfies WorkRunWorkTaskView;
   const submit: ProjectWorkVisitSubmitResult = {
     outcome: "implementation-ready",
+    // work-mission-v5 Phase 6 (SDK 0.15.0): the receipt field is open — real
+    // `document:<sha256>` ids minted by the by-run mission document notary.
+    documentReceiptIds: ["document:" + "0".repeat(64)],
   } satisfies MissionVisitSubmitResult;
   expect([mission.id, work.group, submit.outcome]).toEqual([
     notice.missionId,
