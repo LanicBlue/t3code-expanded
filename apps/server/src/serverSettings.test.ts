@@ -772,7 +772,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         baseUrl: DEFAULT_SERVER_SETTINGS.projectServiceClient.baseUrl,
         keyIdHint: "key-1",
         credentialSet: true,
-        missionsEnabled: false,
+        // work-mission-v5 Phase 7: the gate default is ON.
+        missionsEnabled: true,
       });
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       assert.notInclude(JSON.stringify(next), "s3cret");
