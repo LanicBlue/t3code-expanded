@@ -156,6 +156,19 @@ function ProjectServiceClientSection() {
         ) : null}
       </SettingsRow>
       <SettingsRow
+        title="Mission work"
+        description="Declares the mission.v1 capability on the Project Service connection: mission (visit) runs join the work queue and mission.ended notices settle their sessions. Off until the service side ships it — the flow work population keeps working either way."
+        control={
+          <Switch
+            checked={client.missionsEnabled}
+            onCheckedChange={(checked) =>
+              updateSettings({ projectServiceClient: { missionsEnabled: Boolean(checked) } })
+            }
+            aria-label="Mission work enabled"
+          />
+        }
+      />
+      <SettingsRow
         title="Connection"
         description="Authenticates against the configured service with the stored credential. A rejected credential only fails this test — sessions and threads are untouched."
         control={

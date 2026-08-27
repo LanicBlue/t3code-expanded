@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
+  CONSUMER_CAPABILITY_MISSION_V1,
   consumerWireAdapter,
   decodeConsumerGatewayFrame,
   type ConsumerGatewayMessage,
@@ -86,6 +87,7 @@ interface GatewayRecording {
   readonly sockets: FakeSocket[];
   readonly hellos: Array<{
     readonly credential?: string;
+    readonly capabilities: ReadonlyArray<string>;
     readonly agents: ReadonlyArray<{ readonly agentId: string; readonly displayName?: string }>;
     readonly url: string;
   }>;
@@ -132,6 +134,7 @@ const makeGateway = () => {
           ...(message.payload.credential !== undefined
             ? { credential: message.payload.credential }
             : {}),
+          capabilities: [...message.payload.capabilities],
           agents: message.payload.agents.map((agent) => ({
             agentId: String(agent.agentId),
             ...(agent.displayName !== undefined ? { displayName: agent.displayName } : {}),
@@ -662,6 +665,101 @@ describe("ProjectConsumerRuntimeService", () => {
           assert.strictEqual(
             yield* service.getStatus.pipe(Effect.map((status) => status.state)),
             "connected",
+          );
+        }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+      }),
+  );
+
+  it.live(
+    "missionsEnabled gate (dual state): off omits mission.v1 from the hello + rejects a mission frame; on re-syncs, declares, and settles a mission.ended notice",
+    () =>
+      Effect.gen(function* () {
+        const gateway = makeGateway();
+        const fakes = yield* makeFakes(gateway);
+
+        yield* Effect.gen(function* () {
+          const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+          yield* configureIntegration;
+          const service = yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService;
+          yield* service.start();
+
+          // GATE OFF (the default): the SDK 0.14 registry carries mission.v1,
+          // so the gate's job is to FILTER it out of the advertised set.
+          let socket = gateway.recording.sockets[0];
+          assert.isDefined(socket);
+          socket?.fireOpen();
+          yield* waitForSdk(40);
+          const offHello = gateway.recording.hellos[0];
+          assert.isDefined(offHello);
+          assert.notInclude(offHello?.capabilities, CONSUMER_CAPABILITY_MISSION_V1);
+          // The rest of the SDK registry still rides the hello.
+          assert.include(offHello?.capabilities, "work.available.v1");
+
+          // A mission frame on a gated-off connection is the T3-side signature
+          // gate: rejected as not-dispatchable (never ACKed) so the Project
+          // Service redelivers — a mismatched server or a mid-connection flip
+          // cannot silently drop the notice.
+          const gatedOffNoticeId = "mne_" + "a".repeat(32);
+          (socket as FakeSocket).receive({
+            type: "mission.ended",
+            id: newMessageId(),
+            sentAt: ISO,
+            payload: {
+              noticeId: gatedOffNoticeId,
+              missionId: "ms_" + "0".repeat(32),
+              group: "ms_" + "0".repeat(32),
+              disposition: "completed",
+              outcome: null,
+              workspacePolicy: "project-root",
+            },
+          });
+          yield* waitForSdk(40);
+          assert.include(
+            gateway.recording.failures.map((f) => f.noticeId),
+            gatedOffNoticeId,
+          );
+          assert.include(
+            gateway.recording.failures.find((f) => f.noticeId === gatedOffNoticeId)?.code,
+            "AGENT_NOT_DISPATCHABLE",
+          );
+          assert.notInclude(gateway.recording.acks, gatedOffNoticeId);
+
+          // GATE ON: flipping the setting re-syncs the single runtime (the
+          // signature carries the gate) and the rebuilt hello DECLARES the
+          // mission.v1 capability.
+          yield* serverSettings.updateSettings({
+            projectServiceClient: { missionsEnabled: true },
+          });
+          yield* waitForSdk(60);
+          socket = gateway.recording.sockets[1] ?? socket;
+          (socket as FakeSocket).fireOpen();
+          yield* waitForSdk(40);
+          const onHello = gateway.recording.hellos[1];
+          assert.isDefined(onHello);
+          assert.include(onHello?.capabilities, CONSUMER_CAPABILITY_MISSION_V1);
+
+          // The declared connection settles a mission.ended notice: the SDK's
+          // onMissionEnded runs the settlement (empty plan — no sessions
+          // recorded for this mission) and the notice is ACKed.
+          const settledNoticeId = "mne_" + "b".repeat(32);
+          (socket as FakeSocket).receive({
+            type: "mission.ended",
+            id: newMessageId(),
+            sentAt: ISO,
+            payload: {
+              noticeId: settledNoticeId,
+              missionId: "ms_" + "0".repeat(32),
+              group: "ms_" + "0".repeat(32),
+              disposition: "completed",
+              outcome: null,
+              workspacePolicy: "project-root",
+            },
+          });
+          yield* waitForSdk(60);
+          assert.include(gateway.recording.acks, settledNoticeId);
+          assert.notInclude(
+            gateway.recording.failures.map((f) => f.noticeId),
+            settledNoticeId,
           );
         }).pipe(Effect.provide(fakes.layer), Effect.scoped);
       }),

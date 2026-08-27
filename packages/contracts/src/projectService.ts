@@ -236,6 +236,11 @@ export const LogicalAgentConfigMap = Schema.Record(LogicalAgentId, LogicalAgentC
 export type LogicalAgentConfigMap = typeof LogicalAgentConfigMap.Type;
 
 // ── work-mission-v5 visit view (capability `mission.v1`) ─────────
+// The SHAPE source of truth for every block below is the vendored SDK 0.14
+// (WorkRunMissionTaskView / WorkRunWorkTaskView / the "visit" arm of
+// WorkRunActionView / MissionVisitSubmitResult). These Effect schemas exist
+// because each trust boundary DECODES — apps/server's vendoredSdkIntegrity
+// test pins the assignability against the SDK types so the two cannot drift.
 
 /**
  * The mission a visit run belongs to — the `task.mission` block of the
@@ -315,6 +320,15 @@ export type ProjectWorkVisitSubmitResult = typeof ProjectWorkVisitSubmitResult.T
  * sessions live under, `disposition` the mission's end state. The noticeId is
  * the idempotency key; the durable local ledger record is the ACK commit
  * point (same semantics as the fen_ flow-ended deliveries).
+ *
+ * Single source of truth for the SHAPE is the vendored SDK 0.14's
+ * `MissionEndedNotice` (apps/server's vendoredSdkIntegrity test pins the
+ * assignability, so an SDK drift fails the suite). This Effect schema exists
+ * because the intake DECODES at its trust boundary — a plain interface
+ * re-export cannot. The fields beyond the four the settlement reads
+ * (workspacePolicy/workspaceRef/outcome) decode tolerantly: the SDK runtime
+ * has already exact-parsed the frame before the adapter hook sees it, so the
+ * tolerance only matters for hand-fed test fixtures.
  */
 export const MissionEndedNoticeFacts = Schema.Struct({
   noticeId: Schema.String,
@@ -326,9 +340,6 @@ export const MissionEndedNoticeFacts = Schema.Struct({
   workspaceRef: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type MissionEndedNoticeFacts = typeof MissionEndedNoticeFacts.Type;
-
-/** The capability token gating every mission frame (design §6.1). */
-export const MISSION_CAPABILITY_V1 = "mission.v1";
 
 // ── Connection test ──────────────────────────────────────────────
 
