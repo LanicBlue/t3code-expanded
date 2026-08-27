@@ -286,9 +286,10 @@ export type ProjectWorkVisitActionRecord = typeof ProjectWorkVisitActionRecord.T
 
 /**
  * The decoded visit view of a run's `task` snapshot (the work-mission-v5
- * population). Present iff `task.mission` is — the discriminator between the
- * visit population and the legacy flow population (`task.instance`); the two
- * coexist for the migration drain period (design §6.1).
+ * population). Present iff `task.mission` is — the discriminator this client
+ * keys on (`task.instance` frames are structurally gone: the Project Service
+ * removed the flow stack in work-mission-v5 Phase 7, so a task without a
+ * mission block is standalone work).
  */
 export const ProjectWorkVisitView = Schema.Struct({
   mission: ProjectWorkMissionRecord,

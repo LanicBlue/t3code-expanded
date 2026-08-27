@@ -277,7 +277,7 @@ export const ProjectWorkSubmitInput = Schema.Struct({
   }),
   result: Schema.Record(Schema.String, Schema.Unknown).annotate({
     description:
-      'The work result payload — the shape the run\'s completion contract calls for. Flow-population runs (task.instance): {"kind":"after","transitionId"?,"message"?} for state work, {"kind":"terminal","message"?}, {"kind":"before","outcome":"accept"|"reject","feedback"?} for gates, {"kind":"abandon","message"} to abandon. Visit-population runs (task.mission): {"outcome": one of task.action.outcomes, "nextNode"?: a target workKey — task.action.candidates lists the in-contract ones, "reason": REQUIRED whenever nextNode is outside the candidates (off-contract needs its why), "feedback"?: context for a rework hop, "documentReceiptIds"?: receipts from project_doc_write/edit}. The server validates the result against the contract and rejects mismatches with a structured error.',
+      'The work result payload — the shape the run\'s completion contract calls for. Visit runs (task.mission): {"outcome": one of task.action.outcomes, "nextNode"?: a target workKey — task.action.candidates lists the in-contract ones, "reason": REQUIRED whenever nextNode is outside the candidates (off-contract needs its why), "feedback"?: context for a rework hop, "documentReceiptIds"?: receipts from project_doc_write/edit}. The server validates the result against the contract and rejects mismatches with a structured error.',
   }),
 });
 

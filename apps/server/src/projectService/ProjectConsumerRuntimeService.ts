@@ -633,8 +633,8 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
     // Same ledger discipline as retirement: the local durable record is the
     // ACK commit point (a pending settlement survives a restart without the
     // notice ever re-firing). The intake rides the SDK adapter behind the
-    // mission.v1 capability gate; the drive reuses the router's existing
-    // finalization (safe-idle checks, settle/delete retention).
+    // mission.v1 capability gate; the drive is the router's settle drive
+    // (safe-idle checks, settle/delete retention).
     const missionEndedLedger = yield* makeFileMissionEndedLedgerStore(
       pathService.join(serverConfig.stateDir, "project-service", "mission-ended-ledger.json"),
     ).pipe(

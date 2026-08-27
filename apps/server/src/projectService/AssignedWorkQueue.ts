@@ -44,13 +44,19 @@ export const currentAssignedWork = (
   runs: ReadonlyArray<AssignedWorkQueueEntry>,
 ): AssignedWorkQueueEntry | null => orderAssignedWorkQueue(runs).at(0) ?? null;
 
-// ── Work-group scoping (drain-period dual population) ────────────
+// ── Work-group scoping (work-mission-v5: mission-only population) ──
 
 /**
- * The run's `task.mission` block when present — the work-mission-v5 visit
- * population's discriminator (design §6.1: task.mission vs task.instance).
- * Structural read only; the decoded contract view lives on the run record's
- * `visit` field (ProjectServiceWorkClient).
+ * The run's `task.mission` block when present — the visit population's
+ * discriminator. Structural read only; the decoded contract view lives on
+ * the run record's `visit` field (ProjectServiceWorkClient).
+ *
+ * work-mission-v5 Phase 7: the flow population's `task.instance` arm is
+ * DELETED — the Project Service stopped delivering task.instance runs when
+ * it removed the flow stack, structurally and not by convention. A run whose
+ * task carries no mission block (standalone work, or a pre-drain frame that
+ * can no longer exist) keys to the legacy "" bucket: read as ungrouped,
+ * never decoded, never crashed.
  */
 const missionBlockOf = (run: AssignedWorkQueueEntry): Record<string, unknown> | null => {
   const mission = run.task.mission;
@@ -77,43 +83,8 @@ export const missionNameOf = (run: AssignedWorkQueueEntry): string | null => {
   return trimmed.length > 0 ? trimmed : null;
 };
 
-/** The run's `task.instance.instanceId` when a non-blank string; "" without one. */
-export const flowInstanceKeyOf = (run: AssignedWorkQueueEntry): string => {
-  const instance = run.task.instance;
-  if (typeof instance !== "object" || instance === null) return "";
-  const id = (instance as Record<string, unknown>).instanceId;
-  return typeof id === "string" && id.trim().length > 0 ? id : "";
-};
-
-/** The run's `task.instance.name` trimmed; null when absent or blank. */
-export const flowInstanceNameOf = (run: AssignedWorkQueueEntry): string | null => {
-  const instance = run.task.instance;
-  if (typeof instance !== "object" || instance === null) return null;
-  const name = (instance as Record<string, unknown>).name;
-  if (typeof name !== "string") return null;
-  const trimmed = name.trim();
-  return trimmed.length > 0 ? trimmed : null;
-};
-
 /**
- * The session-grouping key under the drain-period dual population (design
- * §6.1, pinned): the mission population keys by `task.mission.id`, the flow
- * population by `task.instance.instanceId` — this is not an API alias but the
- * two populations' real coexistence, so one key function serves both and the
- * mission ids and instance ids never collide (ms_ vs instance namespaces).
- */
-export const workGroupKeyOf = (run: AssignedWorkQueueEntry): string =>
-  missionBlockOf(run) !== null ? missionKeyOf(run) : flowInstanceKeyOf(run);
-
-/**
- * The display name of a run's group — the mission's name for the visit
- * population, the instance's name for the flow population; null when absent.
- */
-export const workGroupNameOf = (run: AssignedWorkQueueEntry): string | null =>
-  missionBlockOf(run) !== null ? missionNameOf(run) : flowInstanceNameOf(run);
-
-/**
- * Open runs grouped by work-group key (same open-only discipline as
+ * Open runs grouped by the mission key (same open-only discipline as
  * `orderAssignedWorkQueue`, so a partition of only settled runs never exists
  * and no key is ever minted for a dead group). Map iteration order is the
  * keys' first appearance in the input.
@@ -124,7 +95,7 @@ export const partitionOpenWork = (
   const partitions = new Map<string, Array<AssignedWorkQueueEntry>>();
   for (const run of runs) {
     if (run.state !== "open") continue;
-    const key = workGroupKeyOf(run);
+    const key = missionKeyOf(run);
     const partition = partitions.get(key);
     if (partition === undefined) {
       partitions.set(key, [run]);
@@ -137,13 +108,13 @@ export const partitionOpenWork = (
 
 /**
  * A session's run universe: null owns every run (project scope); a string
- * owns that group's runs, with "" as the legacy no-instance bucket.
+ * owns that mission's runs, with "" as the legacy no-mission bucket.
  */
 export const runsForWorkGroup = (
   runs: ReadonlyArray<AssignedWorkQueueEntry>,
   workGroupKey: string | null,
 ): Array<AssignedWorkQueueEntry> =>
-  workGroupKey === null ? [...runs] : runs.filter((run) => workGroupKeyOf(run) === workGroupKey);
+  workGroupKey === null ? [...runs] : runs.filter((run) => missionKeyOf(run) === workGroupKey);
 
 /**
  * A compact one-line summary of a work task payload for wake messages. The
