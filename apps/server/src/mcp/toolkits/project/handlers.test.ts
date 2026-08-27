@@ -259,7 +259,6 @@ const makeWorkClientLayer = (overrides?: {
         eventId: "evt_spawn_1",
       });
     },
-    listFlowInstances: () => Effect.succeed([]),
   });
   return {
     submitted,

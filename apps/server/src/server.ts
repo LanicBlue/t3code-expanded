@@ -30,7 +30,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
 import * as ProviderSessionRuntime from "./persistence/ProviderSessionRuntime.ts";
-import * as ProjectFlowFinalizationStore from "./persistence/ProjectFlowFinalization.ts";
+import * as ProjectWorkSessionRouteStore from "./persistence/ProjectWorkSessionRoute.ts";
 import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRegistry.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
@@ -253,13 +253,12 @@ const ReactorLayerLive = Layer.empty.pipe(
   // The Project Consumer runtime is a server-lifetime service like the
   // reactors: one SDK connection per configured client, started with the
   // server (see serverRuntimeStartup) and reconfigured on settings changes.
-  // The Work client seam is the same one the MCP tools ride; the flow
-  // finalization ledger rides the shared SQLite persistence.
+  // The Work client seam is the same one the MCP tools ride; the work
+  // session-route ledger rides the shared SQLite persistence.
   Layer.provideMerge(
     ProjectConsumerRuntime.layer.pipe(
       Layer.provide(ProjectServiceWorkClient.layer),
-      Layer.provide(ProjectFlowFinalizationStore.layer),
-      Layer.provide(ProjectFlowFinalizationStore.sessionRouteLayer),
+      Layer.provide(ProjectWorkSessionRouteStore.sessionRouteLayer),
     ),
   ),
 );

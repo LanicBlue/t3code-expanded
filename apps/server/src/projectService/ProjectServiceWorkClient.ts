@@ -186,13 +186,14 @@ export type ProjectWorkRunRecord = typeof ProjectWorkRunRecord.Type;
 
 /**
  * Decode the visit view out of a run's task snapshot: null when the task has
- * no `mission` block (the flow population — `task.instance` — and standalone
- * work), the decoded view when it does. The decode REBUILDS the record, so
- * the view carries exactly the pinned §6.1 blocks — never the whole task
- * (the prompt and other task facts stay on `task`, where they belong). A task
- * that DECLARES the mission population but does not decode against the
- * pinned shape is an incompatibility like any other bad shape — never a
- * silently-ignored block.
+ * no `mission` block (standalone work — the Project Service stopped
+ * delivering `task.instance` runs when it removed the flow stack,
+ * work-mission-v5 Phase 7), the decoded view when it does. The decode
+ * REBUILDS the record, so the view carries exactly the pinned §6.1 blocks —
+ * never the whole task (the prompt and other task facts stay on `task`,
+ * where they belong). A task that DECLARES the mission population but does
+ * not decode against the pinned shape is an incompatibility like any other
+ * bad shape — never a silently-ignored block.
  */
 const decodeVisitView = Schema.decodeUnknownSync(ProjectWorkVisitView);
 const visitViewOfTask = (task: Readonly<Record<string, unknown>>): ProjectWorkVisitView | null => {
@@ -248,36 +249,6 @@ const EnvelopeError = Schema.Struct({
 
 /** A failure envelope on routes this module calls directly (not via the SDK). */
 const FailureEnvelope = Schema.Struct({ ok: Schema.Literals([false]), error: EnvelopeError });
-
-/** A spawned flow instance (tree branching): the child handle agents report upward. */
-export const ProjectFlowSpawnRecord = Schema.Struct({
-  instanceId: Schema.String,
-  eventId: Schema.String,
-});
-export type ProjectFlowSpawnRecord = typeof ProjectFlowSpawnRecord.Type;
-
-/**
- * The terminal marker of a flow instance (`ended` in the instance view):
- * `completedByEventId` is the service's own durable event identity for the
- * terminal transition — the stable idempotency key a finalization dedupes on.
- */
-export const ProjectFlowInstanceEndedRecord = Schema.Struct({
-  disposition: Schema.Literals(["completed", "abandoned"]),
-  completedByEventId: Schema.String,
-});
-export type ProjectFlowInstanceEndedRecord = typeof ProjectFlowInstanceEndedRecord.Type;
-
-/**
- * A flow instance as the finalization intake reads it (GET /:id/flow/
- * instances): identity facts plus the terminal marker. `ended === null` is a
- * live instance; extra view fields drop at this trust boundary.
- */
-export const ProjectFlowInstanceRecord = Schema.Struct({
-  instanceId: Schema.String,
-  name: Schema.String,
-  ended: Schema.NullOr(ProjectFlowInstanceEndedRecord),
-});
-export type ProjectFlowInstanceRecord = typeof ProjectFlowInstanceRecord.Type;
 
 /**
  * Ruling ②' spawn outcome. `committed` — the child instance exists. `pending` —
@@ -504,15 +475,6 @@ export class ProjectServiceWorkClient extends Context.Service<
       readonly definitionId: string;
       readonly name: string;
     }) => Effect.Effect<ProjectFlowSpawnOutcome, ProjectServiceWorkClientError>;
-    /**
-     * The project's flow instances (GET /:id/flow/instances), terminal markers
-     * included — the authority the flow-end intake derives terminal-state
-     * notifications from. Ordinary-client readable; no projectGeneration
-     * fence on this route.
-     */
-    readonly listFlowInstances: (input: {
-      readonly projectId: string;
-    }) => Effect.Effect<readonly ProjectFlowInstanceRecord[], ProjectServiceWorkClientError>;
     /**
      * Flow-document notary (by-run addressing): read a document through one of
      * the agent's open runs — the run's slot rights decide readability.
@@ -756,58 +718,6 @@ export const make = Effect.gen(function* () {
     return records.map(projectServiceProjectRecord);
   });
 
-  // GET /:id/flow/instances answers { ok, result: { instances: [...],
-  // status, ... } } — the flowOk envelope every flow route rides (project-router
-  // wraps flow.listInstances in { ok: true, result }). Decoding reads
-  // value.result (NOT value itself): a 200 body that is not the success
-  // envelope is a typed shape failure, never a silently-empty instance list.
-  // The intake reads identity + terminal marker only; extra view fields drop
-  // at this trust boundary like on every other read. Failures keep the
-  // service's own envelope codes.
-  const listFlowInstances = Effect.fn("ProjectServiceWorkClient.listFlowInstances")(function* (
-    projectId: string,
-  ) {
-    const endpoint = yield* resolveEndpoint;
-    const { status, value } = yield* facetRequest(
-      "GET",
-      `${endpoint.baseUrl}/project/v1/${encodeURIComponent(projectId)}/flow/instances`,
-      undefined,
-      endpoint.credential,
-    );
-    if (status === 404) {
-      return yield* new ProjectServiceWorkServiceRejectedError({
-        code: "PROJECT_NOT_FOUND",
-        status,
-        message: "The bound Project Service project does not exist.",
-      });
-    }
-    if (status < 200 || status >= 300) {
-      if (isFailureEnvelope(value)) {
-        return yield* new ProjectServiceWorkServiceRejectedError({
-          code: value.error.code,
-          status,
-          message: value.error.message,
-        });
-      }
-      return yield* new ProjectServiceWorkTransportError({});
-    }
-    const result = yield* Effect.try({
-      try: () =>
-        decodeOrIncompatible(
-          Schema.Struct({
-            ok: Schema.Literals([true]),
-            result: Schema.Struct({ instances: Schema.Array(ProjectFlowInstanceRecord) }),
-          }),
-          value,
-        ),
-      catch: (cause) =>
-        isApiIncompatible(cause)
-          ? cause
-          : new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" }),
-    });
-    return result.result.instances;
-  });
-
   const getProjectGeneration = Effect.fn("ProjectServiceWorkClient.getProjectGeneration")(
     function* (projectId: string) {
       const endpoint = yield* resolveEndpoint;
@@ -933,7 +843,6 @@ export const make = Effect.gen(function* () {
   return ProjectServiceWorkClient.of({
     listProjects,
     getProjectGeneration,
-    listFlowInstances: (input) => listFlowInstances(input.projectId),
     listPositions: (input) =>
       withClient(
         undefined,

@@ -282,37 +282,40 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
     }).pipe(Effect.provide(makeLayer(client)));
   });
 
-  it.effect("a task that declares the mission population but fails the pinned shape is an incompatibility", () => {
-    const halfMission = {
-      ...VISIT_RUN_VIEW,
-      task: {
-        prompt: "x",
-        // mission present (the population discriminator) but the work block
-        // and the visit action are missing — not a silently-ignored block.
-        mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
-      },
-    };
-    const { client } = makeHttpClient(
-      serviceByPath((request) => {
-        const url = new URL(request.url);
-        if (url.pathname === "/project/v1/proj_ps_1/work-runs/my") return okBody([halfMission]);
-        return transportFailure(request);
-      }),
-    );
+  it.effect(
+    "a task that declares the mission population but fails the pinned shape is an incompatibility",
+    () => {
+      const halfMission = {
+        ...VISIT_RUN_VIEW,
+        task: {
+          prompt: "x",
+          // mission present (the population discriminator) but the work block
+          // and the visit action are missing — not a silently-ignored block.
+          mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
+        },
+      };
+      const { client } = makeHttpClient(
+        serviceByPath((request) => {
+          const url = new URL(request.url);
+          if (url.pathname === "/project/v1/proj_ps_1/work-runs/my") return okBody([halfMission]);
+          return transportFailure(request);
+        }),
+      );
 
-    return Effect.gen(function* () {
-      yield* enableClient;
-      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+      return Effect.gen(function* () {
+        yield* enableClient;
+        const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
 
-      const failure = yield* work
-        .listMy({ projectId: "proj_ps_1", projectGeneration: 7, agentId: "ag_one" })
-        .pipe(Effect.flip);
-      assert.deepEqual(plainError(failure), {
-        _tag: "ProjectServiceWorkApiIncompatibleError",
-        code: "PROJECT_WORK_RESPONSE_SHAPE",
-      });
-    }).pipe(Effect.provide(makeLayer(client)));
-  });
+        const failure = yield* work
+          .listMy({ projectId: "proj_ps_1", projectGeneration: 7, agentId: "ag_one" })
+          .pipe(Effect.flip);
+        assert.deepEqual(plainError(failure), {
+          _tag: "ProjectServiceWorkApiIncompatibleError",
+          code: "PROJECT_WORK_RESPONSE_SHAPE",
+        });
+      }).pipe(Effect.provide(makeLayer(client)));
+    },
+  );
 
   it.effect("never leaks the raw credential into any result or error payload", () => {
     const { client } = makeHttpClient(
@@ -676,112 +679,6 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
         reason: "no-credential",
       });
       assert.strictEqual(requests.length, 0);
-    }).pipe(Effect.provide(makeLayer(client)));
-  });
-
-  // ── Flow instance list envelope contract (flow-end design) ──────
-  // GET /:id/flow/instances rides the flowOk envelope: { ok, result } — the
-  // instance list lives under `result.instances`, next to view fields the
-  // intake does not read. These tests pin the production HTTP boundary, not
-  // a pre-decoded seam.
-
-  it.effect("unwraps the ok/result envelope and preserves the terminal marker", () => {
-    // The real route shape: flowOk(res, flow.listInstances(id)) answers
-    // { ok: true, result: { status: {...}, instances: [...] } }.
-    const { client } = makeHttpClient(
-      serviceByPath(() =>
-        okBody({
-          status: {
-            projectId: "proj_ps_1",
-            state: "indexed",
-            indexedControlRevision: "ctrl:9",
-            indexedEnvelopeTotal: 42,
-            errorCode: null,
-            checkedAt: "2026-08-25T10:00:00.000Z",
-            lanes: [],
-          },
-          instances: [
-            {
-              instanceId: "fi_live",
-              name: "Live instance",
-              currentState: "building",
-              ended: null,
-            },
-            {
-              instanceId: "fi_done",
-              name: "Ended instance",
-              currentState: "done",
-              ended: { disposition: "completed", completedByEventId: "evt_term_1" },
-            },
-          ],
-        }),
-      ),
-    );
-
-    return Effect.gen(function* () {
-      yield* enableClient;
-      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
-
-      const instances = yield* work.listFlowInstances({ projectId: "proj_ps_1" });
-
-      // The success envelope is UNWRAPPED (value.result, never value), and
-      // the terminal marker — the finalization's event identity source —
-      // survives the boundary verbatim.
-      assert.deepEqual(
-        instances.map((instance) => instance.instanceId),
-        ["fi_live", "fi_done"],
-      );
-      assert.isNull(instances[0]?.ended);
-      assert.deepEqual(instances[1]?.ended, {
-        disposition: "completed",
-        completedByEventId: "evt_term_1",
-      });
-    }).pipe(Effect.provide(makeLayer(client)));
-  });
-
-  it.effect("a 200 body without the envelope is a typed shape failure, never []", () => {
-    // A bare instance list (the pre-envelope spelling) must not decode as an
-    // empty intake read — the sweep would silently skip every finalization.
-    const { client } = makeHttpClient(serviceByPath(() => Response.json({ instances: [] })));
-
-    return Effect.gen(function* () {
-      yield* enableClient;
-      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
-
-      const failure = yield* work.listFlowInstances({ projectId: "proj_ps_1" }).pipe(Effect.flip);
-
-      assert.deepEqual(plainError(failure), {
-        _tag: "ProjectServiceWorkApiIncompatibleError",
-        code: "PROJECT_WORK_RESPONSE_SHAPE",
-      });
-    }).pipe(Effect.provide(makeLayer(client)));
-  });
-
-  it.effect("keeps the service's typed error envelope on flow instance reads", () => {
-    const { client } = makeHttpClient(
-      serviceByPath(() =>
-        Response.json(
-          {
-            ok: false,
-            error: { code: "FLOW_DEFINITION_INVALID", message: "definition is unreadable" },
-          },
-          { status: 400 },
-        ),
-      ),
-    );
-
-    return Effect.gen(function* () {
-      yield* enableClient;
-      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
-
-      const failure = yield* work.listFlowInstances({ projectId: "proj_ps_1" }).pipe(Effect.flip);
-
-      assert.deepEqual(plainError(failure), {
-        _tag: "ProjectServiceWorkServiceRejectedError",
-        code: "FLOW_DEFINITION_INVALID",
-        status: 400,
-      });
-      assert.equal(failure.message, "definition is unreadable");
     }).pipe(Effect.provide(makeLayer(client)));
   });
 });

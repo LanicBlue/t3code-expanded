@@ -91,11 +91,6 @@ const startupDependencies = Layer.mergeAll(
       dropProjectSessions: () => Effect.void,
       snapshotSessions: Effect.succeed([]),
     },
-    finalization: {
-      intakeSweep: () => Effect.void,
-      drivePending: () => Effect.void,
-      drivePendingForThread: () => Effect.void,
-    },
     retirement: {
       handleRetiredNotice: () => Effect.die("unused"),
       resumePending: Effect.void,

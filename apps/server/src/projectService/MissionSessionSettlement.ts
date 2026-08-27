@@ -4,16 +4,16 @@
  *
  * When a mission reaches a terminal state the Project Service delivers a
  * MissionEndedNotice carrying (noticeId, missionId, group, disposition, …) —
- * idempotent by noticeId, durable-ledger ACK semantics like every fen_ flow
- * frame. T3 answers by settling the sessions that ran the mission's visits:
- * the notice's `group` IS the workspace grouping key the sessions live under
- * (missionId), so the settlement finds them through the same association
- * facts the flow-end finalization uses — the live routing registry plus the
- * durable group→thread rows the routing path recorded while the visits were
- * still open — and then drives the router's EXISTING finalization (safe-idle
- * checks, settle or settle-then-delete per the agent's retention, project-
- * scope rebind), which is why this module stays thin: it owns only the
- * notice idempotency and the ACK ledger.
+ * idempotent by noticeId, durable-ledger ACK semantics like every pushed
+ * terminal frame. T3 answers by settling the sessions that ran the mission's
+ * visits: the notice's `group` IS the workspace grouping key the sessions
+ * live under (missionId), so the settlement finds them through the
+ * association facts — the live routing registry plus the durable group→thread
+ * rows the routing path recorded while the visits were still open — and then
+ * drives the router's settle drive (safe-idle checks, settle or
+ * settle-then-delete per the agent's retention, project-scope rebind), which
+ * is why this module stays thin: it owns only the notice idempotency and the
+ * ACK ledger.
  *
  * Durability: the ledger file IS the commit point. A notice is recorded —
  * with its full settlement plan — BEFORE any side effect runs, so a restart
@@ -26,10 +26,11 @@
  * Gating: the handler itself is gate-free — it only ever runs behind a
  * mission frame, and the runtime service attaches the frame intake only
  * while the `mission.v1` capability is declared (settings gate
- * projectServiceClient.missionsEnabled, default off). The fen_/flow
- * terminal path (FlowSessionFinalization) is untouched and keeps owning the
- * flow population through the drain period; the two never read each other's
- * records.
+ * projectServiceClient.missionsEnabled, default ON since work-mission-v5
+ * Phase 7 — the mission line is THE line; an explicit false is the emergency
+ * off-switch). work-mission-v5 Phase 7 deleted the flow terminal path
+ * (FlowSessionFinalization): this settlement is the only terminal-path
+ * driver left.
  *
  * @module MissionSessionSettlement
  */
@@ -124,13 +125,15 @@ export const makeFileMissionEndedLedgerStore = (
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const load: MissionEndedLedgerStore["load"] = Effect.gen(function* () {
-      const raw = yield* fs.readFileString(ledgerPath).pipe(
-        Effect.catch((cause) =>
-          cause.reason._tag === "NotFound"
-            ? Effect.succeed(null)
-            : Effect.fail(new MissionEndedLedgerError({ operation: "read", ledgerPath })),
-        ),
-      );
+      const raw = yield* fs
+        .readFileString(ledgerPath)
+        .pipe(
+          Effect.catch((cause) =>
+            cause.reason._tag === "NotFound"
+              ? Effect.succeed(null)
+              : Effect.fail(new MissionEndedLedgerError({ operation: "read", ledgerPath })),
+          ),
+        );
       if (raw === null || raw.trim().length === 0) {
         return [];
       }
@@ -246,7 +249,9 @@ const projectEnabledAgents = (settings: ServerSettings): ReadonlyArray<string> =
     .map(([agentId]) => agentId);
 
 export const makeMissionSessionSettlementHandler = Effect.fn("makeMissionSessionSettlement")(
-  function* (deps: MissionSessionSettlementDeps): Effect.fn.Return<MissionSessionSettlementHandler> {
+  function* (
+    deps: MissionSessionSettlementDeps,
+  ): Effect.fn.Return<MissionSessionSettlementHandler> {
     // The ledger is loaded once and kept in memory; every mutation persists
     // first and updates the Ref second, so a crash between the two re-reads the
     // persisted truth at the next start.
