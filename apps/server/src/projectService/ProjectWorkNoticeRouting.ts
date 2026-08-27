@@ -60,11 +60,11 @@ import {
   type AssignedWorkQueueEntry,
   assignedWorkWakeMessage,
   currentAssignedWork,
-  flowInstanceKeyOf,
-  flowInstanceNameOf,
   orderAssignedWorkQueue,
   partitionOpenWork,
-  runsForFlowInstance,
+  runsForWorkGroup,
+  workGroupKeyOf,
+  workGroupNameOf,
 } from "./AssignedWorkQueue.ts";
 
 const DEFAULT_ROUTING_RUNTIME_MODE = "full-access" as const;
@@ -447,7 +447,11 @@ export interface ProjectWorkSessionRouterDeps {
 export interface ProjectWorkSessionSnapshot {
   readonly agentId: string;
   readonly projectId: string;
-  /** The flow instance this session owns (null = the whole project queue). */
+  /**
+   * The work GROUP this session owns (null = the whole project queue): a flow
+   * instance id for the flow population, a mission id for the visit
+   * population — the drain-period dual population's one grouping key.
+   */
   readonly flowInstanceKey: string | null;
   readonly threadId: ThreadId;
   readonly phase: "idle" | "notifying";
@@ -552,11 +556,13 @@ interface RoutedSession {
   readonly input: ProjectWorkWakeInput;
   /**
    * The run universe this session owns, fixed at creation: null = every run
-   * of the (agent, project) queue (project scope); a string = one flow
-   * instance's runs, with "" as the legacy bucket for runs without instance
-   * identity. A session only drives while the agent's CONFIGURED scope
-   * matches this universe — the universe guard in processThreadEvent parks
-   * it the moment a settings toggle moves the work to other sessions.
+   * of the (agent, project) queue (project scope); a string = one work
+   * GROUP's runs — a flow instance (flow population) or a mission (visit
+   * population, drain-period dual population) — with "" as the legacy bucket
+   * for runs without group identity. A session only drives while the agent's
+   * CONFIGURED scope matches this universe — the universe guard in
+   * processThreadEvent parks it the moment a settings toggle moves the work
+   * to other sessions.
    */
   readonly flowInstanceKey: string | null;
   phase: "idle" | "notifying";
@@ -905,7 +911,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     // delivery it rides on; the intake's overturnable no-op repairs a missed
     // row when a later delivery lands.
     for (const instanceKey of new Set(
-      ordered.map((run) => flowInstanceKeyOf(run)).filter((key) => key.length > 0),
+      ordered.map((run) => workGroupKeyOf(run)).filter((key) => key.length > 0),
     )) {
       const recorded = yield* deps
         .recordFlowSessionRoute({
@@ -952,7 +958,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       }
       const openRuns =
         knownRuns ??
-        runsForFlowInstance(
+        runsForWorkGroup(
           yield* deps.listOpenAssignedWork({
             agentId: target.logicalAgentId,
             projectId: target.projectServiceProjectId,
@@ -978,7 +984,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
             ? workSessionThreadTitle(target.agentName)
             : flowInstanceWorkSessionThreadTitle(
                 target.agentName,
-                ordered[0] !== undefined ? flowInstanceNameOf(ordered[0]) : null,
+                ordered[0] !== undefined ? workGroupNameOf(ordered[0]) : null,
               ),
         logicalAgentId: target.logicalAgentId,
         modelSelection,
@@ -1039,7 +1045,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     }
     const runs =
       knownRuns ??
-      runsForFlowInstance(
+      runsForWorkGroup(
         yield* deps.listOpenAssignedWork({
           agentId: target.logicalAgentId,
           projectId: target.projectServiceProjectId,
@@ -1227,7 +1233,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     if (session.phase === "notifying" || isWorkThreadBusy(shell.value)) {
       const runs =
         knownRuns ??
-        runsForFlowInstance(
+        runsForWorkGroup(
           yield* deps.listOpenAssignedWork({
             agentId: target.logicalAgentId,
             projectId: target.projectServiceProjectId,
@@ -1246,7 +1252,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     }
     const runs =
       knownRuns ??
-      runsForFlowInstance(
+      runsForWorkGroup(
         yield* deps.listOpenAssignedWork({
           agentId: target.logicalAgentId,
           projectId: target.projectServiceProjectId,
@@ -1374,7 +1380,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         .pipe(Effect.result);
       if (runs._tag === "Success") {
         const nextHead = orderAssignedWorkQueue(
-          runsForFlowInstance(runs.success, session.flowInstanceKey),
+          runsForWorkGroup(runs.success, session.flowInstanceKey),
         )[0];
         if (nextHead !== undefined && nextHead.runId !== session.lastDeliveredHeadRunId) {
           yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
@@ -1476,7 +1482,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
             );
             return;
           }
-          runs = runsForFlowInstance(queried.success, flowInstanceKey);
+          runs = runsForWorkGroup(queried.success, flowInstanceKey);
         }
         const head = orderAssignedWorkQueue(runs)[0];
 
@@ -1696,7 +1702,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     if (runs._tag === "Failure") {
       return { kind: "waiting", reason: "work-query-unavailable" };
     }
-    if (orderAssignedWorkQueue(runsForFlowInstance(runs.success, input.instanceKey)).length > 0) {
+    if (orderAssignedWorkQueue(runsForWorkGroup(runs.success, input.instanceKey)).length > 0) {
       return { kind: "waiting", reason: "open-work" };
     }
     const settled = yield* dispatchForFinalization({

@@ -9,9 +9,13 @@ import {
   currentAssignedWork,
   flowInstanceKeyOf,
   flowInstanceNameOf,
+  missionKeyOf,
+  missionNameOf,
   orderAssignedWorkQueue,
   partitionOpenWork,
-  runsForFlowInstance,
+  runsForWorkGroup,
+  workGroupKeyOf,
+  workGroupNameOf,
 } from "./AssignedWorkQueue.ts";
 
 const run = (overrides: Partial<AssignedWorkQueueEntry>): AssignedWorkQueueEntry => ({
@@ -158,7 +162,7 @@ describe("AssignedWorkQueue", () => {
     );
   });
 
-  it("runsForFlowInstance: null owns every run, a string owns that instance's runs", () => {
+  it("runsForWorkGroup: null owns every run, a string owns that group's runs", () => {
     const aRun = run({
       runId: "run_a",
       task: { prompt: "x", instance: { instanceId: "inst_a", name: "a", iteration: 1 } },
@@ -167,17 +171,129 @@ describe("AssignedWorkQueue", () => {
     const all = [aRun, legacyRun];
     // Project scope: identity (every run, whatever its state).
     NodeAssert.deepEqual(
-      runsForFlowInstance(all, null).map((entry) => entry.runId),
+      runsForWorkGroup(all, null).map((entry) => entry.runId),
       ["run_a", "run_legacy"],
     );
     NodeAssert.deepEqual(
-      runsForFlowInstance(all, "inst_a").map((entry) => entry.runId),
+      runsForWorkGroup(all, "inst_a").map((entry) => entry.runId),
       ["run_a"],
     );
     NodeAssert.deepEqual(
-      runsForFlowInstance(all, "").map((entry) => entry.runId),
+      runsForWorkGroup(all, "").map((entry) => entry.runId),
       ["run_legacy"],
     );
-    NodeAssert.deepEqual(runsForFlowInstance([], "inst_a"), []);
+    NodeAssert.deepEqual(runsForWorkGroup([], "inst_a"), []);
+  });
+
+  // ── Drain-period dual population (work-mission-v5 design §6.1) ──────
+
+  /**
+   * A visit-view task per the pinned §6.1 contract: task.mission replaces
+   * task.instance, task.work carries the group, task.action is the visit
+   * completion contract.
+   */
+  const visitTask = (missionId: string, missionName: string): Record<string, unknown> => ({
+    prompt: "以 design.md 为唯一需求 authority 实现",
+    mission: { id: missionId, name: missionName, objective: "Ship the release" },
+    work: { group: missionId, workKey: "implement", iteration: 1 },
+    executor: { type: "agent", executorRef: "client-1:ag_one" },
+    action: { kind: "visit", outcomes: ["implementation-ready"], candidates: ["validation"] },
+  });
+
+  it("mission keys read task.mission.id structurally, blank and absent facts degrade", () => {
+    const visitRun = run({ runId: "run_v", task: visitTask("ms_a", "  Release v2  ") });
+    NodeAssert.equal(missionKeyOf(visitRun), "ms_a");
+    NodeAssert.equal(missionNameOf(visitRun), "Release v2");
+    NodeAssert.equal(workGroupKeyOf(visitRun), "ms_a");
+    NodeAssert.equal(workGroupNameOf(visitRun), "Release v2");
+    // Absent, non-object, non-string, and blank mission facts degrade —
+    // the queue discipline never throws on a task shape.
+    NodeAssert.equal(missionKeyOf(run({ runId: "r", task: { prompt: "x" } })), "");
+    NodeAssert.equal(missionNameOf(run({ runId: "r", task: { prompt: "x" } })), null);
+    NodeAssert.equal(missionKeyOf(run({ runId: "r", task: { prompt: "x", mission: null } })), "");
+    NodeAssert.equal(
+      missionKeyOf(run({ runId: "r", task: { prompt: "x", mission: "ms_a" } })),
+      "",
+    );
+    NodeAssert.equal(
+      missionNameOf(run({ runId: "r", task: { prompt: "x", mission: { id: "m", name: 7 } } })),
+      null,
+    );
+    NodeAssert.equal(
+      missionKeyOf(run({ runId: "r", task: { prompt: "x", mission: { id: "   " } } })),
+      "",
+    );
+    NodeAssert.equal(
+      missionNameOf(
+        run({ runId: "r", task: { prompt: "x", mission: { id: "m", name: "  " } } }),
+      ),
+      null,
+    );
+  });
+
+  it("the dual-population group key dispatches: mission runs by mission id, flow runs by instance id", () => {
+    // A mission-block task with a blank id still counts as the visit
+    // population: workGroupKeyOf must NOT fall through to task.instance
+    // (§6.1 pins task.mission presence as the discriminator).
+    const blankMissionRun = run({
+      runId: "run_blank_mission",
+      task: {
+        prompt: "x",
+        mission: { id: "   ", name: "n", objective: "o" },
+        instance: { instanceId: "inst_shadowed", name: "shadow", iteration: 1 },
+      },
+    });
+    NodeAssert.equal(workGroupKeyOf(blankMissionRun), "");
+    // The flow population keys by instance id as before.
+    const flowRun = run({
+      runId: "run_flow",
+      task: { prompt: "x", instance: { instanceId: "inst_1", name: "f", iteration: 2 } },
+    });
+    NodeAssert.equal(workGroupKeyOf(flowRun), "inst_1");
+    NodeAssert.equal(workGroupNameOf(flowRun), "f");
+    // Standalone work keeps the legacy bucket.
+    NodeAssert.equal(workGroupKeyOf(run({ runId: "run_legacy", task: { prompt: "x" } })), "");
+  });
+
+  it("partitionOpenWork groups OPEN runs of BOTH populations side by side", () => {
+    const partitions = partitionOpenWork([
+      run({ runId: "run_m1", task: visitTask("ms_a", "Mission A") }),
+      run({ runId: "run_f1", task: { prompt: "x", instance: { instanceId: "inst_f", name: "f", iteration: 1 } } }),
+      run({ runId: "run_m2", task: visitTask("ms_a", "Mission A") }),
+      run({ runId: "run_m_other", task: visitTask("ms_b", "Mission B") }),
+      run({ runId: "run_legacy", task: { prompt: "x" } }),
+      // Settled runs never form or join a partition — either population.
+      run({ runId: "run_m_done", state: "completed", task: visitTask("ms_c", "C") }),
+      run({
+        runId: "run_f_done",
+        state: "cancelled",
+        task: { prompt: "x", instance: { instanceId: "inst_g", name: "g", iteration: 1 } },
+      }),
+    ]);
+    NodeAssert.deepEqual(
+      [...partitions.entries()].map(([key, entries]) => [key, entries.map((entry) => entry.runId)]),
+      [
+        ["ms_a", ["run_m1", "run_m2"]],
+        ["inst_f", ["run_f1"]],
+        ["ms_b", ["run_m_other"]],
+        ["", ["run_legacy"]],
+      ],
+    );
+    // A group's run universe sees only its own population's runs.
+    const all = [
+      run({ runId: "run_m", task: visitTask("ms_a", "A") }),
+      run({
+        runId: "run_f",
+        task: { prompt: "x", instance: { instanceId: "ms_a", name: "collision-spelled", iteration: 1 } },
+      }),
+    ];
+    // An instance id SPELLED exactly like a mission id compares textually
+    // equal — the key is the contract's plain ternary, and the populations'
+    // disjoint id namespaces (mission ids are ms_-prefixed content hashes)
+    // are what keeps the groups apart, not extra tagging here.
+    NodeAssert.deepEqual(
+      runsForWorkGroup(all, "ms_a").map((entry) => entry.runId),
+      ["run_m", "run_f"],
+    );
   });
 });
