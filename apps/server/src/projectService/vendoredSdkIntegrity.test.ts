@@ -4,6 +4,7 @@ import {
   CONSUMER_CLIENT_LATEST,
   type MissionEndedNotice,
   type MissionVisitSubmitResult,
+  type WorkRunActionView,
   type WorkRunMissionTaskView,
   type WorkRunView,
   type WorkRunWorkTaskView,
@@ -11,6 +12,7 @@ import {
 import type {
   MissionEndedNoticeFacts,
   ProjectWorkMissionRecord,
+  ProjectWorkVisitActionRecord,
   ProjectWorkVisitSubmitResult,
   ProjectWorkVisitWorkRecord,
 } from "@t3tools/contracts";
@@ -51,14 +53,15 @@ it.effect("vendored Project Consumer SDK matches its sha256 sidecar", () =>
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-// ── work-mission-v5 Phase 5/6: the vendored generation carries the mission line ──
-// The install must be the 0.15 artifact (mission.ended frames + the visit-view
-// types + the opened documentReceiptIds vocabulary) — the runtime service's
+// ── work-mission-v5 Phase 7c: the vendored generation is the visit-only line ──
+// The install must be the 0.16 artifact (the fe_/fen_-free protocol registry —
+// the mission.ended frame family and its capability token stay; the flow
+// frame constants and the SDK startFlow arm are gone). The runtime service's
 // capability gate filters mission.v1 OUT of CONSUMER_CAPABILITIES while the
 // settings gate is off, which only works when the vendored registry actually
 // carries the token.
-it("vendored SDK is the 0.15 mission document generation", () => {
-  expect(CONSUMER_CLIENT_LATEST).toBe("0.15.0");
+it("vendored SDK is the 0.16 visit-only generation", () => {
+  expect(CONSUMER_CLIENT_LATEST).toBe("0.16.0");
   expect(CONSUMER_CAPABILITY_MISSION_V1).toBe("mission.v1");
   expect(CONSUMER_CAPABILITIES).toContain(CONSUMER_CAPABILITY_MISSION_V1);
 });
@@ -103,6 +106,21 @@ it("contracts' mission vocabulary stays shape-compatible with the vendored SDK",
     notice.group,
     "implementation-ready",
   ]);
+
+  // The run-level action view (work-mission-v5 Phase 7c, SDK 0.16.0): the
+  // visit-only completion contract — the SDK's WorkRunActionView is the wire
+  // shape ProjectServiceWorkClient decodes run.action against (and the visit
+  // view embeds), so the SDK type must remain assignable to the contracts
+  // record. The flow-era state/gate/terminal arms have no producer and no
+  // schema arm anymore.
+  const sdkAction: WorkRunActionView = {
+    kind: "visit",
+    outcomes: ["implementation-ready"],
+    candidates: ["validation"],
+    abandonAvailable: true,
+  };
+  const action: ProjectWorkVisitActionRecord = sdkAction;
+  expect(action.kind).toBe("visit");
 
   // The top-level CAS echo the visit submit fences on (§6.1: the run's
   // assignmentRevision is the station's, echoed on every read). The SDK brands
