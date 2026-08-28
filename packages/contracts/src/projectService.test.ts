@@ -85,12 +85,24 @@ describe("work-mission-v5 wire types", () => {
       decodeVisitView({
         mission: { id: "ms_abc", name: "Release v2", objective: "Ship the release" },
         work: { group: "ms_abc", workKey: "implement", iteration: 2 },
-        action: { kind: "visit", outcomes: ["implementation-ready"], candidates: ["validation"] },
+        // The SDK 0.16 WorkRunActionView shape: outcomes/candidates optional,
+        // the reserved-abandon alternative rides as abandonAvailable.
+        action: {
+          kind: "visit",
+          outcomes: ["implementation-ready"],
+          candidates: ["validation"],
+          abandonAvailable: true,
+        },
       }),
     ).toEqual({
       mission: { id: "ms_abc", name: "Release v2", objective: "Ship the release" },
       work: { group: "ms_abc", workKey: "implement", iteration: 2 },
-      action: { kind: "visit", outcomes: ["implementation-ready"], candidates: ["validation"] },
+      action: {
+        kind: "visit",
+        outcomes: ["implementation-ready"],
+        candidates: ["validation"],
+        abandonAvailable: true,
+      },
     });
   });
 
@@ -100,6 +112,15 @@ describe("work-mission-v5 wire types", () => {
         mission: { id: "ms_abc", name: "n", objective: "o" },
         work: { group: "ms_abc", workKey: "implement", iteration: 1 },
         action: { kind: "state", abandonAvailable: true },
+      }),
+    ).toThrow();
+    // A visit action without abandonAvailable is off-shape too: the SDK and
+    // the wire both carry it on every visit population run.
+    expect(() =>
+      decodeVisitView({
+        mission: { id: "ms_abc", name: "n", objective: "o" },
+        work: { group: "ms_abc", workKey: "implement", iteration: 1 },
+        action: { kind: "visit" },
       }),
     ).toThrow();
     expect(() =>

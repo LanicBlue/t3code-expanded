@@ -153,13 +153,6 @@ interface CapturedSubmit {
   readonly idempotencyKey: string;
 }
 
-interface CapturedSpawn {
-  readonly projectId: string;
-  readonly idempotencyKey: string;
-  readonly definitionId: string;
-  readonly name: string;
-}
-
 const docWritesRef: { path: string; operation: string; data?: string }[] = [];
 const docReadsRef: { path: string }[] = [];
 let docWriteError: ProjectServiceWorkClient.ProjectServiceWorkClientError | undefined;
@@ -170,8 +163,6 @@ const makeWorkClientLayer = (overrides?: {
   readonly positions?: readonly ProjectServiceWorkClient.ProjectWorkPositionRecord[];
   readonly run?: ProjectServiceWorkClient.ProjectWorkRunRecord | null;
   readonly serviceProjects?: readonly ProjectServiceWorkClient.ProjectServiceProjectRecord[];
-  readonly spawnError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
-  readonly spawnPending?: boolean;
   readonly documentWriteError?: ProjectServiceWorkClient.ProjectServiceWorkClientError;
   readonly submitResult?: ProjectServiceWorkClient.ProjectWorkOperationRecord;
   readonly content?: string;
@@ -179,7 +170,6 @@ const makeWorkClientLayer = (overrides?: {
   docWriteError = overrides?.documentWriteError;
   documentContent = overrides?.content ?? "decision: ship it";
   const submitted: CapturedSubmit[] = [];
-  const spawned: CapturedSpawn[] = [];
   const docWrites = docWritesRef;
   const docReads = docReadsRef;
   const service = ProjectServiceWorkClient.ProjectServiceWorkClient.of({
@@ -242,28 +232,9 @@ const makeWorkClientLayer = (overrides?: {
         displayPath: `flow://project/fi_1/${input.path}`,
       });
     },
-    startFlow: (input) => {
-      spawned.push({ ...input });
-      if (overrides?.spawnError !== undefined) {
-        return Effect.fail(overrides.spawnError);
-      }
-      if (overrides?.spawnPending === true) {
-        return Effect.succeed<ProjectServiceWorkClient.ProjectFlowSpawnOutcome>({
-          status: "pending",
-          operationId: "rest-flow-spawn-pending",
-        });
-      }
-      return Effect.succeed<ProjectServiceWorkClient.ProjectFlowSpawnOutcome>({
-        status: "committed",
-        instanceId: "fin_spawn_1",
-        eventId: "evt_spawn_1",
-      });
-    },
-    listFlowInstances: () => Effect.succeed([]),
   });
   return {
     submitted,
-    spawned,
     docWrites,
     docReads,
     layer: Layer.succeed(ProjectServiceWorkClient.ProjectServiceWorkClient, service),
@@ -374,13 +345,14 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       assert.equal(wsResult.runs[0]?.workspacePolicy, "managed-worktree");
       assert.equal(wsResult.runs[0]?.workspacePath, "/tmp/wt-1");
       // The action projection (PS apiMinor 2) rides the current-work item the
-      // same way — the completion contract as model-readable facts. Absent on
-      // older PS, the field stays absent (the first block's RUN_VIEW has none).
+      // same way — the visit completion contract as model-readable facts.
+      // Absent when the wire omits it, the field stays absent (the first
+      // block's RUN_VIEW has none).
       const ACTION_VIEW = {
-        kind: "state",
-        transitions: [{ transitionId: "handoff", to: "reading" }],
+        kind: "visit",
+        outcomes: ["implementation-ready"],
+        candidates: ["validation"],
         abandonAvailable: true,
-        documents: { read: [], write: ["decision.md"] },
       } as const;
       const { layer: actionLayer } = makeWorkClientLayer({
         runs: [{ ...RUN_VIEW, action: ACTION_VIEW }],
@@ -392,89 +364,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       assert.isUndefined(result.runs[0]?.action);
     });
   });
-
-  it.effect(
-    "project_flow_start spawns through the derived identity with the name as the only task pointer",
-    () => {
-      const { spawned, layer } = makeWorkClientLayer();
-
-      return Effect.gen(function* () {
-        const child = yield* ProjectWorkToolkitHandlers.project_flow_start({
-          definitionId: "bounded-delivery",
-          name: "login bug fix",
-        }).pipe(withHandlerLayers({ workClientLayer: layer }));
-
-        assert.equal(child.status, "committed");
-        if (child.status !== "committed") throw new Error("unreachable");
-        assert.equal(child.instanceId, "fin_spawn_1");
-        assert.equal(spawned.length, 1);
-        const call = spawned[0];
-        // The project comes from the directory-keyed mapping, never the arguments.
-        assert.equal(call?.projectId, "proj_ps_1");
-        assert.equal(call?.definitionId, "bounded-delivery");
-        // v2 (D3): name-only dispatch — the child's authored start-work prompt
-        // interpolates {instance.name}; there is no prompt-override surface.
-        assert.equal(call?.name, "login bug fix");
-        assert.deepEqual(
-          Object.keys(call ?? {}).filter((key) => key === "promptOverrides"),
-          [],
-        );
-        // Fresh idempotency key per invocation: a retry after failure is a NEW
-        // spawn, never a silent replay of the original arguments.
-        assert.match(call?.idempotencyKey ?? "", /^[0-9a-f-]{36}$/);
-      });
-    },
-  );
-
-  it.effect(
-    "project_flow_start passes a still-pending construction through as a pollable state, never an error",
-    () => {
-      const { layer } = makeWorkClientLayer({ spawnPending: true });
-
-      return Effect.gen(function* () {
-        const outcome = yield* ProjectWorkToolkitHandlers.project_flow_start({
-          definitionId: "architectural-delivery",
-          name: "rfc child",
-        }).pipe(withHandlerLayers({ workClientLayer: layer }));
-
-        // Ruling ②': pending is a STATUS with the operationId to poll — the
-        // agent polls project_operation_get; a re-invocation with a fresh key
-        // would mint a duplicate child.
-        assert.deepEqual(outcome, {
-          status: "pending",
-          operationId: "rest-flow-spawn-pending",
-        });
-      });
-    },
-  );
-
-  it.effect(
-    "project_flow_start answers the spawn-refusal error, not an authentication failure",
-    () => {
-      const { layer } = makeWorkClientLayer({
-        spawnError: new ProjectServiceWorkClient.ProjectServiceWorkServiceRejectedError({
-          code: "PROJECT_CONSUMER_SPAWN_NOT_AUTHORIZED",
-          status: 403,
-          message: "this Flow Definition did not opt in to consumer spawning",
-        }),
-      });
-
-      return Effect.gen(function* () {
-        const failure = yield* ProjectWorkToolkitHandlers.project_flow_start({
-          definitionId: "closed",
-          name: "refused",
-        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
-
-        // The 403 bucket stays reserved for credential problems; the refusal is
-        // about the DEFINITION's opt-in.
-        assert.deepEqual(plainError(failure), {
-          _tag: "ProjectFlowSpawnRefusedError",
-          code: "PROJECT_CONSUMER_SPAWN_NOT_AUTHORIZED",
-          serviceMessage: "this Flow Definition did not opt in to consumer spawning",
-        });
-      });
-    },
-  );
 
   it.effect("project_doc_read returns the document through the derived identity", () => {
     const { layer } = makeWorkClientLayer();

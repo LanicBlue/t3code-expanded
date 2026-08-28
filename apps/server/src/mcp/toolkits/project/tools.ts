@@ -109,20 +109,6 @@ export class ProjectWorkRejectedError extends Schema.TaggedErrorClass<ProjectWor
 }
 
 /**
- * The definition refused consumer spawning: only flow definitions whose ACTIVE
- * version opted in (`consumerStartable`) can be started by this client. Not a
- * credential problem — the definition must be re-published with the opt-in.
- */
-export class ProjectFlowSpawnRefusedError extends Schema.TaggedErrorClass<ProjectFlowSpawnRefusedError>()(
-  "ProjectFlowSpawnRefusedError",
-  { code: Schema.String, serviceMessage: Schema.String },
-) {
-  override get message(): string {
-    return `${this.serviceMessage} Only definitions whose active version opts in (consumerStartable) can be started.`;
-  }
-}
-
-/**
  * The addressed run's slot rights do not cover the document operation — a
  * rights question, not a credential one (the 403 bucket stays reserved for
  * credential problems).
@@ -237,7 +223,6 @@ export const ProjectWorkError = Schema.Union([
   ProjectWorkUncertainError,
   ProjectWorkNotFoundError,
   ProjectWorkIncompatibleError,
-  ProjectFlowSpawnRefusedError,
   ProjectFlowDocumentDeniedError,
   ProjectFlowDocumentNotFoundError,
   ProjectFlowDocumentConflictError,
@@ -277,7 +262,7 @@ export const ProjectWorkSubmitInput = Schema.Struct({
   }),
   result: Schema.Record(Schema.String, Schema.Unknown).annotate({
     description:
-      'The work result payload — the shape the run\'s completion contract calls for. Flow-population runs (task.instance): {"kind":"after","transitionId"?,"message"?} for state work, {"kind":"terminal","message"?}, {"kind":"before","outcome":"accept"|"reject","feedback"?} for gates, {"kind":"abandon","message"} to abandon. Visit-population runs (task.mission): {"outcome": one of task.action.outcomes, "nextNode"?: a target workKey — task.action.candidates lists the in-contract ones, "reason": REQUIRED whenever nextNode is outside the candidates (off-contract needs its why), "feedback"?: context for a rework hop, "documentReceiptIds"?: receipts from project_doc_write/edit}. The server validates the result against the contract and rejects mismatches with a structured error.',
+      'The work result payload — the shape the run\'s completion contract calls for. Visit runs: {"outcome": one of action.outcomes (the run\'s action field project_work_list returns; "abandon" is always a reserved extra when action.abandonAvailable is true), "nextNode"?: a target workKey — action.candidates lists the in-contract ones, "reason": REQUIRED whenever nextNode is outside the candidates (off-contract needs its why), "feedback"?: context for a rework hop, "documentReceiptIds"?: receipts from project_doc_write/edit}. The server validates the result against the contract and rejects mismatches with a structured error.',
   }),
 });
 
@@ -285,17 +270,6 @@ export const ProjectOperationGetInput = Schema.Struct({
   operationId: Schema.String.annotate({
     description:
       "The operation identifier returned by project_work_submit or surfaced by its uncertain-outcome error.",
-  }),
-});
-
-export const ProjectFlowStartInput = Schema.Struct({
-  definitionId: Schema.String.annotate({
-    description:
-      'The flow definition to start, e.g. "spike-probe". Only definitions whose active version opted in to consumer spawning answer; others refuse with a structured error.',
-  }),
-  name: Schema.String.annotate({
-    description:
-      'The instance name — THE task pointer: the child\'s start work prompt interpolates {instance.name}, so put the concrete task here (e.g. "fix login bug in auth.ts"). This is the only context you can inject; there is no prompt-override surface.',
   }),
 });
 
@@ -314,17 +288,18 @@ const ProjectWorkListItem = Schema.Struct({
   workspacePolicy: Schema.optional(Schema.String),
   workspacePath: Schema.optional(Schema.String),
   /**
-   * THE completion contract for this run (PS apiMinor 2): the submit shape it
-   * accepts, the transitions a state submission chooses among (with target
-   * states), where a gate's accept/reject send the instance, and the display
-   * paths of the run's document rights. Absent on older PS deployments.
+   * THE completion contract for this run (PS apiMinor 2): the visit action
+   * view — the station's outcome vocabulary, the in-contract candidate next
+   * stations, and whether the reserved "abandon" alternative is open. The
+   * flow-era state/gate/terminal kinds are gone with the flow line; kind is
+   * always "visit" on this PS generation.
    */
   action: Schema.optional(ProjectServiceWorkClient.ProjectWorkActionRecord),
   /**
-   * The decoded VISIT view of `task` (mission population, §6.1): mission /
-   * work-station facts plus the visit completion contract — the outcome
-   * vocabulary and the candidate next stations the submit hints below read.
-   * Absent on flow-population and standalone runs.
+   * The decoded VISIT view of the run (mission population, §6.1): mission /
+   * work-station facts plus the same visit completion contract as `action`,
+   * decoded once at the trust boundary. Absent on runs outside the visit
+   * population.
    */
   visit: Schema.optional(ProjectWorkVisitView),
 });
@@ -376,7 +351,7 @@ export const ProjectWorkGetTool = Tool.make("project_work_get", {
 
 export const ProjectWorkSubmitTool = Tool.make("project_work_submit", {
   description:
-    'Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Match the run\'s completion contract — the action field on the run project_work_list returns spells it out (kind, the transitions with their target states, the gate outcomes, the document paths). In short: a STATE work submits {"kind":"after", "message"?} — add "transitionId" only when action.transitions lists more than one — or {"kind":"abandon", "message"} to abandon the whole instance (the reason is mandatory; an abandon gate reviews it, and a rejection bounces the state for one more attempt); a TERMINAL work submits {"kind":"terminal", "message"?} which ends the instance; a GATE work submits {"kind":"before", "outcome":"accept"|"reject"} — reject REQUIRES "feedback" and sends the SAME instance back for rework (action.review.rejectTo names where): a fresh run re-delivers automatically, and its prompt carries a \'Rework context\' block (attempt ordinal + prior gate feedback) that the next attempt must address. A VISIT work (task.action.kind "visit", mission population) submits {"outcome": <one of task.action.outcomes>, "nextNode"?: <target workKey>, "reason"?, "feedback"?, "documentReceiptIds"?}: outcome picks from THIS station\'s vocabulary; nextNode is YOUR routing choice — task.action.candidates lists the in-contract targets as a hint, not a constraint, but a nextNode outside the candidates is off-contract and REQUIRES "reason" (the choice is semantics and gets recorded); omit nextNode only when the contract leaves exactly one continuation or the outcome is terminal; "feedback" carries rework context when the outcome sends the mission back. Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
+    'Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Match the run\'s completion contract — the action field on the run project_work_list returns spells it out: kind is always "visit" (the station outcome vocabulary plus the candidate next stations). A VISIT work submits {"outcome": <one of action.outcomes>, "nextNode"?: <target workKey>, "reason"?, "feedback"?, "documentReceiptIds"?}: outcome picks from THIS station\'s vocabulary; nextNode is YOUR routing choice — action.candidates lists the in-contract targets as a hint, not a constraint, but a nextNode outside the candidates is off-contract and REQUIRES "reason" (the choice is semantics and gets recorded); omit nextNode only when the contract leaves exactly one continuation or the outcome is terminal; "feedback" carries rework context when the outcome sends the mission back. When action.abandonAvailable is true, {"outcome":"abandon"} is the reserved way to end the work early — carry the why in "feedback". Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
   parameters: ProjectWorkSubmitInput,
   success: ProjectServiceWorkClient.ProjectWorkOperationRecord,
   failure: ProjectWorkError,
@@ -398,18 +373,6 @@ export const ProjectOperationGetTool = Tool.make("project_operation_get", {
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
-
-export const ProjectFlowStartTool = Tool.make("project_flow_start", {
-  description:
-    "Start a new flow instance in the session project (tree branching): a one-way fork into a child flow — the parent flow does not wait for it or observe its completion. Use it to hand follow-up work to a differently-shaped process instead of looping back (e.g. after triage, start the spike/bounded/architectural delivery flow). The instance NAME is the one and only piece of context you inject: the child's authored start-work prompt interpolates {instance.name} and teaches itself the task from it (the run view also carries instance:{instanceId,name}). Richer hand-off context? Write a project document first and reference it by path in the name — never expect to inject prompts. The server constructs the child in the background: the result is either committed (the child instanceId) or pending — construction still in flight under the returned operationId. On pending, POLL project_operation_get with that operationId; NEVER call project_flow_start again for the same logical child (a fresh call mints a fresh idempotency key and would duplicate the child).",
-  parameters: ProjectFlowStartInput,
-  success: ProjectServiceWorkClient.ProjectFlowSpawnOutcome,
-  failure: ProjectWorkError,
-  dependencies,
-})
-  .annotate(Tool.Title, "Start a Project flow instance")
-  .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
 
 export const ProjectDocReadInput = Schema.Struct({
@@ -527,7 +490,6 @@ export const ProjectWorkToolkit = Toolkit.make(
   ProjectWorkGetTool,
   ProjectWorkSubmitTool,
   ProjectOperationGetTool,
-  ProjectFlowStartTool,
   ProjectDocReadTool,
   ProjectDocWriteTool,
   ProjectDocEditTool,

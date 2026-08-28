@@ -179,7 +179,7 @@ interface Harness {
   readonly setWorkCountDelayMs: (ms: number) => void;
   /** Simulated latency on orchestration dispatch (real ms, it.live). */
   readonly setDispatchDelayMs: (ms: number) => void;
-  /** The persisted instance→thread associations, as the routing ledger wrote them. */
+  /** The persisted work-group→thread associations, as the routing ledger wrote them. */
   readonly routeRecords: ReadonlyArray<{
     readonly instanceId: string;
     readonly agentId: string;
@@ -238,7 +238,8 @@ const makeHarness = (settings: ServerSettings): Effect.Effect<Harness> =>
     let dispatchDelayMs = 0;
     let countCalls = 0;
     let idCounter = 0;
-    // The persisted instance→thread association ledger (flow-end design).
+    // The persisted work-group→thread association ledger — what the
+    // mission-ended settlement reads after the runs close or a restart.
     const routeRecords: Array<{
       instanceId: string;
       agentId: string;
@@ -1989,18 +1990,22 @@ describe("flow-instance session scope", () => {
       },
     }));
 
-  /** A run owned by one flow instance (PS v2+ task snapshots carry instance). */
-  const flowRun = (
-    instanceId: string,
+  /** A run owned by one mission (visit tasks carry the mission block). */
+  const missionRun = (
+    missionId: string,
     name: string,
     overrides: Partial<AssignedWorkQueueEntry> = {},
   ): AssignedWorkQueueEntry => ({
-    runId: `run_${instanceId}`,
-    positionId: `position_${instanceId}`,
+    runId: `run_${missionId}`,
+    positionId: `position_${missionId}`,
     runRevision: "run:1",
     state: "open",
     agentId: AGENT_ID,
-    task: { prompt: `work for ${name}`, instance: { instanceId, name, iteration: 1 } },
+    task: {
+      prompt: `work for ${name}`,
+      mission: { id: missionId, name, objective: "o" },
+      work: { group: missionId, workKey: "implement", iteration: 1 },
+    },
     createdAt: "2026-08-21T00:00:10.000Z",
     ...overrides,
   });
@@ -2047,15 +2052,15 @@ describe("flow-instance session scope", () => {
   it.effect("one wake, work across two instances: one session each in the SAME T3 project", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
-      const runA1 = flowRun(INST_A, "Alpha", {
+      const runA1 = missionRun(INST_A, "Alpha", {
         runId: "run_a1",
         createdAt: "2026-08-21T00:00:10.000Z",
       });
-      const runA2 = flowRun(INST_A, "Alpha", {
+      const runA2 = missionRun(INST_A, "Alpha", {
         runId: "run_a2",
         createdAt: "2026-08-21T00:00:11.000Z",
       });
-      const runB1 = flowRun(INST_B, "Beta", {
+      const runB1 = missionRun(INST_B, "Beta", {
         runId: "run_b1",
         createdAt: "2026-08-21T00:00:12.000Z",
       });
@@ -2101,8 +2106,8 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
-        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        missionRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
       ]);
       yield* wake(harness.router);
       const alphaThread = threadCreates(harness.commands).find(
@@ -2133,8 +2138,8 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
-        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        missionRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
       ]);
       yield* wake(harness.router);
       const byTitle = new Map(
@@ -2185,7 +2190,7 @@ describe("flow-instance session scope", () => {
         harness.setOpenRuns([
           legacyRun("run_legacy_1", "2026-08-21T00:00:10.000Z"),
           legacyRun("run_legacy_2", "2026-08-21T00:00:11.000Z"),
-          flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:12.000Z" }),
+          missionRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:12.000Z" }),
         ]);
 
         yield* wake(harness.router);
@@ -2211,9 +2216,9 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
-        flowRun(INST_A, "Alpha", { runId: "run_a2", createdAt: "2026-08-21T00:00:11.000Z" }),
-        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:12.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a2", createdAt: "2026-08-21T00:00:11.000Z" }),
+        missionRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:12.000Z" }),
       ]);
       yield* wake(harness.router);
       const byTitle = new Map(
@@ -2235,8 +2240,8 @@ describe("flow-instance session scope", () => {
       );
       yield* harness.router.onThreadEvent(alphaThread as never);
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", { runId: "run_a2", createdAt: "2026-08-21T00:00:11.000Z" }),
-        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:12.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a2", createdAt: "2026-08-21T00:00:11.000Z" }),
+        missionRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:12.000Z" }),
       ]);
       harness.putThread(
         makeThreadShell(alphaThread, projectId, (shell) => ({
@@ -2269,13 +2274,13 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", {
+        missionRun(INST_A, "Alpha", {
           runId: "run_a1",
           createdAt: "2026-08-21T00:00:10.000Z",
           workspacePolicy: "managed-worktree",
           workspacePath: WT_A,
         }),
-        flowRun(INST_B, "Beta", {
+        missionRun(INST_B, "Beta", {
           runId: "run_b1",
           createdAt: "2026-08-21T00:00:11.000Z",
           workspacePolicy: "managed-worktree",
@@ -2309,8 +2314,8 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
-        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        missionRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
       ]);
 
       yield* harness.router.reconcileOpenWork(wakeInput());
@@ -2333,8 +2338,8 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
-        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        missionRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
       ]);
       yield* wake(harness.router);
       const [created] = threadCreates(harness.commands);
@@ -2374,8 +2379,8 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
-        flowRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
+        missionRun(INST_A, "Alpha", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        missionRun(INST_B, "Beta", { runId: "run_b1", createdAt: "2026-08-21T00:00:11.000Z" }),
       ]);
       yield* wake(harness.router);
       assert.lengthOf(threadCreates(harness.commands), 2);
@@ -2398,7 +2403,7 @@ describe("flow-instance session scope", () => {
       assert.strictEqual(
         sharedTurn?.type === "thread.turn.start" ? sharedTurn.message.text : null,
         assignedWorkWakeMessage({
-          current: flowRun(INST_A, "Alpha", {
+          current: missionRun(INST_A, "Alpha", {
             runId: "run_a1",
             createdAt: "2026-08-21T00:00:10.000Z",
           }),
@@ -2426,7 +2431,7 @@ describe("flow-instance session scope", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeFlowSettings());
       harness.setOpenRuns([
-        flowRun(INST_A, "   ", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
+        missionRun(INST_A, "   ", { runId: "run_a1", createdAt: "2026-08-21T00:00:10.000Z" }),
       ]);
 
       yield* wake(harness.router);
@@ -2469,9 +2474,14 @@ describe("applyThinkLevelToOptions", () => {
   });
 });
 
-// ── Flow-instance finalization drive (flow-end design) ───────────
+// ── Work-group settle drive (the mission settlement's drive) ──────
+// The drive the mission-ended settlement rides (settleWorkGroupSession):
+// safe-idle checks, settle / settle-then-delete per retention, project-scope
+// rebind. Group keys below are generic (fi_* spellings) — the drive is
+// group-key-agnostic; the flow-end intake that used to call it is deleted
+// (work-mission-v5 Phase 7).
 
-describe("flow-instance finalization drive", () => {
+describe("work-group settle drive", () => {
   const INST_A = "fi_alpha";
   const INST_B = "fi_beta";
   const WT_A = "/wt/alpha";
@@ -2503,8 +2513,8 @@ describe("flow-instance finalization drive", () => {
       },
     }));
 
-  const instanceRun = (
-    instanceId: string,
+  const groupRun = (
+    groupId: string,
     runId: string,
     overrides: Partial<AssignedWorkQueueEntry> = {},
   ): AssignedWorkQueueEntry => ({
@@ -2513,7 +2523,11 @@ describe("flow-instance finalization drive", () => {
     runRevision: "run:1",
     state: "open",
     agentId: AGENT_ID,
-    task: { prompt: `work ${runId}`, instance: { instanceId, name: instanceId, iteration: 1 } },
+    task: {
+      prompt: `work ${runId}`,
+      mission: { id: groupId, name: groupId, objective: "o" },
+      work: { group: groupId, workKey: "implement", iteration: 1 },
+    },
     createdAt: "2026-08-21T00:00:10.000Z",
     ...overrides,
   });
@@ -2550,7 +2564,7 @@ describe("flow-instance finalization drive", () => {
     () =>
       Effect.gen(function* () {
         const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
-        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
         yield* wake(harness.router);
         const { threadId } = routedInstanceSession(harness, INST_A);
         harness.setOpenRuns([]);
@@ -2581,7 +2595,7 @@ describe("flow-instance finalization drive", () => {
   it.effect("flow-instance scope: a running session, pending input, or queued turn waits", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
-      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
       yield* wake(harness.router);
       const { threadId, projectId } = routedInstanceSession(harness, INST_A);
       harness.setOpenRuns([]);
@@ -2645,12 +2659,12 @@ describe("flow-instance finalization drive", () => {
   it.effect("flow-instance scope: new open work for the instance keeps the session alive", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
-      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
       yield* wake(harness.router);
       const { threadId } = routedInstanceSession(harness, INST_A);
       // The terminal observation raced a new open work notice for the same
       // instance: the session keeps serving it.
-      harness.setOpenRuns([instanceRun(INST_A, "run_a2")]);
+      harness.setOpenRuns([groupRun(INST_A, "run_a2")]);
 
       assert.deepEqual(
         yield* harness.router.finalizeFlowInstance({
@@ -2670,7 +2684,7 @@ describe("flow-instance finalization drive", () => {
     () =>
       Effect.gen(function* () {
         const harness = yield* makeHarness(makeScopedSettings("flow-instance", "delete"));
-        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
         yield* wake(harness.router);
         const { threadId } = routedInstanceSession(harness, INST_A);
         harness.setOpenRuns([]);
@@ -2711,7 +2725,7 @@ describe("flow-instance finalization drive", () => {
     () =>
       Effect.gen(function* () {
         const harness = yield* makeHarness(makeScopedSettings("flow-instance", "delete"));
-        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
         yield* wake(harness.router);
         const { threadId, projectId } = routedInstanceSession(harness, INST_A);
         harness.setOpenRuns([]);
@@ -2773,7 +2787,7 @@ describe("flow-instance finalization drive", () => {
     () =>
       Effect.gen(function* () {
         const harness = yield* makeHarness(makeScopedSettings("flow-instance", "delete"));
-        harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+        harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
         yield* wake(harness.router);
         const { threadId, projectId } = routedInstanceSession(harness, INST_A);
         harness.setOpenRuns([]);
@@ -2800,10 +2814,10 @@ describe("flow-instance finalization drive", () => {
       }),
   );
 
-  it.effect("delivery persists the instance→thread association the finalization intake reads", () =>
+  it.effect("delivery persists the group→thread association the mission settlement reads", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
-      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
       yield* wake(harness.router);
       const { threadId } = routedInstanceSession(harness, INST_A);
 
@@ -2821,7 +2835,7 @@ describe("flow-instance finalization drive", () => {
       // A redelivered notice on a recreated session REPLACES the row (the
       // newest delivering thread is the association).
       harness.setOpenRuns([]);
-      harness.setOpenRuns([instanceRun(INST_A, "run_a2")]);
+      harness.setOpenRuns([groupRun(INST_A, "run_a2")]);
       yield* wake(harness.router);
       assert.deepEqual(
         harness.routeRecords.map((record) => record.threadId),
@@ -2830,7 +2844,7 @@ describe("flow-instance finalization drive", () => {
 
       // The ledger write is best-effort: its failure never fails the wake.
       harness.failRouteRecord(true);
-      harness.setOpenRuns([instanceRun(INST_B, "run_b1")]);
+      harness.setOpenRuns([groupRun(INST_B, "run_b1")]);
       yield* wake(harness.router);
       assert.isUndefined(harness.routeRecords.find((record) => record.instanceId === INST_B));
     }),
@@ -2839,7 +2853,7 @@ describe("flow-instance finalization drive", () => {
   it.effect("a gone or archived session completes and drops the routing record", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeScopedSettings("flow-instance"));
-      harness.setOpenRuns([instanceRun(INST_A, "run_a1")]);
+      harness.setOpenRuns([groupRun(INST_A, "run_a1")]);
       yield* wake(harness.router);
       const { threadId, projectId } = routedInstanceSession(harness, INST_A);
       harness.setOpenRuns([]);
@@ -2951,7 +2965,7 @@ describe("flow-instance finalization drive", () => {
           makeThreadShell(threadId, projectId, (shell) => ({ ...shell, worktreePath: WT_B })),
         );
         harness.setOpenRuns([
-          instanceRun(INST_B, "run_b1", {
+          groupRun(INST_B, "run_b1", {
             runId: "run_b1",
             workspacePolicy: "managed-worktree",
             workspacePath: WT_B,

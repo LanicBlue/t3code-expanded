@@ -33,7 +33,7 @@ import * as ServerConfig from "../config.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
-import * as ProjectFlowFinalizationStore from "../persistence/ProjectFlowFinalization.ts";
+import * as ProjectWorkSessionRouteStore from "../persistence/ProjectWorkSessionRoute.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as ProjectConsumerRuntime from "./ProjectConsumerRuntimeService.ts";
@@ -464,74 +464,25 @@ const makeFakes = (
       getRun: () => Effect.succeed(null),
       submitRun: () => Effect.succeed(null),
       getOperation: () => Effect.succeed(null),
-      listFlowInstances: () => Effect.succeed([]),
     } as unknown as ProjectServiceWorkClient.ProjectServiceWorkClient["Service"]);
 
-    // In-memory flow-finalization ledger: the durable store's contract,
-    // faked with a Map (the real store is covered by its own test).
-    const finalizationRows = new Map<
-      string,
-      ProjectFlowFinalizationStore.ProjectFlowFinalizationRecord
-    >();
-    const finalizationStoreLayer = Layer.succeed(
-      ProjectFlowFinalizationStore.ProjectFlowFinalizationStore,
-      {
-        record: (input: ProjectFlowFinalizationStore.RecordProjectFlowFinalizationInput) =>
-          Effect.sync(() => {
-            const key = `${input.eventId}\n${input.agentId}`;
-            const existing = finalizationRows.get(key);
-            if (existing !== undefined) {
-              if (
-                input.threadId !== null &&
-                existing.threadId === null &&
-                existing.state === "done"
-              ) {
-                finalizationRows.set(key, {
-                  ...existing,
-                  threadId: input.threadId,
-                  state: "pending",
-                  resolvedAt: null,
-                });
-                return "upgraded" as const;
-              }
-              return "exists" as const;
-            }
-            finalizationRows.set(key, {
-              ...input,
-              state: input.threadId === null ? "done" : "pending",
-              resolvedAt: input.threadId === null ? input.createdAt : null,
-            });
-            return "recorded" as const;
-          }),
-        listPending: () =>
-          Effect.succeed([...finalizationRows.values()].filter((row) => row.state === "pending")),
-        markDone: (input: ProjectFlowFinalizationStore.MarkProjectFlowFinalizationDoneInput) =>
-          Effect.sync(() => {
-            const key = `${input.eventId}\n${input.agentId}`;
-            const row = finalizationRows.get(key);
-            if (row !== undefined && row.state === "pending") {
-              finalizationRows.set(key, { ...row, state: "done", resolvedAt: input.resolvedAt });
-            }
-          }),
-      } as unknown as ProjectFlowFinalizationStore.ProjectFlowFinalizationStore["Service"],
-    );
-
-    // In-memory session-route ledger: the persisted instance→thread
-    // association the delivery path writes and the finalization intake reads.
+    // In-memory session-route ledger: the persisted work-group→thread
+    // association the delivery path writes and the mission-ended settlement
+    // reads (the flow-finalization ledger's drivers are deleted, Phase 7).
     const sessionRoutes = new Map<
       string,
-      ProjectFlowFinalizationStore.ProjectFlowSessionRouteRecord
+      ProjectWorkSessionRouteStore.ProjectWorkSessionRouteRecord
     >();
     const sessionRouteStoreLayer = Layer.succeed(
-      ProjectFlowFinalizationStore.ProjectFlowSessionRouteStore,
+      ProjectWorkSessionRouteStore.ProjectFlowSessionRouteStore,
       {
-        record: (input: ProjectFlowFinalizationStore.RecordProjectFlowSessionRouteInput) =>
+        record: (input: ProjectWorkSessionRouteStore.RecordProjectWorkSessionRouteInput) =>
           Effect.sync(() => {
             sessionRoutes.set(`${input.instanceId}\n${input.agentId}`, input);
           }),
-        find: (input: ProjectFlowFinalizationStore.FindProjectFlowSessionRouteInput) =>
+        find: (input: ProjectWorkSessionRouteStore.FindProjectWorkSessionRouteInput) =>
           Effect.succeed(sessionRoutes.get(`${input.instanceId}\n${input.agentId}`) ?? null),
-      } as unknown as ProjectFlowFinalizationStore.ProjectFlowSessionRouteStore["Service"],
+      } as unknown as ProjectWorkSessionRouteStore.ProjectFlowSessionRouteStore["Service"],
     );
 
     const configLayer = Layer.fresh(
@@ -553,7 +504,6 @@ const makeFakes = (
       Layer.provideMerge(workspacePathsLayer),
       Layer.provideMerge(registryLayer),
       Layer.provideMerge(workClientLayer),
-      Layer.provideMerge(finalizationStoreLayer),
       Layer.provideMerge(sessionRouteStoreLayer),
       Layer.provideMerge(settingsLayer),
       // Platform services folded in so each it.live test provides one layer.

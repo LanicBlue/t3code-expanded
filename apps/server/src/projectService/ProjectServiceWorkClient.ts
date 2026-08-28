@@ -12,6 +12,7 @@
 import {
   isLocalProjectServiceBaseUrl,
   PositiveInt,
+  ProjectWorkVisitActionRecord,
   ProjectWorkVisitView,
 } from "@t3tools/contracts";
 import {
@@ -118,42 +119,18 @@ export const ProjectWorkPositionRecord = Schema.Struct({
 export type ProjectWorkPositionRecord = typeof ProjectWorkPositionRecord.Type;
 
 /**
- * The run's completion contract as PS projects it (apiMinor 2): which submit
- * shape project_work_submit accepts, with the facts prose used to omit —
- * transition target states, gate accept/reject destinations, document display
- * paths. `transitions`/`documents` are absent when the definition join
- * degraded; the whole field is absent on older servers.
+ * The run's completion contract as PS projects it (apiMinor 2): the visit
+ * action view — the station's outcome vocabulary (`outcomes`), the
+ * in-contract next-station candidates, and whether the reserved "abandon"
+ * alternative is open. work-mission-v5 Phase 7 narrowed this to the SDK 0.16
+ * `WorkRunActionView` (kind is always "visit"): the flow-era state/gate/
+ * terminal arms have no producer on the service anymore, so a run record
+ * carrying any other kind is an incompatibility, never silently-dropped
+ * facts. One schema with contracts' visit action record — the run-level
+ * `action` field and the visit view's action block are the SAME wire fact.
  */
-export const ProjectWorkActionRecord = Schema.Struct({
-  kind: Schema.Literals(["state", "gate", "terminal"]),
-  /** State work: the {"kind":"after"} submission picks one of these. */
-  transitions: Schema.optional(
-    Schema.Array(Schema.Struct({ transitionId: Schema.String, to: Schema.String })),
-  ),
-  /** Gate work: where accept / reject(→rework) send the instance. AcceptTo/
-   * rejectTo are omitted on the synthesized ABANDON gate — accept ends the
-   * instance, reject bounces the submitting state; neither is a real state. */
-  review: Schema.optional(
-    Schema.Struct({
-      acceptTo: Schema.optional(Schema.String),
-      rejectTo: Schema.optional(Schema.String),
-      feedbackRequiredOn: Schema.Literals(["reject"]),
-    }),
-  ),
-  /** Terminal work: the end disposition this submission sets. */
-  terminal: Schema.optional(Schema.Literals(["completed", "abandoned"])),
-  /** True when {"kind":"abandon","message"} is an accepted alternative. */
-  abandonAvailable: Schema.Boolean,
-  /** Display paths for the run's document rights. */
-  documents: Schema.optional(
-    Schema.Struct({
-      read: Schema.Array(Schema.String),
-      write: Schema.Array(Schema.String),
-      evidence: Schema.optional(Schema.Array(Schema.String)),
-    }),
-  ),
-});
-export type ProjectWorkActionRecord = typeof ProjectWorkActionRecord.Type;
+export const ProjectWorkActionRecord = ProjectWorkVisitActionRecord;
+export type ProjectWorkActionRecord = ProjectWorkVisitActionRecord;
 
 export const ProjectWorkRunRecord = Schema.Struct({
   runId: Schema.String,
@@ -185,23 +162,37 @@ export const ProjectWorkRunRecord = Schema.Struct({
 export type ProjectWorkRunRecord = typeof ProjectWorkRunRecord.Type;
 
 /**
- * Decode the visit view out of a run's task snapshot: null when the task has
- * no `mission` block (the flow population — `task.instance` — and standalone
- * work), the decoded view when it does. The decode REBUILDS the record, so
- * the view carries exactly the pinned §6.1 blocks — never the whole task
- * (the prompt and other task facts stay on `task`, where they belong). A task
- * that DECLARES the mission population but does not decode against the
- * pinned shape is an incompatibility like any other bad shape — never a
- * silently-ignored block.
+ * Decode the visit view out of a run: null when the task has no `mission`
+ * block (not this population — the Project Service's run surface is
+ * visit-only since it removed the flow stack, work-mission-v5 Phase 7), the
+ * decoded view when it does. The mission/work blocks live in the task
+ * snapshot; the completion contract is the run's TOP-LEVEL `action` field
+ * (the SDK's WorkRunView carries it there — one fact, one home). The decode
+ * REBUILDS the record, so the view carries exactly the pinned §6.1 blocks —
+ * never the whole task (the prompt and other task facts stay on `task`,
+ * where they belong). A task that DECLARES the mission population but does
+ * not decode against the pinned shape — mission/work blocks missing, or the
+ * visit action absent — is an incompatibility like any other bad shape,
+ * never a silently-ignored block.
  */
-const decodeVisitView = Schema.decodeUnknownSync(ProjectWorkVisitView);
-const visitViewOfTask = (task: Readonly<Record<string, unknown>>): ProjectWorkVisitView | null => {
-  const mission = task.mission;
+const VisitTaskBlocks = Schema.Struct({
+  mission: ProjectWorkVisitView.fields.mission,
+  work: ProjectWorkVisitView.fields.work,
+});
+const decodeVisitTaskBlocks = Schema.decodeUnknownSync(VisitTaskBlocks);
+const visitViewOfRun = (run: ProjectWorkRunRecord): ProjectWorkVisitView | null => {
+  const mission = run.task.mission;
   if (typeof mission !== "object" || mission === null) {
     return null;
   }
   try {
-    return decodeVisitView(task);
+    const blocks = decodeVisitTaskBlocks(run.task);
+    // The visit population without its completion contract is a broken
+    // projection — PS emits `action` unconditionally on visit run views.
+    if (run.action === undefined) {
+      throw new Error("visit run without action");
+    }
+    return { ...blocks, action: run.action };
   } catch {
     throw new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" });
   }
@@ -248,58 +239,6 @@ const EnvelopeError = Schema.Struct({
 
 /** A failure envelope on routes this module calls directly (not via the SDK). */
 const FailureEnvelope = Schema.Struct({ ok: Schema.Literals([false]), error: EnvelopeError });
-
-/** A spawned flow instance (tree branching): the child handle agents report upward. */
-export const ProjectFlowSpawnRecord = Schema.Struct({
-  instanceId: Schema.String,
-  eventId: Schema.String,
-});
-export type ProjectFlowSpawnRecord = typeof ProjectFlowSpawnRecord.Type;
-
-/**
- * The terminal marker of a flow instance (`ended` in the instance view):
- * `completedByEventId` is the service's own durable event identity for the
- * terminal transition — the stable idempotency key a finalization dedupes on.
- */
-export const ProjectFlowInstanceEndedRecord = Schema.Struct({
-  disposition: Schema.Literals(["completed", "abandoned"]),
-  completedByEventId: Schema.String,
-});
-export type ProjectFlowInstanceEndedRecord = typeof ProjectFlowInstanceEndedRecord.Type;
-
-/**
- * A flow instance as the finalization intake reads it (GET /:id/flow/
- * instances): identity facts plus the terminal marker. `ended === null` is a
- * live instance; extra view fields drop at this trust boundary.
- */
-export const ProjectFlowInstanceRecord = Schema.Struct({
-  instanceId: Schema.String,
-  name: Schema.String,
-  ended: Schema.NullOr(ProjectFlowInstanceEndedRecord),
-});
-export type ProjectFlowInstanceRecord = typeof ProjectFlowInstanceRecord.Type;
-
-/**
- * Ruling ②' spawn outcome. `committed` — the child instance exists. `pending` —
- * the server ACKed (202 + operationId) and construction continues in the
- * background: poll `project_operation_get` with the operationId. A pending
- * outcome is NOT a failure — re-invoking project_flow_start with a fresh key
- * would mint a DUPLICATE child; the bounded client-side wait simply closed
- * before the server finished constructing.
- */
-export const ProjectFlowSpawnOutcome = Schema.Union([
-  Schema.Struct({
-    status: Schema.Literals(["committed"]),
-    instanceId: Schema.String,
-    eventId: Schema.String,
-    operationId: Schema.optional(Schema.String),
-  }),
-  Schema.Struct({
-    status: Schema.Literals(["pending"]),
-    operationId: Schema.String,
-  }),
-]);
-export type ProjectFlowSpawnOutcome = typeof ProjectFlowSpawnOutcome.Type;
 
 /** The wire shape the SDK delivers (base64 data); decoded before the tool sees it. */
 const WIRE_FLOW_DOCUMENT_RECORD = Schema.Struct({
@@ -378,10 +317,10 @@ export type ProjectWorkOperationRecord = typeof ProjectWorkOperationRecord.Type;
  * are rebuilt field-by-field rather than passed through.
  */
 const projectRunRecord = (run: ProjectWorkRunRecord): ProjectWorkRunRecord => {
-  // The visit view derives from the task snapshot (the wire carries the
-  // mission blocks inside `task`); decoding here puts every later consumer
+  // The visit view derives from the run (the task's mission/work blocks plus
+  // the run-level action field); decoding here puts every later consumer
   // — queue keys, session routing, the MCP tools — behind one boundary.
-  const visit = visitViewOfTask(run.task);
+  const visit = visitViewOfRun(run);
   return {
     runId: run.runId,
     positionId: run.positionId,
@@ -487,32 +426,6 @@ export class ProjectServiceWorkClient extends Context.Service<
     readonly getOperation: (
       operationId: string,
     ) => Effect.Effect<ProjectWorkOperationRecord | null, ProjectServiceWorkClientError>;
-    /**
-     * Tree-branch spawn (POST /:id/flow/instances): start a flow instance of a
-     * definition whose active version opted in via `consumerStartable`. The
-     * ordinary credential is the authorization. v2 (D3): the payload is
-     * name-only — the instance name is the single injected context; the
-     * child's start work prompt interpolates {instance.name} and the run view
-     * carries instance:{instanceId,name}. No prompt injection surface.
-     * Ruling ②': the server ACKs (202 + operationId) and constructs in the
-     * background; the client polls bounded — the outcome is committed, or
-     * pending with the operationId to poll. Never re-spawn on pending.
-     */
-    readonly startFlow: (input: {
-      readonly projectId: string;
-      readonly idempotencyKey: string;
-      readonly definitionId: string;
-      readonly name: string;
-    }) => Effect.Effect<ProjectFlowSpawnOutcome, ProjectServiceWorkClientError>;
-    /**
-     * The project's flow instances (GET /:id/flow/instances), terminal markers
-     * included — the authority the flow-end intake derives terminal-state
-     * notifications from. Ordinary-client readable; no projectGeneration
-     * fence on this route.
-     */
-    readonly listFlowInstances: (input: {
-      readonly projectId: string;
-    }) => Effect.Effect<readonly ProjectFlowInstanceRecord[], ProjectServiceWorkClientError>;
     /**
      * Flow-document notary (by-run addressing): read a document through one of
      * the agent's open runs — the run's slot rights decide readability.
@@ -756,58 +669,6 @@ export const make = Effect.gen(function* () {
     return records.map(projectServiceProjectRecord);
   });
 
-  // GET /:id/flow/instances answers { ok, result: { instances: [...],
-  // status, ... } } — the flowOk envelope every flow route rides (project-router
-  // wraps flow.listInstances in { ok: true, result }). Decoding reads
-  // value.result (NOT value itself): a 200 body that is not the success
-  // envelope is a typed shape failure, never a silently-empty instance list.
-  // The intake reads identity + terminal marker only; extra view fields drop
-  // at this trust boundary like on every other read. Failures keep the
-  // service's own envelope codes.
-  const listFlowInstances = Effect.fn("ProjectServiceWorkClient.listFlowInstances")(function* (
-    projectId: string,
-  ) {
-    const endpoint = yield* resolveEndpoint;
-    const { status, value } = yield* facetRequest(
-      "GET",
-      `${endpoint.baseUrl}/project/v1/${encodeURIComponent(projectId)}/flow/instances`,
-      undefined,
-      endpoint.credential,
-    );
-    if (status === 404) {
-      return yield* new ProjectServiceWorkServiceRejectedError({
-        code: "PROJECT_NOT_FOUND",
-        status,
-        message: "The bound Project Service project does not exist.",
-      });
-    }
-    if (status < 200 || status >= 300) {
-      if (isFailureEnvelope(value)) {
-        return yield* new ProjectServiceWorkServiceRejectedError({
-          code: value.error.code,
-          status,
-          message: value.error.message,
-        });
-      }
-      return yield* new ProjectServiceWorkTransportError({});
-    }
-    const result = yield* Effect.try({
-      try: () =>
-        decodeOrIncompatible(
-          Schema.Struct({
-            ok: Schema.Literals([true]),
-            result: Schema.Struct({ instances: Schema.Array(ProjectFlowInstanceRecord) }),
-          }),
-          value,
-        ),
-      catch: (cause) =>
-        isApiIncompatible(cause)
-          ? cause
-          : new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" }),
-    });
-    return result.result.instances;
-  });
-
   const getProjectGeneration = Effect.fn("ProjectServiceWorkClient.getProjectGeneration")(
     function* (projectId: string) {
       const endpoint = yield* resolveEndpoint;
@@ -887,18 +748,6 @@ export const make = Effect.gen(function* () {
       agentId: input.agentId,
       result: input.result,
     }) as unknown as Parameters<ProjectConsumerWorkClient["submitRun"]>[0];
-  const startFlowArgs = (input: {
-    readonly projectId: string;
-    readonly idempotencyKey: string;
-    readonly definitionId: string;
-    readonly name: string;
-  }) =>
-    ({
-      projectId: input.projectId,
-      idempotencyKey: input.idempotencyKey,
-      definitionId: input.definitionId,
-      name: input.name,
-    }) as Parameters<ProjectConsumerWorkClient["startFlow"]>[0];
   const readFlowDocumentArgs = (input: {
     readonly projectId: string;
     readonly runId: string;
@@ -933,7 +782,6 @@ export const make = Effect.gen(function* () {
   return ProjectServiceWorkClient.of({
     listProjects,
     getProjectGeneration,
-    listFlowInstances: (input) => listFlowInstances(input.projectId),
     listPositions: (input) =>
       withClient(
         undefined,
@@ -973,12 +821,6 @@ export const make = Effect.gen(function* () {
           value === null || value === undefined
             ? null
             : projectOperationRecord(decodeOrIncompatible(ProjectWorkOperationRecord, value)),
-      ),
-    startFlow: (input) =>
-      withClient(
-        undefined,
-        (client) => client.startFlow(startFlowArgs(input)),
-        (value) => decodeOrIncompatible(ProjectFlowSpawnOutcome, value),
       ),
     readFlowDocument: (input) =>
       withClient(

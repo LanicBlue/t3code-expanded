@@ -237,10 +237,10 @@ export const LogicalAgentConfigMap = Schema.Record(LogicalAgentId, LogicalAgentC
 export type LogicalAgentConfigMap = typeof LogicalAgentConfigMap.Type;
 
 // ── work-mission-v5 visit view (capability `mission.v1`) ─────────
-// The SHAPE source of truth for every block below is the vendored SDK 0.14
-// (WorkRunMissionTaskView / WorkRunWorkTaskView / the "visit" arm of
-// WorkRunActionView / MissionVisitSubmitResult). These Effect schemas exist
-// because each trust boundary DECODES — apps/server's vendoredSdkIntegrity
+// The SHAPE source of truth for every block below is the vendored SDK 0.16
+// (WorkRunMissionTaskView / WorkRunWorkTaskView / WorkRunActionView — the
+// visit-only action view / MissionVisitSubmitResult). These Effect schemas
+// exist because each trust boundary DECODES — apps/server's vendoredSdkIntegrity
 // test pins the assignability against the SDK types so the two cannot drift.
 
 /**
@@ -271,24 +271,30 @@ export const ProjectWorkVisitWorkRecord = Schema.Struct({
 export type ProjectWorkVisitWorkRecord = typeof ProjectWorkVisitWorkRecord.Type;
 
 /**
- * The visit completion contract — the `task.action` block of the visit view:
- * `outcomes` is THIS station's vocabulary (the submit `outcome` domain),
- * `candidates` the in-contract target stations for the current pending state.
- * Candidates are a choice HINT, not a constraint — off-contract targets are
- * legal within the station's handoff permission and require a submit `reason`.
+ * The visit completion contract — the run-level `action` field of a visit run
+ * (work-mission-v5 §6.1; the SDK's `WorkRunActionView`). `kind` is always
+ * "visit" on the 0.16 generation: the state/gate/terminal arms died with the
+ * flow line. `outcomes` is THIS station's vocabulary (the submit `outcome`
+ * domain, "abandon" always an additional reserved alternative),
+ * `candidates` the in-contract target stations for the current pending state —
+ * a choice HINT, not a constraint (off-contract targets are legal within the
+ * station's handoff permission and require a submit `reason`).
  */
 export const ProjectWorkVisitActionRecord = Schema.Struct({
   kind: Schema.Literals(["visit"]),
-  outcomes: Schema.Array(Schema.String),
-  candidates: Schema.Array(Schema.String),
+  outcomes: Schema.optional(Schema.Array(Schema.String)),
+  candidates: Schema.optional(Schema.Array(Schema.String)),
+  abandonAvailable: Schema.Boolean,
 });
 export type ProjectWorkVisitActionRecord = typeof ProjectWorkVisitActionRecord.Type;
 
 /**
- * The decoded visit view of a run's `task` snapshot (the work-mission-v5
- * population). Present iff `task.mission` is — the discriminator between the
- * visit population and the legacy flow population (`task.instance`); the two
- * coexist for the migration drain period (design §6.1).
+ * The decoded visit view of a run (the work-mission-v5 population): the
+ * `task.mission`/`task.work` blocks plus the run-level `action` field.
+ * Present iff `task.mission` is — the discriminator this client keys on
+ * (`task.instance` frames are structurally gone: the Project Service removed
+ * the flow stack in work-mission-v5 Phase 7 and its run surface is
+ * visit-only, so a task without a mission block is not this population).
  */
 export const ProjectWorkVisitView = Schema.Struct({
   mission: ProjectWorkMissionRecord,

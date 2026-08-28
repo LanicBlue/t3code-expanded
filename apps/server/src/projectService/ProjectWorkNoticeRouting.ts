@@ -8,9 +8,10 @@
  * state only — Work lifecycle is never mirrored into T3.
  *
  * The routing key is `logicalAgentId + Project Service projectId` — plus the
- * flow-instance key when the agent's session scope is "flow-instance", which
- * gives each instance's work its own session; names in either direction are
- * display metadata and never participate in the mapping.
+ * work-group key (the mission id) when the agent's session scope is
+ * "flow-instance" (the historical scope name), which gives each mission's
+ * visits their own session; names in either direction are display metadata
+ * and never participate in the mapping.
  * The T3 project is resolved from the notice's WORKSPACE DIRECTORY: the
  * active local project keyed by that directory is reused, and a missing one
  * is created on the spot (issue #6's auto-reuse/auto-create rule), so no
@@ -60,11 +61,11 @@ import {
   type AssignedWorkQueueEntry,
   assignedWorkWakeMessage,
   currentAssignedWork,
+  missionKeyOf,
+  missionNameOf,
   orderAssignedWorkQueue,
   partitionOpenWork,
   runsForWorkGroup,
-  workGroupKeyOf,
-  workGroupNameOf,
 } from "./AssignedWorkQueue.ts";
 
 const DEFAULT_ROUTING_RUNTIME_MODE = "full-access" as const;
@@ -261,7 +262,7 @@ const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
  * latestTurn timestamp, inside the bounded adoption grace window. The
  * shell-fact mirror of the decider's messages-based guard; a failed session
  * start (stopped/error/interrupted) clears the block immediately. The
- * finalization drive uses this only as a churn guard — the settle command's
+ * settle drive uses this only as a churn guard — the settle command's
  * own decider check stays the authority.
  */
 export const workThreadHasQueuedTurnStart = (
@@ -428,11 +429,11 @@ export interface ProjectWorkSessionRouterDeps {
     input: ProjectWorkWakeInput,
   ) => Effect.Effect<ReadonlyArray<AssignedWorkQueueEntry>, ProjectWorkRoutingError>;
   /**
-   * Persist one instance→thread association into the routing ledger. Called
+   * Persist one work-group→thread association into the routing ledger. Called
    * at every aggregate delivery, best-effort: the Project Service's run
    * lists only answer OPEN runs, so this durable row is the only fact that
-   * survives the run's closure — which is exactly when flow-end finalization
-   * needs to know which session ran the instance's work.
+   * survives the runs' closure — which is exactly when the mission-ended
+   * settlement needs to know which session ran the mission's visits.
    */
   readonly recordFlowSessionRoute: (input: {
     readonly instanceId: string;
@@ -448,9 +449,10 @@ export interface ProjectWorkSessionSnapshot {
   readonly agentId: string;
   readonly projectId: string;
   /**
-   * The work GROUP this session owns (null = the whole project queue): a flow
-   * instance id for the flow population, a mission id for the visit
-   * population — the drain-period dual population's one grouping key.
+   * The work GROUP this session owns (null = the whole project queue): the
+   * mission id — the visit population's one grouping key (the flow
+   * population's instance keys are gone with the flow stack,
+   * work-mission-v5 Phase 7).
    */
   readonly flowInstanceKey: string | null;
   readonly threadId: ThreadId;
@@ -462,27 +464,33 @@ export interface ProjectWorkSessionSnapshot {
   readonly workspaceDir: string | null;
 }
 
-/** Facts one recorded flow-instance finalization carries into its drive. */
+/**
+ * Facts one work-group settle drive carries. Despite the historical field
+ * names (kept for churn control across work-mission-v5 Phase 7), the group
+ * is the MISSION id — the mission-ended settlement is this drive's only
+ * caller since the flow-end finalization was deleted.
+ */
 export interface FlowInstanceFinalizationInput {
-  /** The logical agent whose session(s) the instance's work ran on. */
+  /** The logical agent whose session(s) the group's work ran on. */
   readonly agentId: string;
-  /** The Project Service project the instance belongs to. */
+  /** The Project Service project the group belongs to. */
   readonly projectId: string;
   /**
-   * The flow instance id — the routing-key segment the instance's sessions
-   * live under (the legacy no-instance bucket "" never reaches finalization:
-   * its runs carry no instance identity to end).
+   * The work-group key — the routing-key segment the group's sessions live
+   * under (the legacy no-group bucket "" never reaches a settle drive: its
+   * runs carry no group identity to end).
    */
   readonly instanceKey: string;
   /**
-   * The session thread the intake resolved for this (instance, agent). The
-   * live registry entry wins when present; this is the restart fallback.
+   * The session thread the settlement's plan resolved for this (group,
+   * agent). The live registry entry wins when present; this is the restart
+   * fallback.
    */
   readonly threadId: string;
 }
 
 /**
- * Why a finalization could not finish yet. Every waiting reason is retried
+ * Why a settle drive could not finish yet. Every waiting reason is retried
  * on the next thread event, sweep tick, or reconnect — never dropped.
  */
 export type FlowInstanceFinalizationWait =
@@ -492,7 +500,7 @@ export type FlowInstanceFinalizationWait =
   | "routing-unavailable"
   | "projection-unreadable";
 
-/** One finalization drive's outcome. */
+/** One settle drive's outcome. */
 export type FlowInstanceFinalizationOutcome =
   | { readonly kind: "completed" }
   | { readonly kind: "waiting"; readonly reason: FlowInstanceFinalizationWait };
@@ -521,10 +529,10 @@ export interface ProjectWorkSessionRouter {
    */
   readonly reconcileOpenWork: (input: ProjectWorkWakeInput) => Effect.Effect<void>;
   /**
-   * Drive one recorded flow-instance finalization (flow-end design): under
+   * Drive one work-group settle (the mission settlement's drive): under
    * the routing key's serialization, wait for the session's safe-idle
-   * conditions, apply the agent's retention for flow-instance sessions
-   * (settle, or settle-then-delete), remove the instance's routing record —
+   * conditions, apply the agent's retention for group-scoped sessions
+   * (settle, or settle-then-delete), remove the group's routing record —
    * or, for a project-scope session, recompute the workspace binding from
    * CURRENT open work (next work's worktree, or project root when none).
    * Never fails: a session that cannot finish yet resolves "waiting" and the
@@ -557,9 +565,8 @@ interface RoutedSession {
   /**
    * The run universe this session owns, fixed at creation: null = every run
    * of the (agent, project) queue (project scope); a string = one work
-   * GROUP's runs — a flow instance (flow population) or a mission (visit
-   * population, drain-period dual population) — with "" as the legacy bucket
-   * for runs without group identity. A session only drives while the agent's
+   * GROUP's runs — the mission id — with "" as the legacy bucket for runs
+   * without group identity. A session only drives while the agent's
    * CONFIGURED scope matches this universe — the universe guard in
    * processThreadEvent parks it the moment a settings toggle moves the work
    * to other sessions.
@@ -904,14 +911,14 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       interactionMode: DEFAULT_ROUTING_INTERACTION_MODE,
       createdAt,
     });
-    // Durable instance→thread association, written while the work is still
-    // OPEN (the only moment a live API can see it): the finalization intake
-    // reads this ledger after the runs have closed or a restart emptied the
-    // registry. Best-effort by design — a failed write never fails the
-    // delivery it rides on; the intake's overturnable no-op repairs a missed
-    // row when a later delivery lands.
+    // Durable work-group→thread association, written while the work is still
+    // OPEN (the only moment a live API can see it): the mission-ended
+    // settlement reads this ledger after the runs have closed or a restart
+    // emptied the registry. Best-effort by design — a failed write never
+    // fails the delivery it rides on; a later delivery's row repairs a
+    // missed one when it lands.
     for (const instanceKey of new Set(
-      ordered.map((run) => workGroupKeyOf(run)).filter((key) => key.length > 0),
+      ordered.map((run) => missionKeyOf(run)).filter((key) => key.length > 0),
     )) {
       const recorded = yield* deps
         .recordFlowSessionRoute({
@@ -923,7 +930,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         .pipe(Effect.result);
       if (recorded._tag === "Failure") {
         yield* Effect.logWarning(
-          "Project Work session route could not be persisted; the finalization intake retries on the next delivery",
+          "Project Work session route could not be persisted; the next delivery retries",
           {
             agentId: target.logicalAgentId,
             projectId: target.projectServiceProjectId,
@@ -984,7 +991,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
             ? workSessionThreadTitle(target.agentName)
             : flowInstanceWorkSessionThreadTitle(
                 target.agentName,
-                ordered[0] !== undefined ? workGroupNameOf(ordered[0]) : null,
+                ordered[0] !== undefined ? missionNameOf(ordered[0]) : null,
               ),
         logicalAgentId: target.logicalAgentId,
         modelSelection,
@@ -1616,7 +1623,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     yield* sweepBody(input, routingKeyOf(input.agentId, input.projectId, null), null, undefined);
   });
 
-  // ── Flow-instance finalization (flow-end design) ────────────────
+  // ── Work-group settle drive (the mission settlement's drive) ─────
 
   /**
    * The agent's CURRENT session facts: settings are re-read every drive, so

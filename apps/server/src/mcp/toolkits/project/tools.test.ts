@@ -9,7 +9,6 @@ import {
   ProjectDocEditInput,
   ProjectDocReadInput,
   ProjectDocWriteInput,
-  ProjectFlowStartInput,
   ProjectOperationGetInput,
   ProjectWorkGetInput,
   ProjectWorkListInput,
@@ -84,7 +83,6 @@ it("never accepts an identity or credential field in any tool input", () => {
     project_work_get: ProjectWorkGetInput,
     project_work_submit: ProjectWorkSubmitInput,
     project_operation_get: ProjectOperationGetInput,
-    project_flow_start: ProjectFlowStartInput,
     project_doc_read: ProjectDocReadInput,
     project_doc_write: ProjectDocWriteInput,
     project_doc_edit: ProjectDocEditInput,
@@ -159,12 +157,24 @@ it("the submit tool description teaches the visit contract: candidates hint, off
   const description = ProjectWorkToolkit.tools.project_work_submit.description ?? "";
   // The visit population's submit semantics are agent-facing contract text:
   // they must name the outcome domain, the candidates' hint-not-constraint
-  // status, and the off-contract reason requirement.
+  // status, and the off-contract reason requirement. The action field is
+  // run-level (the wire carries it beside task, not inside it).
   expect(description).toContain("VISIT work");
-  expect(description).toContain("task.action.outcomes");
-  expect(description).toContain("task.action.candidates");
+  expect(description).toContain("action.outcomes");
+  expect(description).toContain("action.candidates");
   expect(description).toContain("off-contract");
   expect(description).toContain('"reason"');
+});
+
+it("the flow-line surfaces are gone: no spawn tool, no flow-era submit kinds", () => {
+  // work-mission-v5 Phase 7c: the consumer spawn face and the flow-era
+  // state/gate/terminal action kinds died with the flow line — the toolkit
+  // carries neither the tool nor the teaching.
+  expect(Object.keys(ProjectWorkToolkit.tools)).not.toContain("project_flow_start");
+  const description = ProjectWorkToolkit.tools.project_work_submit.description ?? "";
+  for (const dead of ['"kind":"after"', '"kind":"before"', '"kind":"terminal"', "transitionId"]) {
+    expect(description).not.toContain(dead);
+  }
 });
 
 it("strips identity keys an agent smuggles into business arguments", () => {
