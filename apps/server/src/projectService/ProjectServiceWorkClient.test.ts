@@ -86,12 +86,13 @@ const RUN_VIEW = {
   createdAt: "2026-08-01T00:00:00.000Z",
   resolvedAt: null,
   // apiMinor 2: the completion contract rides the run view; the client-side
-  // projection must carry it through to the MCP tools.
+  // projection must carry it through to the MCP tools. SDK 0.16 generation:
+  // the visit-only action view.
   action: {
-    kind: "state",
-    transitions: [{ transitionId: "handoff", to: "reading" }],
+    kind: "visit",
+    outcomes: ["implementation-ready"],
+    candidates: ["validation"],
     abandonAvailable: true,
-    documents: { read: [], write: ["decision.md"] },
   },
 };
 
@@ -105,11 +106,11 @@ const POSITION_VIEW = {
 };
 
 /**
- * A visit-population run view per the pinned work-mission-v5 §6.1 contract:
- * task.mission replaces task.instance, task.work carries the workspace group,
- * and task.action is the visit completion contract (outcome vocabulary +
- * candidate next stations). The run-level `action` of the flow population is
- * absent on visits — its home is inside the task snapshot.
+ * A visit-population run view per the pinned work-mission-v5 §6.1 contract
+ * and the SDK 0.16 WorkRunView: task.mission replaces task.instance,
+ * task.work carries the workspace group, and the run-level `action` field is
+ * the visit completion contract (outcome vocabulary + candidate next
+ * stations) — action rides BESIDE task on the wire, never inside it.
  */
 const VISIT_RUN_VIEW = {
   runId: "run_v1",
@@ -126,11 +127,12 @@ const VISIT_RUN_VIEW = {
     mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
     work: { group: "ms_a", workKey: "implement", iteration: 1 },
     executor: { type: "agent", executorRef: "client-1:ag_one" },
-    action: {
-      kind: "visit",
-      outcomes: ["implementation-ready", "design-clarification"],
-      candidates: ["validation"],
-    },
+  },
+  action: {
+    kind: "visit",
+    outcomes: ["implementation-ready", "design-clarification"],
+    candidates: ["validation"],
+    abandonAvailable: true,
   },
   createdAt: "2026-08-27T00:00:00.000Z",
   resolvedAt: null,
@@ -210,10 +212,10 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
           createdAt: "2026-08-01T00:00:00.000Z",
           resolvedAt: null,
           action: {
-            kind: "state",
-            transitions: [{ transitionId: "handoff", to: "reading" }],
+            kind: "visit",
+            outcomes: ["implementation-ready"],
+            candidates: ["validation"],
             abandonAvailable: true,
-            documents: { read: [], write: ["decision.md"] },
           },
         },
       ]);
@@ -247,8 +249,9 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
         agentId: "ag_one",
       });
       // The visit view rides the record as the DECODED projection of the
-      // task's mission blocks; the raw task passes through untouched (the
-      // flow population's consumers keep their structural reads).
+      // task's mission/work blocks plus the run-level action field; the raw
+      // task passes through untouched (the prompt and other task facts stay
+      // where the wire put them).
       assert.deepEqual(runs, [
         {
           runId: "run_v1",
@@ -259,6 +262,12 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
           task: VISIT_RUN_VIEW.task,
           createdAt: "2026-08-27T00:00:00.000Z",
           resolvedAt: null,
+          action: {
+            kind: "visit",
+            outcomes: ["implementation-ready", "design-clarification"],
+            candidates: ["validation"],
+            abandonAvailable: true,
+          },
           visit: {
             mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
             work: { group: "ms_a", workKey: "implement", iteration: 1 },
@@ -266,6 +275,7 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
               kind: "visit",
               outcomes: ["implementation-ready", "design-clarification"],
               candidates: ["validation"],
+              abandonAvailable: true,
             },
           },
         },
@@ -290,14 +300,18 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
         task: {
           prompt: "x",
           // mission present (the population discriminator) but the work block
-          // and the visit action are missing — not a silently-ignored block.
+          // is missing — not a silently-ignored block.
           mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
         },
       };
+      // The completion contract lives in the run-level action field: a visit
+      // run without it is a broken projection, not a degraded-but-OK read.
+      const actionless = { ...VISIT_RUN_VIEW, action: undefined };
       const { client } = makeHttpClient(
         serviceByPath((request) => {
           const url = new URL(request.url);
-          if (url.pathname === "/project/v1/proj_ps_1/work-runs/my") return okBody([halfMission]);
+          const body = url.pathname.endsWith("/work-runs/my") ? [halfMission, actionless] : null;
+          if (body !== null) return okBody(body);
           return transportFailure(request);
         }),
       );

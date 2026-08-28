@@ -64,11 +64,6 @@ export const mapProjectServiceError = (
         : new Tools.ProjectWorkUnavailableError({ reason: "service-unreachable" });
     case "ProjectServiceWorkServiceRejectedError": {
       const { code, status, message, details } = error;
-      // Spawn refusal is about the DEFINITION's opt-in, not the credential —
-      // mapping it to the 403 authentication bucket would misdirect the agent.
-      if (code === "PROJECT_CONSUMER_SPAWN_NOT_AUTHORIZED") {
-        return new Tools.ProjectFlowSpawnRefusedError({ code, serviceMessage: message });
-      }
       // Flow-document failures are their own bucket BEFORE the generic
       // NOT_FOUND/CONFLICT classes: the right recovery reads the DOCUMENT —
       // the generic project_work_list hint would misdirect the agent.
@@ -425,28 +420,6 @@ const handlers = {
         });
       }
       return operation;
-    }),
-  project_flow_start: (input: { readonly definitionId: string; readonly name: string }) =>
-    Effect.gen(function* () {
-      const context = yield* resolveContext("project.work.write");
-      const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
-      const crypto = yield* Crypto.Crypto;
-      // Fresh key per call: the receipt idempotency replays the ORIGINAL spawn
-      // arguments, so re-invoking this tool after a failure is a NEW spawn,
-      // never a silent replay of a possibly-unwanted child. That is exactly why
-      // a PENDING outcome (ruling ②': construction still in flight server-side)
-      // must be answered by polling project_operation_get with the returned
-      // operationId — never by re-invoking this tool. v2 (D3): name-only —
-      // the instance name is the single injected task pointer.
-      const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-      return yield* client
-        .startFlow({
-          projectId: context.projectServiceProjectId,
-          idempotencyKey,
-          definitionId: input.definitionId,
-          name: input.name,
-        })
-        .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
     }),
   project_doc_read: (input: { readonly runId: string; readonly path: string }) =>
     Effect.gen(function* () {
