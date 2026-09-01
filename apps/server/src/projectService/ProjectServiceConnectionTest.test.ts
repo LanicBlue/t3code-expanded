@@ -48,11 +48,32 @@ const transportFailure: Responder = (request) =>
   });
 
 // Health is unauthenticated; the project list requires the bearer credential.
-// apiMinor rides the health body — the compatibility gate reads it.
-const healthOk: Responder = (request) =>
-  request.url.endsWith("/project/v1/health")
-    ? Response.json({ ok: true, status: "ok", apiMajor: 1, apiMinor: 2 })
-    : transportFailure(request);
+// The real Project Service envelopes every response as {ok, result} — apiMinor
+// rides inside result; the compatibility gate reads it through that envelope.
+const healthWithApiMinor =
+  (apiMinor: number): Responder =>
+  (request) =>
+    request.url.endsWith("/project/v1/health")
+      ? Response.json({
+          ok: true,
+          result: {
+            status: "ready",
+            apiVersion: "project-service-v1",
+            apiMajor: 1,
+            apiMinor,
+            serviceVersion: "0.1.0",
+            schemaVersion: 11,
+            startupGeneration: "gen-1",
+            capabilities: ["project-management-v1", "project-work-v1"],
+            serviceId: "project-service-test",
+            dataRootFingerprint: "fingerprint",
+            pid: 1234,
+            endpoint: "http://127.0.0.1:7600",
+          },
+        })
+      : transportFailure(request);
+
+const healthOk: Responder = healthWithApiMinor(2);
 
 const makeLayer = (client: HttpClient.HttpClient) => {
   const configLayer = Layer.fresh(
@@ -99,10 +120,7 @@ it.layer(NodeServices.layer)("ProjectServiceConnectionTest", (it) => {
   it.effect("flags an authenticated Project Service that predates apiMinor 1", () => {
     // Old PS: health advertises apiMinor 0 (no `write` upsert) but otherwise
     // round-trips fine — the failure must name the version, not the auth.
-    const healthOld: Responder = (request) =>
-      request.url.endsWith("/project/v1/health")
-        ? Response.json({ ok: true, status: "ok", apiMajor: 1, apiMinor: 0 })
-        : transportFailure(request);
+    const healthOld = healthWithApiMinor(0);
     const { client } = makeHttpClient((request) =>
       request.url.endsWith("/project/v1/") ? Response.json([]) : healthOld(request),
     );
@@ -120,6 +138,38 @@ it.layer(NodeServices.layer)("ProjectServiceConnectionTest", (it) => {
         apiCompatible: false,
         detail:
           "Project Service is too old for this T3 (apiMinor 0); deploy Project Service first, then re-test",
+      });
+    }).pipe(Effect.provide(makeLayer(client)));
+  });
+
+  it.effect("still reads a bare health body without the {ok,result} envelope", () => {
+    // No deployed Project Service emits this shape today (health is always
+    // enveloped); the fallback keeps the probe honest if that ever changes.
+    const healthBare: Responder = (request) =>
+      request.url.endsWith("/project/v1/health")
+        ? Response.json({
+            status: "ready",
+            apiVersion: "project-service-v1",
+            apiMajor: 1,
+            apiMinor: 2,
+          })
+        : transportFailure(request);
+    const { client } = makeHttpClient((request) =>
+      request.url.endsWith("/project/v1/") ? Response.json([]) : healthBare(request),
+    );
+
+    return Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      yield* serverSettings.updateSettings({
+        projectServiceClient: { enabled: true, newCredential: "psk_key-1.s3cret" },
+      });
+      const connectionTest = yield* ProjectServiceConnectionTest.ProjectServiceConnectionTest;
+      const result = yield* connectionTest.testConnection;
+      assert.deepEqual(result, {
+        reachable: true,
+        authenticated: true,
+        apiCompatible: true,
+        detail: "Authenticated and API compatible",
       });
     }).pipe(Effect.provide(makeLayer(client)));
   });

@@ -63,6 +63,15 @@ const normalizeBaseUrl = (baseUrl: string): string | null => {
   }
 };
 
+/** Project Service wraps every response in a `{ok, result|error}` envelope
+ * (http-server `jsonBody`); the health fields — apiMinor included — live
+ * inside `result`. A body without `result` is read as-is so the probe still
+ * parses against a hypothetically de-enveloped health route. */
+const healthSourceOf = (body: unknown): unknown =>
+  typeof body === "object" && body !== null && "result" in body
+    ? (body as { readonly result: unknown }).result
+    : body;
+
 const result = (
   reachable: boolean,
   authenticated: boolean,
@@ -125,15 +134,18 @@ export const make = Effect.gen(function* () {
       // will not parse degrades to "unknown", never to an error.
       const health = yield* probe(`${base}/project/v1/health`, (response) =>
         response.json.pipe(
-          Effect.map((body): { readonly status: number; readonly apiMinor: number | null } => ({
-            status: response.status,
-            apiMinor:
-              typeof body === "object" &&
-              body !== null &&
-              typeof (body as { readonly apiMinor?: unknown }).apiMinor === "number"
-                ? (body as { readonly apiMinor: number }).apiMinor
-                : null,
-          })),
+          Effect.map((body): { readonly status: number; readonly apiMinor: number | null } => {
+            const healthBody = healthSourceOf(body);
+            return {
+              status: response.status,
+              apiMinor:
+                typeof healthBody === "object" &&
+                healthBody !== null &&
+                typeof (healthBody as { readonly apiMinor?: unknown }).apiMinor === "number"
+                  ? (healthBody as { readonly apiMinor: number }).apiMinor
+                  : null,
+            };
+          }),
           Effect.catch(() => Effect.succeed({ status: response.status, apiMinor: null })),
         ),
       );
