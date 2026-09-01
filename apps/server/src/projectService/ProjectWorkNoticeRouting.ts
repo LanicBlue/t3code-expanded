@@ -594,11 +594,20 @@ interface RoutedSession {
    * delivery). Drives the post-turn drain: notices are per-run and never
    * re-fire when the head rotates, so the router itself advances the queue
    * once the head the agent was last told about has moved on. A head equal
-   * to this value is never re-delivered by a notice or by the reconcile
-   * sweep — an agent that has not submitted its current work is reminded at
-   * most once instead (`remindedHeadRunId`).
+   * to this value — runId AND revision, see `lastDeliveredHeadRunRevision` —
+   * is never re-delivered by a notice or by the reconcile sweep; an agent
+   * that has not submitted its current work is reminded at most once instead
+   * (`remindedHeadRunId`).
    */
   lastDeliveredHeadRunId: string | null;
+  /**
+   * work-mission-v6: the runId IS the missionId — STABLE across the whole
+   * mission, including rework round-trips that return the same run to the
+   * same station. The runRevision is what discriminates a NEW round of the
+   * same run (run:3 → run:5 through a build round-trip): a head is "already
+   * told" only when both match.
+   */
+  lastDeliveredHeadRunRevision: string | null;
   /**
    * When the last DELIVERED aggregate was dispatched (null before the first
    * delivery). The queued-turn guard's shell-fact escape: a latestTurn that
@@ -610,10 +619,13 @@ interface RoutedSession {
    * The head run the ONE turn-end reminder already named (null = no reminder
    * spent for the current head). When the aggregate turn finishes with the
    * same head still open, the agent ended its turn without submitting: the
-   * drain delivers exactly one reminder for that run. A head change resets
-   * the budget — the new head gets its own single reminder.
+   * drain delivers exactly one reminder for that run. A head change — runId
+   * or revision, same v6 rationale as `lastDeliveredHeadRunRevision` — resets
+   * the budget: the new round gets its own single reminder.
    */
   remindedHeadRunId: string | null;
+  /** The revision of the run the reminder budget was spent on (v6 pairing). */
+  remindedHeadRunRevision: string | null;
   /**
    * Stable identity of the open Work set last observed for this session.
    * Project Service notices are triggers and may be replayed, so an
@@ -621,6 +633,17 @@ interface RoutedSession {
    */
   observedWorkSignature: string;
 }
+
+/** A run is "already told" only when BOTH its stable id and round match (v6). */
+const sameDeliveredHead = (
+  session: {
+    readonly lastDeliveredHeadRunId: string | null;
+    readonly lastDeliveredHeadRunRevision: string | null;
+  },
+  run: { readonly runId: string; readonly runRevision: string },
+): boolean =>
+  session.lastDeliveredHeadRunId === run.runId &&
+  session.lastDeliveredHeadRunRevision === run.runRevision;
 
 /**
  * The registry key: opaque, never parsed back (snapshots read their facts
@@ -1013,8 +1036,10 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         seenBusy: false,
         boundWorktreePath: binding,
         lastDeliveredHeadRunId: null,
+        lastDeliveredHeadRunRevision: null,
         lastDeliveredAtIso: null,
         remindedHeadRunId: null,
+        remindedHeadRunRevision: null,
         observedWorkSignature: openWorkSignature(ordered),
       });
       const deliveredAt = yield* deliverAggregate(target, threadId, ordered);
@@ -1027,6 +1052,10 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           deliveredAt !== null && ordered[0] !== undefined
             ? ordered[0].runId
             : session.lastDeliveredHeadRunId,
+        lastDeliveredHeadRunRevision:
+          deliveredAt !== null && ordered[0] !== undefined
+            ? ordered[0].runRevision
+            : session.lastDeliveredHeadRunRevision,
         observedWorkSignature: openWorkSignature(ordered),
       }));
     },
@@ -1125,11 +1154,16 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         ...(delivered.success !== null && current !== null
           ? {
               lastDeliveredAtIso: delivered.success,
-              // A head change spends the old run's reminder budget and arms
-              // the new head's (the same head re-delivered by a fresh notice
-              // keeps the marker — one reminder per run, never per notice).
-              ...(current.runId !== s.lastDeliveredHeadRunId
-                ? { lastDeliveredHeadRunId: current.runId, remindedHeadRunId: null }
+              // A head change — runId or revision (v6: a rework round-trip
+              // returns the SAME run at a NEW revision) — spends the old
+              // round's reminder budget and arms the new round's.
+              ...(!sameDeliveredHead(s, current)
+                ? {
+                    lastDeliveredHeadRunId: current.runId,
+                    lastDeliveredHeadRunRevision: current.runRevision,
+                    remindedHeadRunId: null,
+                    remindedHeadRunRevision: null,
+                  }
                 : {}),
             }
           : {}),
@@ -1146,8 +1180,13 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       ...(dispatchedAt !== null && current !== null
         ? {
             lastDeliveredAtIso: dispatchedAt,
-            ...(current.runId !== s.lastDeliveredHeadRunId
-              ? { lastDeliveredHeadRunId: current.runId, remindedHeadRunId: null }
+            ...(!sameDeliveredHead(s, current)
+              ? {
+                  lastDeliveredHeadRunId: current.runId,
+                  lastDeliveredHeadRunRevision: current.runRevision,
+                  remindedHeadRunId: null,
+                  remindedHeadRunRevision: null,
+                }
               : {}),
           }
         : {}),
@@ -1195,6 +1234,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       ...(delivered.success !== null
         ? {
             remindedHeadRunId: current.runId,
+            remindedHeadRunRevision: current.runRevision,
             lastDeliveredAtIso: delivered.success,
             observedWorkSignature: openWorkSignature(ordered),
           }
@@ -1389,14 +1429,20 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         const nextHead = orderAssignedWorkQueue(
           runsForWorkGroup(runs.success, session.flowInstanceKey),
         )[0];
-        if (nextHead !== undefined && nextHead.runId !== session.lastDeliveredHeadRunId) {
+        // v6: a rework round-trip returns the SAME run at a NEW revision —
+        // that is a head the agent was never told about (a fresh round), not
+        // an unchanged one.
+        if (nextHead !== undefined && !sameDeliveredHead(session, nextHead)) {
           yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
           return;
         }
         if (
           nextHead !== undefined &&
-          nextHead.runId === session.lastDeliveredHeadRunId &&
-          session.remindedHeadRunId !== nextHead.runId
+          sameDeliveredHead(session, nextHead) &&
+          !(
+            session.remindedHeadRunId === nextHead.runId &&
+            session.remindedHeadRunRevision === nextHead.runRevision
+          )
         ) {
           yield* remindOpenHead(key, target.success, session.threadId, runs.success);
           return;
@@ -1495,10 +1541,11 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
 
         if (liveSession !== null) {
           // The session exists, is idle, and nothing is pending. The no-nag
-          // invariant: a head the session already delivered (or no open work
-          // at all) stays quiet — the one reminder owns the not-submitted
-          // case.
-          if (head === undefined || head.runId === liveSession.lastDeliveredHeadRunId) {
+          // invariant: a head the session already delivered — runId AND
+          // revision; v6 returns the same run from rework round-trips at a
+          // new revision — stays quiet (or there is no open work at all);
+          // the one reminder owns the not-submitted case.
+          if (head === undefined || sameDeliveredHead(liveSession, head)) {
             return;
           }
           // The head advanced past the one the agent was last told about and

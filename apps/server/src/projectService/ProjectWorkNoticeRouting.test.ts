@@ -1818,6 +1818,67 @@ describe("delivery reconcile sweep", () => {
     }),
   );
 
+  it.effect(
+    "v6 rework return: the SAME run at a NEW revision is a fresh round and is delivered",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeSettings());
+        const reworkRun = (revision: string): AssignedWorkQueueEntry => ({
+          runId: "ms_rework",
+          positionId: "verify",
+          runRevision: revision,
+          state: "open",
+          agentId: AGENT_ID,
+          task: {
+            prompt: "verify the implementation",
+            mission: { id: "ms_rework", name: "Rework", objective: "Ship it" },
+          },
+          createdAt: "2026-08-21T00:00:10Z",
+        });
+
+        // Round 1: the sweep creates the thread and delivers the aggregate.
+        harness.setOpenRuns([reworkRun("run:3")]);
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        assert.lengthOf(turnStarts(harness.commands), 1);
+        const [created] = threadCreates(harness.commands);
+        const threadId = created?.type === "thread.create" ? created.threadId : null;
+        const projectId = String(created?.projectId);
+
+        // The aggregate turn ran and settled; the agent submitted and the
+        // work moved away (the build round) — the drain rests the session.
+        harness.putThread(
+          makeThreadShell(threadId as string, projectId, (shell) => ({
+            ...shell,
+            session: readySession(threadId as string),
+            latestTurn: settledTurn(),
+          })),
+        );
+        harness.setOpenRuns([]);
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        assert.lengthOf(turnStarts(harness.commands), 1);
+
+        // The build round finishes and the SAME run (v6: runId = missionId)
+        // returns to verify at a NEW revision. The no-nag invariant must key
+        // on (runId, runRevision) — runId alone would swallow the round.
+        harness.setOpenRuns([reworkRun("run:5")]);
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        assert.lengthOf(turnStarts(harness.commands), 2);
+
+        // Round 2's aggregate turn engages (the shell shows it running): a
+        // busy turn is never interrupted or re-nagged.
+        harness.putThread(
+          makeThreadShell(threadId as string, projectId, (shell) => ({
+            ...shell,
+            session: runningSession(threadId as string),
+            latestTurn: settledTurn(),
+          })),
+        );
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        assert.lengthOf(turnStarts(harness.commands), 2);
+      }),
+  );
+
   it.effect("no open work: the sweep stays silent and creates nothing", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(makeSettings());
