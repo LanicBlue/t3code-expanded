@@ -111,7 +111,6 @@ it("accepts the visit-population submit result vocabulary (outcome/nextNode/reas
   const decoded = decode({
     runId: "run_v1",
     runRevision: "run:4",
-    assignmentRevision: "position:2",
     result: {
       outcome: "implementation-defect",
       nextNode: "implement",
@@ -131,7 +130,6 @@ it("accepts the visit-population submit result vocabulary (outcome/nextNode/reas
   const minimal = decode({
     runId: "run_v1",
     runRevision: "run:4",
-    assignmentRevision: "position:2",
     result: { outcome: "implementation-ready" },
   });
   expect(minimal.result).toEqual({ outcome: "implementation-ready" });
@@ -182,7 +180,6 @@ it("strips identity keys an agent smuggles into business arguments", () => {
   const decoded = decode({
     runId: "run_1",
     runRevision: "run:3",
-    assignmentRevision: "position:5",
     result: { kind: "standalone", output: "done" },
     agentId: "ag_spoofed",
     projectId: "proj_spoofed",
@@ -191,7 +188,6 @@ it("strips identity keys an agent smuggles into business arguments", () => {
   expect(decoded).toEqual({
     runId: "run_1",
     runRevision: "run:3",
-    assignmentRevision: "position:5",
     result: { kind: "standalone", output: "done" },
   });
 });

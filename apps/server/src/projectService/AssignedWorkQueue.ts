@@ -59,7 +59,10 @@ export const currentAssignedWork = (
  * never decoded, never crashed.
  */
 const missionBlockOf = (run: AssignedWorkQueueEntry): Record<string, unknown> | null => {
-  const mission = run.task.mission;
+  // work-mission-v6 list projections carry the mission identity at the TOP
+  // level (no task snapshot); detail-hydrated runs nest it under task.mission.
+  // Read both so grouping holds for either shape.
+  const mission = run.task === undefined ? run.mission : run.task.mission;
   return typeof mission === "object" && mission !== null
     ? (mission as Record<string, unknown>)
     : null;
@@ -123,7 +126,14 @@ export const runsForWorkGroup = (
  * whitespace; the prompt is passed IN FULL — its tail carries the completion
  * rules the woken agent needs before its first tool call.
  */
-export const assignedWorkTaskSummary = (task: Readonly<Record<string, unknown>>): string => {
+export const assignedWorkTaskSummary = (
+  task: Readonly<Record<string, unknown>> | undefined,
+): string => {
+  // An un-hydrated summary record has no task snapshot; its mission identity
+  // (id/name/objective strings) may still be passed in by the caller.
+  if (task === undefined) {
+    return "no task text";
+  }
   // The wire `task` is the run's full snapshot (workDefinitionId, owner,
   // prompt, semanticFingerprint, …) — NOT a prompt record. Prefer the task
   // text explicitly: joining every string value would lead with opaque
@@ -163,7 +173,7 @@ export const assignedWorkWakeMessage = (input: {
   readonly current: AssignedWorkQueueEntry;
   readonly queued: number;
 }): string => {
-  const summary = assignedWorkTaskSummary(input.current.task);
+  const summary = assignedWorkTaskSummary(input.current.task ?? input.current.mission);
   const waiting =
     input.queued > 0
       ? ` ${input.queued} more item${input.queued === 1 ? "" : "s"} waiting behind it.`

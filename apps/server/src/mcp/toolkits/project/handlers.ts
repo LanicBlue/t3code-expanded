@@ -272,6 +272,31 @@ const requireCurrentRun = (
       )
     : Effect.void;
 
+/**
+ * work-mission-v6: notarized writes are documentId-keyed — the mission
+ * contract's declaration fixes the path. The tool surface stays path-shaped
+ * (the model reads paths in documentsResolved); this resolves a path onto
+ * its contract documentId. null = the path is not in this run's contract.
+ */
+const documentIdForPath = (
+  current: ProjectServiceWorkClient.ProjectWorkRunRecord,
+  path: string,
+): string | null => {
+  const declared = current.task?.documentsResolved;
+  if (!Array.isArray(declared)) return null;
+  for (const entry of declared) {
+    if (
+      typeof entry === "object" &&
+      entry !== null &&
+      (entry as { readonly path?: unknown }).path === path &&
+      typeof (entry as { readonly id?: unknown }).id === "string"
+    ) {
+      return (entry as { readonly id: string }).id;
+    }
+  }
+  return null;
+};
+
 const handlers = {
   project_work_list: () =>
     Effect.gen(function* () {
@@ -307,7 +332,8 @@ const handlers = {
                   assignmentRevision: assignmentByPosition.get(current.positionId) ?? null,
                   agentId: current.agentId ?? context.logicalAgentId,
                   state: current.state,
-                  task: current.task,
+                  ...(current.task === undefined ? {} : { task: current.task }),
+                  ...(current.mission === undefined ? {} : { mission: current.mission }),
                   createdAt: current.createdAt,
                   ...(current.workspacePolicy === undefined
                     ? {}
@@ -328,7 +354,7 @@ const handlers = {
                 .map((position) => ({
                   positionId: position.positionId,
                   displayName: position.displayName,
-                  assignmentRevision: position.assignmentRevision,
+                  assignmentRevision: position.assignmentRevision ?? null,
                 })),
       };
     }),
@@ -360,7 +386,6 @@ const handlers = {
   project_work_submit: (input: {
     readonly runId: string;
     readonly runRevision: string;
-    readonly assignmentRevision: string;
     readonly result: Readonly<Record<string, unknown>>;
   }) =>
     Effect.gen(function* () {
@@ -383,7 +408,6 @@ const handlers = {
             projectGeneration: generation,
             runId: input.runId,
             expectedRunRevision: input.runRevision,
-            expectedAssignmentRevision: input.assignmentRevision,
             agentId: context.logicalAgentId,
             result: input.result,
           },
@@ -454,21 +478,30 @@ const handlers = {
       const context = yield* resolveContext("project.work.write");
       const current = yield* resolveCurrentWorkRun(context);
       yield* requireCurrentRun(current, input.runId);
+      // work-mission-v6: the write is documentId-keyed — resolve the path
+      // against the run's contract declaration (documentsResolved).
+      const documentId = current === null ? null : documentIdForPath(current, input.path);
+      if (documentId === null) {
+        return yield* new Tools.ProjectWorkRejectedError({
+          code: "PROJECT_DOC_PATH_NOT_DECLARED",
+          status: 0,
+          serviceMessage: `"${input.path}" is not declared in this run's mission contract — only declared document paths may be written (see the run's documentsResolved via project_work_get)`,
+        });
+      }
       const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
       const crypto = yield* Crypto.Crypto;
       // Fresh key per call: a retried write is a new notarized write (the
       // receipt layer replays only same-key+same-digest), never a silent replay.
       const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-      // "write" is the PS-native upsert (apiMinor 1): create-or-overwrite in
-      // one server-side step — no existence probing, no create/update guess.
+      // One upsert semantic: the documentId fixes the path; no create/update
+      // guess, no delete (a document cannot be emptied).
       return yield* client
         .writeFlowDocument({
           projectId: context.projectServiceProjectId,
           runId: input.runId,
           agentId: context.logicalAgentId,
           idempotencyKey,
-          path: input.path,
-          operation: "write",
+          documentId,
           data: Buffer.from(input.content, "utf8").toString("base64"),
         })
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
@@ -520,42 +553,42 @@ const handlers = {
         return yield* new Tools.ProjectWorkRejectedError({
           code: "PROJECT_DOC_CONTENT_INVALID",
           status: 0,
-          serviceMessage:
-            "the edit would empty the document; a flow document cannot be empty — use project_doc_delete instead",
+          serviceMessage: "the edit would empty the document; a mission document cannot be empty",
         });
       }
       const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      // work-mission-v6: the notarized write-back is documentId-keyed —
+      // resolve the path against the run's contract declaration.
+      const documentId = current === null ? null : documentIdForPath(current, input.path);
+      if (documentId === null) {
+        return yield* new Tools.ProjectWorkRejectedError({
+          code: "PROJECT_DOC_PATH_NOT_DECLARED",
+          status: 0,
+          serviceMessage: `"${input.path}" is not declared in this run's mission contract — only declared document paths may be written (see the run's documentsResolved via project_work_get)`,
+        });
+      }
       const written = yield* client
         .writeFlowDocument({
           projectId: context.projectServiceProjectId,
           runId: input.runId,
           agentId: context.logicalAgentId,
           idempotencyKey,
-          path: input.path,
-          operation: "write",
+          documentId,
           data: Buffer.from(content, "utf8").toString("base64"),
         })
         .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
       return { ...written, replacements: input.replaceAll === true ? occurrences : 1 };
     }),
-  project_doc_delete: (input: { readonly runId: string; readonly path: string }) =>
-    Effect.gen(function* () {
-      const context = yield* resolveContext("project.work.write");
-      const current = yield* resolveCurrentWorkRun(context);
-      yield* requireCurrentRun(current, input.runId);
-      const client = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
-      const crypto = yield* Crypto.Crypto;
-      const idempotencyKey = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-      return yield* client
-        .writeFlowDocument({
-          projectId: context.projectServiceProjectId,
-          runId: input.runId,
-          agentId: context.logicalAgentId,
-          idempotencyKey,
-          path: input.path,
-          operation: "delete",
-        })
-        .pipe(Effect.mapError((error) => mapProjectServiceError(error, undefined)));
+  project_doc_delete: (_input: { readonly runId: string; readonly path: string }) =>
+    // work-mission-v6 removed the delete: mission documents are
+    // contract-declared writes only (the notary has one upsert semantic and
+    // no removal). The tool answers a typed rejection instead of a transport
+    // 404, so the model stops reaching for it after one try.
+    new Tools.ProjectWorkRejectedError({
+      code: "PROJECT_DOC_DELETE_UNSUPPORTED",
+      status: 0,
+      serviceMessage:
+        "document delete is gone in work-mission-v6 — mission documents are contract-declared; overwrite with project_doc_write instead",
     }),
 } satisfies Parameters<typeof Tools.ProjectWorkToolkit.toLayer>[0];
 

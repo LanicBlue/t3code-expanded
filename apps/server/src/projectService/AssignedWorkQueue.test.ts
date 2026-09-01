@@ -111,6 +111,35 @@ describe("AssignedWorkQueue", () => {
     );
   });
 
+  it("a v6 summary record groups by its top-level mission block (no task snapshot)", () => {
+    // work-mission-v6: work-runs/my answers summaries — the mission identity
+    // rides the top level and there is no task. Grouping and the wake message
+    // must hold for that shape (listMy hydrates open runs, but the queue
+    // discipline never depends on hydration having happened).
+    const summaryRun = run({
+      runId: "run_summary",
+      task: undefined,
+      mission: { id: "ms_s", name: "Verify build", objective: "Verify the build passes" },
+    });
+    NodeAssert.equal(missionKeyOf(summaryRun), "ms_s");
+    NodeAssert.equal(missionNameOf(summaryRun), "Verify build");
+    NodeAssert.equal(partitionOpenWork([summaryRun]).get("ms_s")?.length, 1);
+    // No task snapshot and no mission block at all: ungrouped, and the wake
+    // message degrades to the placeholder instead of crashing.
+    NodeAssert.equal(assignedWorkTaskSummary(undefined), "no task text");
+    const bare = run({ runId: "run_bare", task: undefined });
+    NodeAssert.equal(missionKeyOf(bare), "");
+    NodeAssert.match(
+      assignedWorkWakeMessage({ current: bare, queued: 0 }),
+      /^Your current work: no task text\./,
+    );
+    // A summary without a task still names the mission in the wake line.
+    NodeAssert.match(
+      assignedWorkWakeMessage({ current: summaryRun, queued: 0 }),
+      /Verify the build passes/,
+    );
+  });
+
   it("a task.instance run is NOT decoded: it keys to the legacy bucket (the flow arm is deleted)", () => {
     // work-mission-v5 Phase 7: PS stopped delivering task.instance runs when
     // it removed the flow stack — structurally, not by convention. The queue

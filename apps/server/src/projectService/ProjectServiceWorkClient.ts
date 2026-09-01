@@ -101,6 +101,8 @@ export type ProjectServiceWorkClientError =
   | ProjectServiceWorkTransportError
   | ProjectServiceWorkServiceRejectedError;
 
+const isServiceRejected = Schema.is(ProjectServiceWorkServiceRejectedError);
+
 // ── Wire records (the subset the tools surface; extra fields drop) ──
 
 /**
@@ -114,7 +116,14 @@ const AggregateRevisionSchema = Schema.String;
 export const ProjectWorkPositionRecord = Schema.Struct({
   positionId: Schema.String,
   displayName: Schema.String,
-  assignmentRevision: AggregateRevisionSchema,
+  /**
+   * work-mission-v6.2: positions answer the OCCUPANCY token — "last-write-wins
+   * — no assignment CAS on the wire"; the assignmentRevision counter is gone
+   * (it is not part of any fence anymore). Older generations may still answer
+   * the counter; both decode, neither is required.
+   */
+  assignmentRevision: Schema.optional(AggregateRevisionSchema),
+  occupancy: Schema.optional(Schema.Int),
 });
 export type ProjectWorkPositionRecord = typeof ProjectWorkPositionRecord.Type;
 
@@ -132,13 +141,29 @@ export type ProjectWorkPositionRecord = typeof ProjectWorkPositionRecord.Type;
 export const ProjectWorkActionRecord = ProjectWorkVisitActionRecord;
 export type ProjectWorkActionRecord = ProjectWorkVisitActionRecord;
 
+/**
+ * work-mission-v6: `work-runs/my` answers SUMMARY projections — the mission
+ * identity rides the TOP level (id/name/objective), and there is no task
+ * snapshot: the prompt/documents/rights are the detail read's payload
+ * (`getRun`). listMy hydrates open runs through getRun below, so consumers
+ * see one full shape; the block stays decodeable for the un-hydrated pass.
+ */
+const SummaryMissionBlock = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  objective: Schema.String,
+});
+
 export const ProjectWorkRunRecord = Schema.Struct({
   runId: Schema.String,
   positionId: Schema.String,
   runRevision: AggregateRevisionSchema,
   state: Schema.Literals(["open", "completed", "superseded", "cancelled"]),
   agentId: Schema.optional(Schema.String),
-  task: Schema.Record(Schema.String, Schema.Unknown),
+  /** The v6 list projection's top-level mission identity (see above). */
+  mission: Schema.optional(SummaryMissionBlock),
+  /** Absent on v6 summary projections; present on detail views. */
+  task: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   createdAt: Schema.String,
   resolvedAt: Schema.optional(Schema.NullOr(Schema.String)),
   /**
@@ -181,6 +206,11 @@ const VisitTaskBlocks = Schema.Struct({
 });
 const decodeVisitTaskBlocks = Schema.decodeUnknownSync(VisitTaskBlocks);
 const visitViewOfRun = (run: ProjectWorkRunRecord): ProjectWorkVisitView | null => {
+  // A v6 summary projection has no task snapshot — no visit contract to
+  // decode (the hydrated form replaces it before consumers see it).
+  if (run.task === undefined) {
+    return null;
+  }
   const mission = run.task.mission;
   if (typeof mission !== "object" || mission === null) {
     return null;
@@ -243,19 +273,20 @@ const FailureEnvelope = Schema.Struct({ ok: Schema.Literals([false]), error: Env
 /** The wire shape the SDK delivers (base64 data); decoded before the tool sees it. */
 const WIRE_FLOW_DOCUMENT_RECORD = Schema.Struct({
   data: Schema.String,
-  revision: Schema.String,
+  /** work-mission-v6 reads carry no revision — mission documents are immutable reads; only notarized writes mint receipts. */
+  revision: Schema.optional(Schema.String),
   displayPath: Schema.String,
-  size: Schema.Int,
+  size: Schema.optional(Schema.Int),
 });
 
 /**
  * A read flow document: `content` is the decoded UTF-8 text (the wire carries
- * base64; the MCP boundary never hands the model raw base64). Revision is the
- * durable CAS token.
+ * base64; the MCP boundary never hands the model raw base64). Revision is
+ * null on work-mission-v6 reads (only writes produce revision facts).
  */
 export const ProjectFlowDocumentRecord = Schema.Struct({
   content: Schema.String,
-  revision: Schema.String,
+  revision: Schema.NullOr(Schema.String),
   displayPath: Schema.String,
   size: Schema.Int,
 });
@@ -327,7 +358,8 @@ const projectRunRecord = (run: ProjectWorkRunRecord): ProjectWorkRunRecord => {
     runRevision: run.runRevision,
     state: run.state,
     ...(run.agentId === undefined ? {} : { agentId: run.agentId }),
-    task: run.task,
+    ...(run.mission === undefined ? {} : { mission: run.mission }),
+    ...(run.task === undefined ? {} : { task: run.task }),
     createdAt: run.createdAt,
     ...(run.resolvedAt === undefined ? {} : { resolvedAt: run.resolvedAt }),
     ...(run.workspacePolicy === undefined ? {} : { workspacePolicy: run.workspacePolicy }),
@@ -342,7 +374,10 @@ const projectRunRecord = (run: ProjectWorkRunRecord): ProjectWorkRunRecord => {
 const projectPositionRecord = (position: ProjectWorkPositionRecord): ProjectWorkPositionRecord => ({
   positionId: position.positionId,
   displayName: position.displayName,
-  assignmentRevision: position.assignmentRevision,
+  ...(position.assignmentRevision === undefined
+    ? {}
+    : { assignmentRevision: position.assignmentRevision }),
+  ...(position.occupancy === undefined ? {} : { occupancy: position.occupancy }),
 });
 
 const projectOperationRecord = (
@@ -412,11 +447,15 @@ export class ProjectServiceWorkClient extends Context.Service<
         readonly agentId: string;
       },
     ) => Effect.Effect<ProjectWorkRunRecord | null, ProjectServiceWorkClientError>;
+    /**
+     * work-mission-v6: the submit addresses the MISSION — `runId` IS the
+     * ms_-shaped missionId — and the mission revision (expectedRunRevision)
+     * is the SOLE CAS fence; there is no assignment revision anymore.
+     */
     readonly submitRun: (
       input: WorkCallContext & {
         readonly runId: string;
         readonly expectedRunRevision: string;
-        readonly expectedAssignmentRevision: string;
         readonly agentId: string;
         readonly result: Readonly<Record<string, unknown>>;
       },
@@ -440,22 +479,18 @@ export class ProjectServiceWorkClient extends Context.Service<
      * Notarized document write: returns the durable documentReceiptId to hand
      * to project_work_submit's result (documentReceiptIds) — the completion
      * validates it against the run's slot rights; only this path can mint one.
-     * "write" is the upsert (create-or-overwrite, PS apiMinor 1): send it
-     * instead of guessing create vs update.
      *
-     * work-mission-v5 Phase 6: a `vs_`-shaped runId addresses an OPEN mission
-     * visit — the write mints a receipt v3 (missionId-addressed, no
-     * instanceId) into the shared document registry and answers with
-     * `mission://` displayPaths; `wr_` runIds keep the flow behavior
-     * (`flow://` — the one-version compat read).
+     * work-mission-v6: the write is MISSION-addressed and documentId-keyed —
+     * the mission contract's declaration fixes the path, so callers resolve
+     * their path against the run detail's documentsResolved and pass its id.
+     * There is no operation enum (one upsert semantic) and no delete.
      */
     readonly writeFlowDocument: (input: {
       readonly projectId: string;
       readonly runId: string;
       readonly agentId: string;
       readonly idempotencyKey: string;
-      readonly path: string;
-      readonly operation: "write" | "create" | "update" | "delete";
+      readonly documentId: string;
       readonly data?: string;
     }) => Effect.Effect<ProjectFlowDocumentWriteRecord, ProjectServiceWorkClientError>;
   }
@@ -725,59 +760,19 @@ export const make = Effect.gen(function* () {
       runId: input.runId,
       agentId: input.agentId,
     }) as Parameters<ProjectConsumerWorkClient["getRun"]>[0];
-  const submitRunArgs = (
-    input: WorkCallContext & {
-      readonly runId: string;
-      readonly expectedRunRevision: string;
-      readonly expectedAssignmentRevision: string;
-      readonly agentId: string;
-      readonly result: Readonly<Record<string, unknown>>;
-    },
-    operation: { readonly operationId: string; readonly idempotencyKey: string },
+
+  /** One run's full (detail) view — the task snapshot and visit contract. */
+  const runDetail = (
+    input: WorkCallContext & { readonly runId: string; readonly agentId: string },
   ) =>
-    ({
-      projectId: input.projectId,
-      meta: {
-        operationId: operation.operationId,
-        idempotencyKey: operation.idempotencyKey,
-        projectGeneration: input.projectGeneration,
-      },
-      runId: input.runId,
-      expectedRunRevision: input.expectedRunRevision,
-      expectedAssignmentRevision: input.expectedAssignmentRevision,
-      agentId: input.agentId,
-      result: input.result,
-    }) as unknown as Parameters<ProjectConsumerWorkClient["submitRun"]>[0];
-  const readFlowDocumentArgs = (input: {
-    readonly projectId: string;
-    readonly runId: string;
-    readonly agentId: string;
-    readonly path: string;
-  }) =>
-    ({
-      projectId: input.projectId,
-      runId: input.runId,
-      agentId: input.agentId,
-      path: input.path,
-    }) as Parameters<ProjectConsumerWorkClient["readFlowDocument"]>[0];
-  const writeFlowDocumentArgs = (input: {
-    readonly projectId: string;
-    readonly runId: string;
-    readonly agentId: string;
-    readonly idempotencyKey: string;
-    readonly path: string;
-    readonly operation: "write" | "create" | "update" | "delete";
-    readonly data?: string;
-  }) =>
-    ({
-      projectId: input.projectId,
-      runId: input.runId,
-      agentId: input.agentId,
-      idempotencyKey: input.idempotencyKey,
-      path: input.path,
-      operation: input.operation,
-      ...(input.data === undefined ? {} : { data: input.data }),
-    }) as Parameters<ProjectConsumerWorkClient["writeFlowDocument"]>[0];
+    withClient(
+      undefined,
+      (client) => client.getRun(getRunArgs(input)),
+      (value) =>
+        value === null || value === undefined
+          ? null
+          : projectRunRecord(decodeOrIncompatible(ProjectWorkRunRecord, value)),
+    );
 
   return ProjectServiceWorkClient.of({
     listProjects,
@@ -789,27 +784,96 @@ export const make = Effect.gen(function* () {
         (value) =>
           decodeArrayOrIncompatible(ProjectWorkPositionRecord, value).map(projectPositionRecord),
       ),
+    /**
+     * work-mission-v6: the service answers this list with SUMMARY
+     * projections (top-level mission identity, no task snapshot — the
+     * prompt/documents/rights are the detail read's payload). Every OPEN run
+     * is hydrated through getRun so queue keys, the visit contract, and
+     * prompts read one full shape everywhere downstream. A detail 404 means
+     * the run resolved between the two reads: the run drops out — a fresh
+     * list would not have shown it open either. Any other detail failure
+     * fails the whole call like any work-query failure (redelivered later).
+     */
     listMy: (input) =>
-      withClient(
-        undefined,
-        (client) => client.listMy(listMyArgs(input)),
-        (value) => decodeArrayOrIncompatible(ProjectWorkRunRecord, value).map(projectRunRecord),
-      ),
-    getRun: (input) =>
-      withClient(
-        undefined,
-        (client) => client.getRun(getRunArgs(input)),
-        (value) =>
-          value === null || value === undefined
-            ? null
-            : projectRunRecord(decodeOrIncompatible(ProjectWorkRunRecord, value)),
-      ),
+      Effect.gen(function* () {
+        const summaries = yield* withClient(
+          undefined,
+          (client) => client.listMy(listMyArgs(input)),
+          (value) => decodeArrayOrIncompatible(ProjectWorkRunRecord, value).map(projectRunRecord),
+        );
+        const runs: Array<ProjectWorkRunRecord> = [];
+        for (const run of summaries) {
+          if (run.state !== "open") {
+            runs.push(run);
+            continue;
+          }
+          const detail = yield* runDetail({ ...input, runId: run.runId }).pipe(
+            Effect.catchIf(
+              (error): error is ProjectServiceWorkServiceRejectedError =>
+                isServiceRejected(error) && error.status === 404,
+              () => Effect.succeed(null),
+            ),
+          );
+          if (detail !== null) {
+            runs.push(detail);
+          }
+        }
+        return runs;
+      }),
+    getRun: (input) => runDetail(input),
+    /**
+     * work-mission-v6: run.submit addresses the MISSION (runId IS the
+     * ms_-shaped missionId) and the mission revision is the SOLE CAS fence.
+     * The vendored SDK 0.16 still builds the pre-v6 command (runId +
+     * expectedAssignmentRevision), which v6's exact-field validation rejects —
+     * so the submit rides the facet transport directly (the listProjects
+     * precedent); the frozen tarball is bypassed, not patched.
+     */
     submitRun: (input, operation) =>
-      withClient(
-        operation,
-        (client) => client.submitRun(submitRunArgs(input, operation)),
-        (value) => projectOperationRecord(decodeOrIncompatible(ProjectWorkOperationRecord, value)),
-      ),
+      Effect.gen(function* () {
+        const endpoint = yield* resolveEndpoint;
+        const transportError = () =>
+          new ProjectServiceWorkTransportError({ operationId: operation.operationId });
+        const { status, value } = yield* facetRequest(
+          "POST",
+          `${endpoint.baseUrl}/project/v1/${encodeURIComponent(input.projectId)}/work/execute`,
+          {
+            operationId: operation.operationId,
+            idempotencyKey: operation.idempotencyKey,
+            projectGeneration: input.projectGeneration,
+            command: {
+              kind: "run.submit",
+              missionId: input.runId,
+              expectedRunRevision: input.expectedRunRevision,
+              agentId: input.agentId,
+              result: input.result,
+            },
+          },
+          endpoint.credential,
+        ).pipe(Effect.mapError(() => transportError()));
+        if (status < 200 || status >= 300) {
+          if (isFailureEnvelope(value)) {
+            return yield* new ProjectServiceWorkServiceRejectedError({
+              code: value.error.code,
+              status,
+              message: value.error.message,
+            });
+          }
+          return yield* transportError();
+        }
+        // The route answers the {ok, result} envelope; the operation record
+        // rides `result`. A synchronous rejection is a REJECTED RECORD (HTTP
+        // 200), not a failure envelope — the handler surfaces those.
+        const record = (value as { readonly result?: unknown }).result;
+        return yield* Effect.try({
+          try: () =>
+            projectOperationRecord(decodeOrIncompatible(ProjectWorkOperationRecord, record)),
+          catch: (cause) =>
+            isApiIncompatible(cause)
+              ? cause
+              : new ProjectServiceWorkApiIncompatibleError({ code: "PROJECT_WORK_RESPONSE_SHAPE" }),
+        });
+      }),
     getOperation: (operationId) =>
       withClient(
         undefined,
@@ -822,26 +886,87 @@ export const make = Effect.gen(function* () {
             ? null
             : projectOperationRecord(decodeOrIncompatible(ProjectWorkOperationRecord, value)),
       ),
+    /**
+     * work-mission-v6: the read is path-keyed (`/documents/by-run/:runId/*`)
+     * but carries no revision — the vendored SDK 0.16 validates a required
+     * revision string and rejects every real v6 answer, so this rides the
+     * facet transport directly (the frozen tarball is bypassed, not patched).
+     */
     readFlowDocument: (input) =>
-      withClient(
-        undefined,
-        (client) => client.readFlowDocument(readFlowDocumentArgs(input)),
-        (value) => {
-          const wire = decodeOrIncompatible(WIRE_FLOW_DOCUMENT_RECORD, value);
-          return {
-            content: Buffer.from(wire.data, "base64").toString("utf8"),
-            revision: wire.revision,
-            displayPath: wire.displayPath,
-            size: wire.size,
-          };
-        },
-      ),
+      Effect.gen(function* () {
+        const endpoint = yield* resolveEndpoint;
+        const path = input.path.replace(/^\/+/, "");
+        const { status, value } = yield* facetRequest(
+          "GET",
+          `${endpoint.baseUrl}/project/v1/${encodeURIComponent(input.projectId)}` +
+            `/mission/documents/by-run/${encodeURIComponent(input.runId)}/${path}` +
+            `?agentId=${encodeURIComponent(input.agentId)}`,
+          undefined,
+          endpoint.credential,
+        );
+        if (status < 200 || status >= 300) {
+          if (isFailureEnvelope(value)) {
+            return yield* new ProjectServiceWorkServiceRejectedError({
+              code: value.error.code,
+              status,
+              message: value.error.message,
+            });
+          }
+          return yield* new ProjectServiceWorkTransportError({});
+        }
+        const wire = decodeOrIncompatible(
+          WIRE_FLOW_DOCUMENT_RECORD,
+          (value as { readonly result?: unknown }).result,
+        );
+        const data = Buffer.from(wire.data, "base64");
+        return {
+          content: data.toString("utf8"),
+          revision: wire.revision ?? null,
+          displayPath: wire.displayPath,
+          size: wire.size ?? data.byteLength,
+        };
+      }),
+    /**
+     * work-mission-v6: the notarized write is documentId-keyed (the mission
+     * contract's declaration fixes the path) — {idempotencyKey, documentId,
+     * data(base64)} — and the receipt answers {documentReceiptId, displayPath}
+     * with no successor revision. Same SDK-bypass rationale as the read.
+     */
     writeFlowDocument: (input) =>
-      withClient(
-        undefined,
-        (client) => client.writeFlowDocument(writeFlowDocumentArgs(input)),
-        (value) => decodeOrIncompatible(ProjectFlowDocumentWriteRecord, value),
-      ),
+      Effect.gen(function* () {
+        const endpoint = yield* resolveEndpoint;
+        const { status, value } = yield* facetRequest(
+          "POST",
+          `${endpoint.baseUrl}/project/v1/${encodeURIComponent(input.projectId)}` +
+            `/mission/documents/by-run/${encodeURIComponent(input.runId)}`,
+          {
+            idempotencyKey: input.idempotencyKey,
+            documentId: input.documentId,
+            agentId: input.agentId,
+            ...(input.data === undefined ? {} : { data: input.data }),
+          },
+          endpoint.credential,
+        );
+        if (status < 200 || status >= 300) {
+          if (isFailureEnvelope(value)) {
+            return yield* new ProjectServiceWorkServiceRejectedError({
+              code: value.error.code,
+              status,
+              message: value.error.message,
+            });
+          }
+          return yield* new ProjectServiceWorkTransportError({});
+        }
+        const receipt = decodeOrIncompatible(
+          Schema.Struct({ documentReceiptId: Schema.String, displayPath: Schema.String }),
+          (value as { readonly result?: unknown }).result,
+        );
+        return {
+          documentReceiptId: receipt.documentReceiptId,
+          revision: null,
+          displayPath: receipt.displayPath,
+        };
+      }),
   });
 });
 

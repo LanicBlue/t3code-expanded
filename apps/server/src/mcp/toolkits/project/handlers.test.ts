@@ -131,7 +131,10 @@ const RUN_VIEW = {
   runRevision: "run:3",
   state: "open",
   agentId: "ag_one",
-  task: { prompt: "Summarize" },
+  task: {
+    prompt: "Summarize",
+    documentsResolved: [{ id: "decision", kind: "file", path: "decision.md" }],
+  },
   createdAt: "2026-08-01T00:00:00.000Z",
 } as const;
 
@@ -146,14 +149,13 @@ interface CapturedSubmit {
   readonly projectGeneration: number;
   readonly runId: string;
   readonly expectedRunRevision: string;
-  readonly expectedAssignmentRevision: string;
   readonly agentId: string;
   readonly result: Readonly<Record<string, unknown>>;
   readonly operationId: string;
   readonly idempotencyKey: string;
 }
 
-const docWritesRef: { path: string; operation: string; data?: string }[] = [];
+const docWritesRef: { documentId: string; data?: string }[] = [];
 const docReadsRef: { path: string }[] = [];
 let docWriteError: ProjectServiceWorkClient.ProjectServiceWorkClientError | undefined;
 let documentContent = "decision: ship it";
@@ -197,7 +199,6 @@ const makeWorkClientLayer = (overrides?: {
         projectGeneration: input.projectGeneration,
         runId: input.runId,
         expectedRunRevision: input.expectedRunRevision,
-        expectedAssignmentRevision: input.expectedAssignmentRevision,
         agentId: input.agentId,
         result: input.result,
         operationId: operation.operationId,
@@ -217,19 +218,15 @@ const makeWorkClientLayer = (overrides?: {
         size: documentContent.length,
       });
     },
-    writeFlowDocument: (input: {
-      readonly path: string;
-      readonly operation: string;
-      readonly data?: string;
-    }) => {
+    writeFlowDocument: (input: { readonly documentId: string; readonly data?: string }) => {
       docWrites.push({ ...input });
       if (docWriteError !== undefined) {
         return Effect.fail(docWriteError);
       }
       return Effect.succeed({
         documentReceiptId: "document:" + "a".repeat(64),
-        revision: "doc:2",
-        displayPath: `flow://project/fi_1/${input.path}`,
+        revision: null,
+        displayPath: `mission://project/ms_1/${input.documentId}`,
       });
     },
   });
@@ -282,7 +279,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       const operation = yield* ProjectWorkToolkitHandlers.project_work_submit({
         runId: "run_9",
         runRevision: "run:3",
-        assignmentRevision: "position:5",
         result: { kind: "standalone", output: "done" },
       }).pipe(withHandlerLayers({ workClientLayer: layer }));
 
@@ -296,7 +292,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       // Business data the AGENT supplied, verbatim.
       assert.equal(call?.runId, "run_9");
       assert.equal(call?.expectedRunRevision, "run:3");
-      assert.equal(call?.expectedAssignmentRevision, "position:5");
       assert.deepEqual(call?.result, { kind: "standalone", output: "done" });
       // The recovery handle is server-generated, not agent-visible input.
       assert.match(call?.operationId ?? "", /.+/);
@@ -329,7 +324,10 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         assignmentRevision: "position:5",
         agentId: "ag_one",
         state: "open",
-        task: { prompt: "Summarize" },
+        task: {
+          prompt: "Summarize",
+          documentsResolved: [{ id: "decision", kind: "file", path: "decision.md" }],
+        },
         createdAt: "2026-08-01T00:00:00.000Z",
       });
       assert.isUndefined(result.runs[1]);
@@ -403,8 +401,9 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
           code: "FLOW_DOCUMENT_PERMISSION_DENIED",
           serviceMessage: "slot rights do not cover this document",
         });
-        // The upsert operation reached the client — never a create/update guess.
-        assert.equal(docWrites[docWrites.length - 1]?.operation, "write");
+        // The write reached the client keyed by the contract documentId the
+        // path resolved to — the v6 notarized-write addressing.
+        assert.equal(docWrites[docWrites.length - 1]?.documentId, "decision");
       });
     },
   );
@@ -439,7 +438,7 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
 
       assert.match(receipt.documentReceiptId, /^document:[0-9a-f]{64}$/);
       const sent = docWrites[docWrites.length - 1];
-      assert.equal(sent?.operation, "write");
+      assert.equal(sent?.documentId, "decision");
       assert.equal(sent?.data, Buffer.from("# decision\nship it\n", "utf8").toString("base64"));
     });
   });
@@ -462,7 +461,7 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       // LAST read is this edit's read of the document, not the global count.
       assert.equal(docReads[docReads.length - 1]?.path, "decision.md");
       const sent = docWrites[docWrites.length - 1];
-      assert.equal(sent?.operation, "write");
+      assert.equal(sent?.documentId, "decision");
       assert.equal(
         sent?.data,
         Buffer.from("# decision\nship it twice\n", "utf8").toString("base64"),
@@ -525,7 +524,7 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
     },
   );
 
-  it.effect("project_doc_edit refuses to empty the document and points at delete", () => {
+  it.effect("project_doc_edit refuses to empty the document and points at write", () => {
     const { layer } = makeWorkClientLayer({ content: "everything" });
 
     return Effect.gen(function* () {
@@ -537,25 +536,29 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
 
       assert.equal((plainError(failure) as { code?: string }).code, "PROJECT_DOC_CONTENT_INVALID");
-      assert.include(failure.message, "project_doc_delete");
+      assert.include(failure.message, "cannot be empty");
     });
   });
 
-  it.effect("project_doc_delete sends the delete operation through the derived identity", () => {
-    const { docWrites, layer } = makeWorkClientLayer();
+  it.effect(
+    "project_doc_delete answers the typed v6 rejection — there is no delete anymore",
+    () => {
+      const { layer } = makeWorkClientLayer();
 
-    return Effect.gen(function* () {
-      const receipt = yield* ProjectWorkToolkitHandlers.project_doc_delete({
-        runId: "run_9",
-        path: "decision.md",
-      }).pipe(withHandlerLayers({ workClientLayer: layer }));
+      return Effect.gen(function* () {
+        const failure = yield* ProjectWorkToolkitHandlers.project_doc_delete({
+          runId: "run_9",
+          path: "decision.md",
+        }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
 
-      assert.match(receipt.documentReceiptId, /^document:[0-9a-f]{64}$/);
-      const sent = docWrites[docWrites.length - 1];
-      assert.equal(sent?.operation, "delete");
-      assert.equal(sent?.data, undefined);
-    });
-  });
+        assert.equal(
+          (plainError(failure) as { code?: string }).code,
+          "PROJECT_DOC_DELETE_UNSUPPORTED",
+        );
+        assert.include(failure.message, "project_doc_write");
+      });
+    },
+  );
 
   it.effect("flow-document conflicts recover via doc_read, never the work-list hint", () => {
     const conflict = new ProjectServiceWorkClient.ProjectServiceWorkServiceRejectedError({
@@ -608,7 +611,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       const failure = yield* ProjectWorkToolkitHandlers.project_work_submit({
         runId: "run_9",
         runRevision: "run:1",
-        assignmentRevision: "position:1",
         result: { kind: "after", transitionId: "t_bogus" },
       }).pipe(withHandlerLayers({ workClientLayer: layer }), Effect.flip);
 
@@ -728,7 +730,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
         ProjectWorkToolkitHandlers.project_work_submit({
           runId: "run_newest",
           runRevision: "run:3",
-          assignmentRevision: "position:5",
           result: { kind: "after", message: "done" },
         }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
       );
@@ -744,7 +745,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       const operation = yield* ProjectWorkToolkitHandlers.project_work_submit({
         runId: "run_tie_a",
         runRevision: "run:1",
-        assignmentRevision: "position:5",
         result: { kind: "after", message: "done" },
       }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }));
       assert.equal(operation.status, "committed");
@@ -795,7 +795,13 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
           path: "decision.md",
         }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) })),
       );
-      assert.equal(deleteFailure._tag, "ProjectWorkNotCurrentError");
+      // v6 has no delete at all — the tool answers its typed rejection
+      // without consulting the queue (there is nothing to enforce).
+      assert.equal(deleteFailure._tag, "ProjectWorkRejectedError");
+      assert.equal(
+        (deleteFailure as { readonly code?: string }).code,
+        "PROJECT_DOC_DELETE_UNSUPPORTED",
+      );
 
       // The head flows through every tool unchanged.
       const document = yield* ProjectWorkToolkitHandlers.project_doc_read({
@@ -817,7 +823,6 @@ it.layer(NodeServices.layer)("ProjectWorkToolkit handlers", (it) => {
       const operation = yield* ProjectWorkToolkitHandlers.project_work_submit({
         runId: "run_9",
         runRevision: "run:3",
-        assignmentRevision: "position:5",
         result: { kind: "after", message: "done" },
       }).pipe(withHandlerLayers({ workClientLayer: layer, capabilities: new Set(["preview"]) }));
       assert.equal(operation.status, "committed");

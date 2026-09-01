@@ -150,6 +150,38 @@ const OPERATION_VIEW = {
   createdAt: "2026-08-01T00:00:59.000Z",
 };
 
+/**
+ * work-mission-v6 list projections (GET work-runs/my): the mission identity
+ * rides the TOP level and there is NO task snapshot — the prompt/documents/
+ * rights are the detail read's payload. listMy hydrates open runs through
+ * getRun (run_v1's detail is VISIT_RUN_VIEW); completed summaries pass through.
+ */
+const RUN_SUMMARY_OPEN = {
+  runId: "run_v1",
+  projectId: "proj_ps_1",
+  projectGeneration: 7,
+  positionId: "pos_implement",
+  state: "open",
+  mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
+  iteration: 1,
+  executor: { type: "agent", executorRef: "client-1:ag_one" },
+  runRevision: "run:9",
+  createdAt: "2026-08-27T00:00:00.000Z",
+  resolvedAt: null,
+  runningSeconds: 60,
+  stationSeconds: 30,
+};
+
+const RUN_SUMMARY_COMPLETED = {
+  ...RUN_SUMMARY_OPEN,
+  runId: "run_c1",
+  positionId: "pos_review",
+  state: "completed",
+  mission: { id: "ms_b", name: "Review v2", objective: "Review the release" },
+  runRevision: "run:2",
+  resolvedAt: "2026-08-27T00:10:00.000Z",
+};
+
 const okBody = (result: unknown) => Response.json({ ok: true, result });
 
 /** Happy-path routes; an `override` responder wins over every route. */
@@ -230,6 +262,110 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
     }).pipe(Effect.provide(makeLayer(client)));
   });
 
+  it.effect("decodes v6.2 positions — the occupancy token, no assignment CAS", () => {
+    // work-mission-v6.2: positions answer `occupancy` (hash of the executor
+    // ref) and dropped the assignmentRevision counter ("last-write-wins — no
+    // assignment CAS on the wire"); the decode must not require the counter.
+    const v6Positions: Responder = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === "/project/v1/proj_ps_1/work-positions") {
+        return okBody([
+          {
+            positionId: "pos_1",
+            projectId: "proj_ps_1",
+            owner: { type: "project" },
+            displayName: "Summarizer",
+            executor: { type: "agent", executorRef: "client-1:ag_one" },
+            occupancy: 2656310283,
+          },
+        ]);
+      }
+      return transportFailure(request);
+    };
+    const { client } = makeHttpClient(serviceByPath(v6Positions));
+
+    return Effect.gen(function* () {
+      yield* enableClient;
+      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+      const positions = yield* work.listPositions({ projectId: "proj_ps_1", projectGeneration: 7 });
+      assert.deepEqual(positions, [
+        { positionId: "pos_1", displayName: "Summarizer", occupancy: 2656310283 },
+      ]);
+    }).pipe(Effect.provide(makeLayer(client)));
+  });
+
+  it.effect("reads and writes mission documents on the v6 routes", () => {
+    const content = "# decision\nship it\n";
+    const encoded = Buffer.from(content, "utf8").toString("base64");
+    const routes: Responder = (request) => {
+      const url = new URL(request.url);
+      if (
+        url.pathname ===
+        "/project/v1/proj_ps_1/mission/documents/by-run/run_9/design/TARGET-BLUEPRINT.md"
+      ) {
+        return okBody({
+          // work-mission-v6 reads carry no revision.
+          displayPath: "mission://project/ms_1/design/TARGET-BLUEPRINT.md",
+          size: 18,
+          data: encoded,
+        });
+      }
+      if (url.pathname === "/project/v1/proj_ps_1/mission/documents/by-run/run_9") {
+        return okBody({
+          documentReceiptId: "rcpt_1",
+          displayPath: "mission://project/ms_1/<decision>",
+        });
+      }
+      return transportFailure(request);
+    };
+    const { client, requests } = makeHttpClient(serviceByPath(routes));
+
+    return Effect.gen(function* () {
+      yield* enableClient;
+      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+      const doc = yield* work.readFlowDocument({
+        projectId: "proj_ps_1",
+        runId: "run_9",
+        agentId: "ag_one",
+        path: "design/TARGET-BLUEPRINT.md",
+      });
+      assert.deepEqual(doc, {
+        content,
+        revision: null,
+        displayPath: "mission://project/ms_1/design/TARGET-BLUEPRINT.md",
+        size: 18,
+      });
+
+      const receipt = yield* work.writeFlowDocument({
+        projectId: "proj_ps_1",
+        runId: "run_9",
+        agentId: "ag_one",
+        idempotencyKey: "idem_1",
+        documentId: "decision",
+        data: encoded,
+      });
+      assert.deepEqual(receipt, {
+        documentReceiptId: "rcpt_1",
+        revision: null,
+        displayPath: "mission://project/ms_1/<decision>",
+      });
+      // The write is documentId-keyed — the pre-v6 path/operation pair is gone.
+      const writeRequest = requests.find(
+        (request) =>
+          request.url.includes("/mission/documents/by-run/run_9") && request.method === "POST",
+      );
+      const body = jsonBodyOf(writeRequest);
+      assert.deepEqual(body, {
+        idempotencyKey: "idem_1",
+        documentId: "decision",
+        agentId: "ag_one",
+        data: encoded,
+      });
+    }).pipe(Effect.provide(makeLayer(client)));
+  });
+
   it.effect("decodes the mission visit view onto the run record", () => {
     const visitByPath: Responder = (request) => {
       const url = new URL(request.url);
@@ -290,6 +426,127 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
       assert.deepEqual(run?.visit?.mission.id, "ms_a");
       assert.deepEqual(run?.visit?.work.group, "ms_a");
     }).pipe(Effect.provide(makeLayer(client)));
+  });
+
+  it.effect("hydrates v6 summary list projections through the detail read", () => {
+    const summaryRoutes: Responder = (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === "/project/v1/proj_ps_1/work-runs/my")
+        return okBody([RUN_SUMMARY_COMPLETED, RUN_SUMMARY_OPEN]);
+      if (url.pathname === "/project/v1/proj_ps_1/work-runs/run_v1") return okBody(VISIT_RUN_VIEW);
+      return transportFailure(request);
+    };
+    const { client, requests } = makeHttpClient(serviceByPath(summaryRoutes));
+
+    return Effect.gen(function* () {
+      yield* enableClient;
+      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+
+      const runs = yield* work.listMy({
+        projectId: "proj_ps_1",
+        projectGeneration: 7,
+        agentId: "ag_one",
+      });
+      // The OPEN summary is replaced by its hydrated detail — task snapshot,
+      // visit contract, everything downstream reads.
+      assert.deepEqual(runs, [
+        {
+          runId: "run_c1",
+          positionId: "pos_review",
+          runRevision: "run:2",
+          state: "completed",
+          mission: { id: "ms_b", name: "Review v2", objective: "Review the release" },
+          createdAt: "2026-08-27T00:00:00.000Z",
+          resolvedAt: "2026-08-27T00:10:00.000Z",
+        },
+        {
+          runId: "run_v1",
+          positionId: "pos_implement",
+          runRevision: "run:9",
+          state: "open",
+          agentId: "ag_one",
+          task: VISIT_RUN_VIEW.task,
+          createdAt: "2026-08-27T00:00:00.000Z",
+          resolvedAt: null,
+          action: {
+            kind: "visit",
+            outcomes: ["implementation-ready", "design-clarification"],
+            candidates: ["validation"],
+            abandonAvailable: true,
+          },
+          visit: {
+            mission: { id: "ms_a", name: "Release v2", objective: "Ship the release" },
+            work: { group: "ms_a", workKey: "implement", iteration: 1 },
+            action: {
+              kind: "visit",
+              outcomes: ["implementation-ready", "design-clarification"],
+              candidates: ["validation"],
+              abandonAvailable: true,
+            },
+          },
+        },
+      ]);
+      // Exactly one detail read, for the open run only, fenced to the same
+      // generation and agent scope as the list call.
+      const detailRequests = requests.filter((request) => request.url.includes("/work-runs/run_"));
+      assert.lengthOf(detailRequests, 1);
+      assert.match(detailRequests[0]?.url ?? "", /work-runs\/run_v1/);
+      assert.match(detailRequests[0]?.url ?? "", /projectGeneration=7/);
+      assert.match(detailRequests[0]?.url ?? "", /agentId=ag_one/);
+      assert.strictEqual(detailRequests[0]?.headers["authorization"], `Bearer ${CREDENTIAL}`);
+    }).pipe(Effect.provide(makeLayer(client)));
+  });
+
+  it.effect("drops an open summary whose detail read 404s, but fails on other rejections", () => {
+    // The run resolved between the list and the detail read: the 404 drops it
+    // (a fresh list would not have shown it open). Any other rejection —
+    // here a 403 — fails the whole call like any work-query failure.
+    const gone =
+      (detailStatus: number): Responder =>
+      (request) => {
+        const url = new URL(request.url);
+        if (url.pathname === "/project/v1/proj_ps_1/work-runs/my")
+          return okBody([RUN_SUMMARY_OPEN]);
+        if (url.pathname === "/project/v1/proj_ps_1/work-runs/run_v1")
+          return Response.json(
+            {
+              ok: false,
+              error: { code: "PROJECT_WORK_RUN_NOT_FOUND", message: "the run is gone" },
+            },
+            { status: detailStatus },
+          );
+        return transportFailure(request);
+      };
+
+    const droppedOn404 = Effect.gen(function* () {
+      yield* enableClient;
+      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+      const dropped = yield* work.listMy({
+        projectId: "proj_ps_1",
+        projectGeneration: 7,
+        agentId: "ag_one",
+      });
+      assert.deepEqual(dropped, []);
+    }).pipe(Effect.provide(makeLayer(makeHttpClient(gone(404)).client)));
+
+    const failsOn403 = Effect.gen(function* () {
+      yield* enableClient;
+      const work = yield* ProjectServiceWorkClient.ProjectServiceWorkClient;
+      const failure = yield* work
+        .listMy({ projectId: "proj_ps_1", projectGeneration: 7, agentId: "ag_one" })
+        .pipe(Effect.flip);
+      assert.deepEqual(plainError(failure), {
+        _tag: "ProjectServiceWorkServiceRejectedError",
+        code: "PROJECT_WORK_RUN_NOT_FOUND",
+        status: 403,
+      });
+      assert.equal(failure.message, "the run is gone");
+    }).pipe(Effect.provide(makeLayer(makeHttpClient(gone(403)).client)));
+
+    return Effect.gen(function* () {
+      yield* droppedOn404;
+      yield* failsOn403;
+    });
   });
 
   it.effect(
@@ -380,7 +637,6 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
             projectGeneration: 7,
             runId: "run_9",
             expectedRunRevision: "run:3",
-            expectedAssignmentRevision: "position:5",
             agentId: "ag_one",
             result: { kind: "standalone", output: "done" },
           },
@@ -397,12 +653,16 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
         const body = jsonBodyOf(submit);
         assert.equal(body.operationId, "op_123");
         assert.equal(body.idempotencyKey, "idem_123");
-        const command = body.command as Record<string, unknown>;
-        assert.equal(command.agentId, "ag_one");
-        assert.equal(command.runId, "run_9");
-        assert.equal(command.expectedRunRevision, "run:3");
-        assert.equal(command.expectedAssignmentRevision, "position:5");
-        assert.deepEqual(command.result, { kind: "standalone", output: "done" });
+        // work-mission-v6: the command addresses the MISSION (runId IS the
+        // missionId) and the mission revision is the SOLE fence — the
+        // pre-v6 runId/expectedAssignmentRevision pair must be gone.
+        assert.deepEqual(body.command, {
+          kind: "run.submit",
+          missionId: "run_9",
+          expectedRunRevision: "run:3",
+          agentId: "ag_one",
+          result: { kind: "standalone", output: "done" },
+        });
       }).pipe(Effect.provide(makeLayer(client)));
     },
   );
@@ -421,7 +681,6 @@ it.layer(NodeServices.layer)("ProjectServiceWorkClient", (it) => {
             projectGeneration: 7,
             runId: "run_9",
             expectedRunRevision: "run:3",
-            expectedAssignmentRevision: "position:5",
             agentId: "ag_one",
             result: {},
           },

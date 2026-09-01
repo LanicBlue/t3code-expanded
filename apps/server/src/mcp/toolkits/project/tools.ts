@@ -254,11 +254,7 @@ export const ProjectWorkSubmitInput = Schema.Struct({
   }),
   runRevision: Schema.String.annotate({
     description:
-      'The run\'s current revision token from project_work_list (e.g. "run:4"); pass it back verbatim — a stale value is rejected as a conflict.',
-  }),
-  assignmentRevision: Schema.String.annotate({
-    description:
-      'The position\'s current assignment revision token from project_work_list (e.g. "position:2"); pass it back verbatim — a stale value is rejected as a conflict.',
+      'The run\'s current revision token from project_work_list (e.g. "run:4"); pass it back verbatim — a stale value is rejected as a conflict. This mission-revision CAS is the only fence.',
   }),
   result: Schema.Record(Schema.String, Schema.Unknown).annotate({
     description:
@@ -282,7 +278,16 @@ const ProjectWorkListItem = Schema.Struct({
   assignmentRevision: Schema.NullOr(Schema.String),
   agentId: Schema.String,
   state: Schema.Literals(["open", "completed", "superseded", "cancelled"]),
-  task: Schema.Record(Schema.String, Schema.Unknown),
+  /**
+   * work-mission-v6: the run's task snapshot (prompt/documents/rights) comes
+   * from the detail read — always present on the hydrated current work, but
+   * optional on the wire for degraded reads; the top-level `mission` identity
+   * covers the summary shape.
+   */
+  mission: Schema.optional(
+    Schema.Struct({ id: Schema.String, name: Schema.String, objective: Schema.String }),
+  ),
+  task: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   createdAt: Schema.String,
   /** Where this run's work happens (managed worktree path / project root). */
   workspacePolicy: Schema.optional(Schema.String),
@@ -307,7 +312,8 @@ const ProjectWorkListItem = Schema.Struct({
 const ProjectWorkPositionItem = Schema.Struct({
   positionId: Schema.String,
   displayName: Schema.String,
-  assignmentRevision: Schema.String,
+  /** Null on work-mission-v6.2: the assignment CAS is gone (occupancy token). */
+  assignmentRevision: Schema.NullOr(Schema.String),
 });
 
 export const ProjectWorkListResult = Schema.Struct({
@@ -323,7 +329,7 @@ export const ProjectWorkListResult = Schema.Struct({
 
 export const ProjectWorkListTool = Tool.make("project_work_list", {
   description:
-    "List this agent's assigned Work in the session project's Project Service project (matched by the project's workspace directory). Work is delivered strictly in arrival order: the result carries ONLY the current work (the oldest open run, with the revision pair project_work_submit expects); queuedWorkCount says how many wait behind it and those are not visible until the current one is submitted. No identity is required or accepted.",
+    "List this agent's assigned Work in the session project's Project Service project (matched by the project's workspace directory). Work is delivered strictly in arrival order: the result carries ONLY the current work (the oldest open run, with the runRevision project_work_submit expects); queuedWorkCount says how many wait behind it and those are not visible until the current one is submitted. No identity is required or accepted.",
   parameters: ProjectWorkListInput,
   success: ProjectWorkListResult,
   failure: ProjectWorkError,
@@ -351,7 +357,7 @@ export const ProjectWorkGetTool = Tool.make("project_work_get", {
 
 export const ProjectWorkSubmitTool = Tool.make("project_work_submit", {
   description:
-    'Complete the CURRENT Work run with the result payload, guarded by the run and assignment revisions from project_work_list. Match the run\'s completion contract — the action field on the run project_work_list returns spells it out: kind is always "visit" (the station outcome vocabulary plus the candidate next stations). A VISIT work submits {"outcome": <one of action.outcomes>, "nextNode"?: <target workKey>, "reason"?, "feedback"?, "documentReceiptIds"?}: outcome picks from THIS station\'s vocabulary; nextNode is YOUR routing choice — action.candidates lists the in-contract targets as a hint, not a constraint, but a nextNode outside the candidates is off-contract and REQUIRES "reason" (the choice is semantics and gets recorded); omit nextNode only when the contract leaves exactly one continuation or the outcome is terminal; "feedback" carries rework context when the outcome sends the mission back. When action.abandonAvailable is true, {"outcome":"abandon"} is the reserved way to end the work early — carry the why in "feedback". Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
+    'Complete the CURRENT Work run with the result payload, guarded by the runRevision from project_work_list (the mission-revision CAS — the only fence). Match the run\'s completion contract — the action field on the run project_work_list returns spells it out: kind is always "visit" (the station outcome vocabulary plus the candidate next stations). A VISIT work submits {"outcome": <one of action.outcomes>, "nextNode"?: <target workKey>, "reason"?, "feedback"?, "documentReceiptIds"?}: outcome picks from THIS station\'s vocabulary; nextNode is YOUR routing choice — action.candidates lists the in-contract targets as a hint, not a constraint, but a nextNode outside the candidates is off-contract and REQUIRES "reason" (the choice is semantics and gets recorded); omit nextNode only when the contract leaves exactly one continuation or the outcome is terminal; "feedback" carries rework context when the outcome sends the mission back. When action.abandonAvailable is true, {"outcome":"abandon"} is the reserved way to end the work early — carry the why in "feedback". Only the current work (queue head) may be submitted — anything else answers a not-current error; re-list. The server derives the executor identity from the session; arguments never carry it. On a stale revision the service answers a conflict — re-list. If the outcome is uncertain, the error carries an operationId for project_operation_get. After a successful submit, call project_work_list again: the next work may now be current.',
   parameters: ProjectWorkSubmitInput,
   success: ProjectServiceWorkClient.ProjectWorkOperationRecord,
   failure: ProjectWorkError,
@@ -393,7 +399,7 @@ export const ProjectDocWriteInput = Schema.Struct({
   }),
   path: Schema.String.annotate({
     description:
-      'The instance-relative document path, e.g. "decision.md". Must be a document the flow definition declares.',
+      'The instance-relative document path, e.g. "decision.md". Must be a path the run\'s mission contract declares (documentsResolved).',
   }),
   content: Schema.String.annotate({
     description:
@@ -475,7 +481,7 @@ export const ProjectDocEditTool = Tool.make("project_doc_edit", {
 
 export const ProjectDocDeleteTool = Tool.make("project_doc_delete", {
   description:
-    "Delete a flow document through one of your open work runs (notarized). The document must already exist; the receipt handed back carries no successor revision. Use this instead of writing empty content — a document cannot be emptied by write.",
+    "Delete a flow document through one of your open work runs (notarized). UNSUPPORTED on work-mission-v6: mission documents are contract-declared and cannot be deleted — this tool answers a typed rejection; overwrite with project_doc_write instead.",
   parameters: ProjectDocDeleteInput,
   success: ProjectServiceWorkClient.ProjectFlowDocumentWriteRecord,
   failure: ProjectWorkError,
