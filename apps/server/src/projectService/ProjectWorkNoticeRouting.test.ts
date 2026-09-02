@@ -1859,10 +1859,15 @@ describe("delivery reconcile sweep", () => {
 
         // The build round finishes and the SAME run (v6: runId = missionId)
         // returns to verify at a NEW revision. The no-nag invariant must key
-        // on (runId, runRevision) — runId alone would swallow the round.
+        // on (runId, runRevision) — runId alone would swallow the round —
+        // and the delivery id must differ per revision, or the orchestration
+        // receipt dedups the returning round into a durable no-op.
         harness.setOpenRuns([reworkRun("run:5")]);
         yield* harness.router.reconcileOpenWork(wakeInput());
         assert.lengthOf(turnStarts(harness.commands), 2);
+        const roundOneId = turnStarts(harness.commands)[0]?.commandId;
+        const roundTwoId = turnStarts(harness.commands)[1]?.commandId;
+        assert.notEqual(String(roundOneId), String(roundTwoId));
 
         // Round 2's aggregate turn engages (the shell shows it running): a
         // busy turn is never interrupted or re-nagged.
@@ -1876,6 +1881,47 @@ describe("delivery reconcile sweep", () => {
         yield* harness.router.reconcileOpenWork(wakeInput());
         yield* harness.router.reconcileOpenWork(wakeInput());
         assert.lengthOf(turnStarts(harness.commands), 2);
+      }),
+  );
+
+  it.effect(
+    "a delivery whose turn never engages is retried with fresh ids, then parked loudly",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(makeSettings());
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        const [created] = threadCreates(harness.commands);
+        const threadId = created?.type === "thread.create" ? created.threadId : null;
+        const projectId = String(created?.projectId);
+        assert.lengthOf(turnStarts(harness.commands), 1);
+
+        // The delivery lapsed without ANY engagement: the provider session
+        // died without ever running the queued turn (no busy observation,
+        // no settled-after-delivery turn). The ACK obligation retries the
+        // delivery — attempt-keyed ids, one per sweep — up to the cap.
+        const stoppedNoTurn = () =>
+          harness.putThread(
+            makeThreadShell(threadId as string, projectId, (shell) => ({
+              ...shell,
+              session: stoppedSession(threadId as string),
+              latestTurn: null,
+            })),
+          );
+        stoppedNoTurn();
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        assert.lengthOf(turnStarts(harness.commands), 4);
+        const ids = turnStarts(harness.commands).map((command) => String(command.commandId));
+        assert.lengthOf(new Set(ids), 4);
+
+        // The cap spent: further sweeps park the session instead of
+        // nagging forever; the head is still open but already delivered.
+        stoppedNoTurn();
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        yield* harness.router.reconcileOpenWork(wakeInput());
+        assert.lengthOf(turnStarts(harness.commands), 4);
+        assert.strictEqual((yield* harness.router.snapshotSessions)[0]?.phase, "idle");
       }),
   );
 

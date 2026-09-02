@@ -627,6 +627,16 @@ interface RoutedSession {
   /** The revision of the run the reminder budget was spent on (v6 pairing). */
   remindedHeadRunRevision: string | null;
   /**
+   * Deliveries of the current head whose turn NEVER engaged (no busy
+   * observation, no settled-after-delivery turn). The ACK obligation: once
+   * routed, the router guarantees the mission actually STARTS — a delivery
+   * that never engages a turn is retried (attempt-keyed delivery ids, so the
+   * orchestration receipt does not dedup them) up to
+   * MAX_ENGAGEMENT_DELIVERY_ATTEMPTS, then surfaced loudly. Reset when the
+   * round changes (new runId or revision) or engagement is observed.
+   */
+  engagementAttempts: number;
+  /**
    * Stable identity of the open Work set last observed for this session.
    * Project Service notices are triggers and may be replayed, so an
    * unchanged authoritative set is not new pending work.
@@ -656,14 +666,24 @@ const routingKeyOf = (agentId: string, projectId: string, flowInstanceKey: strin
     ? `${agentId}::${projectId}`
     : `${agentId}::${projectId}::${flowInstanceKey}`;
 
+/**
+ * Stable identity of the open Work set. work-mission-v6: the runId alone is
+ * the missionId — STABLE across rework round-trips that return the same run
+ * to the same station — so the revision rides along: a changed signature
+ * (and therefore a fresh delivery id) is exactly what a returning round is.
+ */
 const openWorkSignature = (runs: ReadonlyArray<AssignedWorkQueueEntry>): string =>
-  JSON.stringify(orderAssignedWorkQueue(runs).map((run) => run.runId));
+  JSON.stringify(orderAssignedWorkQueue(runs).map((run) => [run.runId, run.runRevision]));
 
 const workDeliveryId = (
   threadId: ThreadId,
   kind: "aggregate" | "reminder",
   signature: string,
-): string => `project-work:${threadId}:${kind}:${signature}`;
+  attempt = 0,
+): string => `project-work:${threadId}:${kind}${attempt === 0 ? "" : `-${attempt}`}:${signature}`;
+
+/** Retries for a delivery whose turn never engaged before parking loudly. */
+const MAX_ENGAGEMENT_DELIVERY_ATTEMPTS = 3;
 
 export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRouter")(function* (
   deps: ProjectWorkSessionRouterDeps,
@@ -907,6 +927,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     threadId: ThreadId,
     runs: ReadonlyArray<AssignedWorkQueueEntry>,
     kind: "aggregate" | "reminder" = "aggregate",
+    attempt = 0,
   ): Effect.fn.Return<string | null, ProjectWorkRoutingError> {
     const ordered = orderAssignedWorkQueue(runs);
     const current = ordered.at(0);
@@ -916,7 +937,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       return null;
     }
     const createdAt = yield* deps.nowIso;
-    const deliveryId = workDeliveryId(threadId, kind, openWorkSignature(ordered));
+    const deliveryId = workDeliveryId(threadId, kind, openWorkSignature(ordered), attempt);
     yield* deps.dispatchCommand({
       type: "thread.turn.start",
       // A Project Service notice can be replayed or race the reconcile sweep.
@@ -1040,6 +1061,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
         lastDeliveredAtIso: null,
         remindedHeadRunId: null,
         remindedHeadRunRevision: null,
+        engagementAttempts: 0,
         observedWorkSignature: openWorkSignature(ordered),
       });
       const deliveredAt = yield* deliverAggregate(target, threadId, ordered);
@@ -1163,6 +1185,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
                     lastDeliveredHeadRunRevision: current.runRevision,
                     remindedHeadRunId: null,
                     remindedHeadRunRevision: null,
+                    engagementAttempts: 0,
                   }
                 : {}),
             }
@@ -1186,6 +1209,7 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
                   lastDeliveredHeadRunRevision: current.runRevision,
                   remindedHeadRunId: null,
                   remindedHeadRunRevision: null,
+                  engagementAttempts: 0,
                 }
               : {}),
           }
@@ -1361,8 +1385,14 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
     }
     if (Option.isSome(shell.success) && isWorkThreadBusy(shell.success.value)) {
       // The notification turn engaged; remember it so the FIRST
-      // not-busy observation afterwards is the real turn end.
-      yield* mutateSession(key, (current) => ({ ...current, seenBusy: true }));
+      // not-busy observation afterwards is the real turn end. Engagement
+      // also spends any pending retry budget: a later lapse is the
+      // agent's (reminder territory), not a delivery failure.
+      yield* mutateSession(key, (current) => ({
+        ...current,
+        seenBusy: true,
+        engagementAttempts: 0,
+      }));
       return;
     }
     if (
@@ -1415,10 +1445,14 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
       // and never re-fire when the queue head rotates (the Project Service
       // records the next run's notice as already delivered), so the router
       // itself advances the queue when the head moved past the one the
-      // agent was last told about. An unchanged head means the agent
-      // finished its turn WITHOUT submitting (the run is still open and
-      // still the head): exactly ONE reminder, then the session rests —
-      // the same run is never reminded twice.
+      // agent was last told about. An unchanged head splits by engagement:
+      // a turn that provably RAN (busy observed, or a shell turn settled
+      // after our delivery) ending without a submit gets exactly ONE
+      // reminder; a delivery that NEVER engaged a turn is retried instead.
+      const turnRan =
+        session.seenBusy ||
+        (Option.isSome(shell.success) &&
+          workThreadTurnSettledAfterDelivery(shell.success.value, session.lastDeliveredAtIso));
       const runs = yield* deps
         .listOpenAssignedWork({
           agentId: target.success.logicalAgentId,
@@ -1436,16 +1470,71 @@ export const makeProjectWorkSessionRouter = Effect.fn("makeProjectWorkSessionRou
           yield* flushRecordedWork(key, target.success, true, runs.success).pipe(Effect.ignore);
           return;
         }
-        if (
-          nextHead !== undefined &&
-          sameDeliveredHead(session, nextHead) &&
-          !(
-            session.remindedHeadRunId === nextHead.runId &&
-            session.remindedHeadRunRevision === nextHead.runRevision
-          )
-        ) {
-          yield* remindOpenHead(key, target.success, session.threadId, runs.success);
-          return;
+        if (nextHead !== undefined && sameDeliveredHead(session, nextHead)) {
+          if (!turnRan) {
+            // The delivered aggregate NEVER engaged a turn (no busy
+            // observation, no settled-after-delivery turn): the ACK
+            // obligation says retry the delivery, bounded and loud —
+            // attempt-keyed ids keep the orchestration receipt from
+            // deduping the retries into no-ops.
+            const attempt = session.engagementAttempts + 1;
+            if (attempt <= MAX_ENGAGEMENT_DELIVERY_ATTEMPTS) {
+              yield* mutateSession(key, (current) => ({
+                ...current,
+                engagementAttempts: attempt,
+              }));
+              const delivered = yield* deliverAggregate(
+                target.success,
+                session.threadId,
+                runs.success,
+                "reminder",
+                attempt,
+              ).pipe(Effect.result);
+              const orderedNow = orderAssignedWorkQueue(
+                runsForWorkGroup(runs.success, session.flowInstanceKey),
+              );
+              yield* mutateSession(key, (current) => ({
+                ...current,
+                phase:
+                  delivered._tag === "Success" && delivered.success !== null ? "notifying" : "idle",
+                seenBusy: false,
+                ...(delivered._tag === "Success" && delivered.success !== null
+                  ? {
+                      lastDeliveredAtIso: delivered.success,
+                      observedWorkSignature: openWorkSignature(orderedNow),
+                    }
+                  : {}),
+              }));
+              yield* Effect.logWarning(
+                "Project Work delivery never engaged a turn; retried the delivery",
+                {
+                  agentId: target.success.logicalAgentId,
+                  projectId: target.success.projectServiceProjectId,
+                  runId: nextHead.runId,
+                  attempt,
+                  maxAttempts: MAX_ENGAGEMENT_DELIVERY_ATTEMPTS,
+                },
+              );
+              return;
+            }
+            yield* Effect.logWarning(
+              "Project Work delivery never engaged a turn after every retry; parked for the operator — a new round re-arms delivery and the reconcile sweep re-checks each pass",
+              {
+                agentId: target.success.logicalAgentId,
+                projectId: target.success.projectServiceProjectId,
+                runId: nextHead.runId,
+                attempts: MAX_ENGAGEMENT_DELIVERY_ATTEMPTS,
+              },
+            );
+          } else if (
+            !(
+              session.remindedHeadRunId === nextHead.runId &&
+              session.remindedHeadRunRevision === nextHead.runRevision
+            )
+          ) {
+            yield* remindOpenHead(key, target.success, session.threadId, runs.success);
+            return;
+          }
         }
       }
       yield* mutateSession(key, (current) => ({ ...current, phase: "idle" }));
