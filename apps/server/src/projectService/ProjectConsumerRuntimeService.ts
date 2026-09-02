@@ -94,6 +94,9 @@ const CONSUMER_ID = "t3" as ConsumerId;
 /** Spacing of the delivery reconcile sweep (flow liveness A1). */
 const RECONCILE_SWEEP_INTERVAL = Duration.minutes(3);
 
+/** Consecutive down sweeps before the channel watchdog forces a revival. */
+const DEFAULT_CHANNEL_DOWN_REVIVAL_SWEEPS = 5;
+
 const normalizeBaseUrl = (baseUrl: string): string | null => {
   try {
     const url = new URL(baseUrl);
@@ -185,6 +188,8 @@ export interface ProjectConsumerRuntimeOverrides {
   readonly revivalDelayMs?: number;
   /** Spacing of the delivery reconcile sweep (tests shorten it). */
   readonly reconcileSweepIntervalMs?: number;
+  /** Consecutive down sweeps before the channel watchdog forces a revival (tests shorten it). */
+  readonly channelDownRevivalSweepThreshold?: number;
 }
 
 /** listAgents cannot answer; the SDK cycles the channel and retries. */
@@ -867,13 +872,38 @@ const make = (overrides?: ProjectConsumerRuntimeOverrides) =>
       overrides?.reconcileSweepIntervalMs !== undefined
         ? Duration.millis(overrides.reconcileSweepIntervalMs)
         : RECONCILE_SWEEP_INTERVAL;
+    // Channel watchdog: a runtime stuck out of `connected` WITHOUT reaching
+    // `stopped` (a half-dead socket the SDK's own reconnect never completes
+    // against) fires no self-stop hook, so nothing revives it and the sweep
+    // below would no-op forever. After this many consecutive down sweeps the
+    // sweep itself logs loudly and forces the delayed runtime revival.
+    const channelDownRevivalSweeps =
+      overrides?.channelDownRevivalSweepThreshold ?? DEFAULT_CHANNEL_DOWN_REVIVAL_SWEEPS;
+    const consecutiveDownSweepsRef = yield* Ref.make(0);
     const reconcileSweep: Effect.Effect<void> = Effect.gen(function* () {
       const status = yield* Ref.get(statusRef);
       if (status.state !== "connected") {
         // Nothing to reconcile against while the channel is down; the
-        // SDK's reconnect owns getting back here.
+        // SDK's reconnect owns getting back here — but a channel that
+        // never comes back (and never self-stops) gets revived by force.
+        const downSweeps = 1 + (yield* Ref.get(consecutiveDownSweepsRef));
+        yield* Ref.set(consecutiveDownSweepsRef, downSweeps);
+        if (downSweeps >= channelDownRevivalSweeps) {
+          yield* Ref.set(consecutiveDownSweepsRef, 0);
+          yield* Effect.logWarning(
+            "Project consumer gateway channel has been down across every recent reconcile sweep; forcing a runtime revival",
+            {
+              state: status.state,
+              detail: status.detail,
+              lastServerError: status.lastServerError,
+              downSweeps,
+            },
+          );
+          yield* scheduleRuntimeRevival;
+        }
         return;
       }
+      yield* Ref.set(consecutiveDownSweepsRef, 0);
       const agents = yield* listProjectConsumerAgents(serverSettings).pipe(Effect.result);
       if (agents._tag === "Failure") {
         // Settings unreadable right now; the sweep retries on its next tick

@@ -281,7 +281,11 @@ const sessionWithStatus = (
 
 const makeFakes = (
   gateway: ReturnType<typeof makeGateway>,
-  options?: { readonly reconcileSweepIntervalMs?: number },
+  options?: {
+    readonly reconcileSweepIntervalMs?: number;
+    readonly channelDownRevivalSweepThreshold?: number;
+    readonly backoff?: (attempt: number) => number;
+  },
 ) =>
   Effect.gen(function* () {
     const commands: OrchestrationCommand[] = [];
@@ -493,10 +497,13 @@ const makeFakes = (
 
     const serviceLayer = ProjectConsumerRuntime.layerWithOptions({
       socketFactory: gateway.factory,
-      backoff: () => 10,
+      backoff: options?.backoff ?? (() => 10),
       revivalDelayMs: 20,
       ...(options?.reconcileSweepIntervalMs !== undefined
         ? { reconcileSweepIntervalMs: options.reconcileSweepIntervalMs }
+        : {}),
+      ...(options?.channelDownRevivalSweepThreshold !== undefined
+        ? { channelDownRevivalSweepThreshold: options.channelDownRevivalSweepThreshold }
         : {}),
     }).pipe(
       Layer.provideMerge(engineLayer),
@@ -1037,6 +1044,63 @@ describe("ProjectConsumerRuntimeService", () => {
           second?.fireOpen();
           yield* waitForSdk(40);
           assert.lengthOf(gateway.recording.hellos, 2);
+          assert.strictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "connected",
+          );
+        }).pipe(Effect.provide(fakes.layer), Effect.scoped);
+      }),
+  );
+
+  it.live(
+    "a channel stuck out of connected without a self-stop is force-revived by the sweep watchdog",
+    () =>
+      Effect.gen(function* () {
+        const gateway = makeGateway();
+        const fakes = yield* makeFakes(gateway, {
+          // Sweep every 100ms with a threshold of 2: the initial handshake
+          // (~40ms) is observed connected by the first post-open sweep, and
+          // only the post-drop sweeps count toward the watchdog.
+          reconcileSweepIntervalMs: 100,
+          channelDownRevivalSweepThreshold: 2,
+        });
+
+        yield* Effect.gen(function* () {
+          yield* configureIntegration;
+          const service = yield* ProjectConsumerRuntime.ProjectConsumerRuntimeService;
+          yield* service.start();
+          const first = gateway.recording.sockets[0];
+          assert.isDefined(first);
+          first?.fireOpen();
+          yield* waitForSdk(150);
+          assert.strictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "connected",
+          );
+
+          // The channel dies WITHOUT a terminal classification: the socket
+          // drops, the SDK re-dials once, and the re-dial PARKS unopened —
+          // no hello, no self-stop, nothing revives it. Exactly the half-
+          // dead channel that stranded delivery silently: non-connected and
+          // inert while the socket count stops growing.
+          first?.fireClose();
+          yield* waitForSdk(50);
+          assert.notStrictEqual(
+            yield* service.getStatus.pipe(Effect.map((status) => status.state)),
+            "connected",
+          );
+          const parkedDials = gateway.recording.sockets.length;
+          yield* waitForSdk(60);
+          assert.lengthOf(gateway.recording.sockets, parkedDials);
+
+          // Two down sweeps (100ms apart) trip the watchdog: the forced
+          // revival rebuilds the runtime, which dials a fresh socket, and
+          // the channel converges once it opens.
+          yield* waitForSdk(350);
+          assert.isAbove(gateway.recording.sockets.length, parkedDials);
+          const revived = gateway.recording.sockets[gateway.recording.sockets.length - 1];
+          revived?.fireOpen();
+          yield* waitForSdk(150);
           assert.strictEqual(
             yield* service.getStatus.pipe(Effect.map((status) => status.state)),
             "connected",
