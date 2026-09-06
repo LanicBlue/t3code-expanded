@@ -7,6 +7,7 @@ export type SettingsPath =
   | "/settings/keybindings"
   | "/settings/providers"
   | "/settings/integrations"
+  | "/settings/im"
   | "/settings/source-control"
   | "/settings/connections"
   | "/settings/archived";
@@ -52,6 +53,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/keybindings": "Keybindings",
   "/settings/providers": "Providers",
   "/settings/integrations": "Integrations",
+  "/settings/im": "IM Bridge",
   "/settings/source-control": "Source Control",
   "/settings/connections": "Connections",
   "/settings/archived": "Archive",
@@ -392,6 +394,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Auto-show floating preview",
     to: "/settings/integrations",
     searchTerms: ["agent opens browser pop into view hide"],
+  },
+  {
+    id: "im-bridge",
+    title: "IM Bridge",
+    to: "/settings/im",
+    searchTerms: ["im mission bridge infinite member 成员"],
+    primaryOnly: true,
   },
   {
     id: "source-control",

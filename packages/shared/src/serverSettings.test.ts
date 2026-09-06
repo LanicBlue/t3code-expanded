@@ -299,6 +299,46 @@ describe("serverSettings helpers", () => {
     });
   });
 
+  it("replaces imBridge members wholesale so the bridge sees the exact roster", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      imBridge: {
+        members: [
+          {
+            id: "alice",
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5.6-luna",
+            runtimeMode: "full-access" as const,
+          },
+        ],
+      },
+    };
+
+    const next = applyServerSettingsPatch(current, {
+      imBridge: {
+        members: [
+          {
+            id: "bob",
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: "sonnet",
+            runtimeMode: "auto" as const,
+            enabled: false,
+          },
+        ],
+      },
+    });
+
+    expect(next.imBridge.members).toEqual([
+      {
+        id: "bob",
+        instanceId: "claudeAgent",
+        model: "sonnet",
+        runtimeMode: "auto",
+        enabled: false,
+      },
+    ]);
+  });
+
   it("upserts and removes usageLimitSources per entry so concurrent edits cannot clobber", () => {
     const hubA = UsageLimitSourceId.make("cliproxy-a");
     const hubB = UsageLimitSourceId.make("cliproxy-b");

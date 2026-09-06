@@ -10,7 +10,7 @@ import {
   DEFAULT_TEXT_GENERATION_REASONING_EFFORT,
   ProviderOptionSelections,
 } from "./model.ts";
-import { ModelSelection } from "./orchestration.ts";
+import { DEFAULT_RUNTIME_MODE, ModelSelection, RuntimeMode } from "./orchestration.ts";
 import { BrowserProfile, BrowserProfileId, DEFAULT_BROWSER_PROFILE_ID } from "./browserProfile.ts";
 import {
   DEFAULT_PREVIEW_APPEARANCE,
@@ -813,6 +813,42 @@ export const BackgroundActivitySettings = Schema.Struct({
 }).pipe(Schema.withDecodingDefault(Effect.succeed({})));
 export type BackgroundActivitySettings = typeof BackgroundActivitySettings.Type;
 
+/**
+ * One member of an external IM bridge. The bridge joins one T3 thread per
+ * member per IM workspace; `instanceId`/`model` select the provider those
+ * threads run on, and `id` is the bridge-side member identifier the bridge
+ * matches its IM users against. No secrets live here — credentials stay in
+ * the bridge's own config.
+ */
+export const ImBridgeMemberSettings = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  instanceId: ProviderInstanceId,
+  model: TrimmedNonEmptyString,
+  options: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
+  runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
+  enabled: Schema.optionalKey(Schema.Boolean),
+});
+export type ImBridgeMemberSettings = typeof ImBridgeMemberSettings.Type;
+
+const uniqueImBridgeMemberIdsFilter = Schema.makeFilter(
+  (settings: { readonly members: ReadonlyArray<{ readonly id: string }> }) =>
+    new Set(settings.members.map((member) => member.id)).size === settings.members.length ||
+    "imBridge member ids must be unique.",
+);
+
+/**
+ * IM bridge membership. Members are ordinary T3 threads from this server's
+ * perspective; the external bridge re-reads this section on its reconcile
+ * tick (at most ~60s), so edits do not take effect instantly.
+ */
+export const ImBridgeSettings = Schema.Struct({
+  members: Schema.Array(ImBridgeMemberSettings),
+}).pipe(
+  Schema.withDecodingDefault(Effect.succeed({ members: [] })),
+  Schema.check(uniqueImBridgeMemberIdsFilter),
+);
+export type ImBridgeSettings = typeof ImBridgeSettings.Type;
+
 export const ServerSettings = Schema.Struct({
   // Legacy token-by-token assistant output. Deliberately a fresh key (was
   // `enableAssistantStreaming`): decoding drops the old key, so everyone,
@@ -924,6 +960,7 @@ export const ServerSettings = Schema.Struct({
   providerInstances: Schema.Record(ProviderInstanceId, ProviderInstanceConfig).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
+  imBridge: ImBridgeSettings,
   observability: ObservabilitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // Keyed by a user-chosen id so a source keeps its rows across edits. Entries
   // this build cannot decode round-trip untouched, as provider instances do.
@@ -1083,6 +1120,10 @@ const OpenCodeSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 
+export const ImBridgeSettingsPatch = Schema.Struct({
+  members: Schema.optionalKey(Schema.Array(ImBridgeMemberSettings)),
+});
+
 export const ServerSettingsPatch = Schema.Struct({
   // Server settings
   enableLegacyTokenStreaming: Schema.optionalKey(Schema.Boolean),
@@ -1135,6 +1176,8 @@ export const ServerSettingsPatch = Schema.Struct({
   // patches risk leaving driver-specific config in a half-merged state.
   // The web UI sends a fully-formed map every time it edits this field.
   providerInstances: Schema.optionalKey(Schema.Record(ProviderInstanceId, ProviderInstanceConfig)),
+  // Whole-section replace; the bridge re-reads on its reconcile tick.
+  imBridge: Schema.optionalKey(ImBridgeSettingsPatch),
   // Per-entry, unlike `providerInstances`: a client only ever adds or removes
   // one source, and sending the whole map races another edit that has not
   // echoed back yet. `null` removes; the server merges into its current map.

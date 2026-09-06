@@ -8,6 +8,7 @@ import {
   ClaudeSettings,
   DEFAULT_SERVER_SETTINGS,
   defaultEnabledForDriver,
+  ImBridgeSettings,
   resolveProviderInstanceEnabled,
   ServerSettings,
   ServerSettingsPatch,
@@ -20,6 +21,8 @@ const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
+const decodeImBridgeSettings = Schema.decodeUnknownSync(ImBridgeSettings);
+const encodeImBridgeSettings = Schema.encodeSync(ImBridgeSettings);
 
 describe("ClaudeSettings auto-compaction", () => {
   it("uses Claude's default threshold when no override is configured", () => {
@@ -538,5 +541,76 @@ describe("ServerSettings environment icon", () => {
   it("round-trips through encode", () => {
     const settings = decodeServerSettings({ environmentIcon: "laptop" });
     expect(encodeServerSettings(settings).environmentIcon).toBe("laptop");
+  });
+});
+
+describe("ImBridgeSettings", () => {
+  it("defaults to no members for legacy configs", () => {
+    expect(decodeServerSettings({}).imBridge).toEqual({ members: [] });
+  });
+
+  it("round-trips members, passing options through and defaulting runtimeMode", () => {
+    const decoded = decodeImBridgeSettings({
+      members: [
+        {
+          id: "alice",
+          instanceId: "codex",
+          model: "gpt-5.6-luna",
+          options: { reasoningEffort: "low", nested: { deep: true } },
+        },
+        {
+          id: "bob",
+          instanceId: "claudeAgent",
+          model: "sonnet",
+          runtimeMode: "auto",
+          enabled: false,
+        },
+      ],
+    });
+
+    expect(decoded.members[0]).toEqual({
+      id: "alice",
+      instanceId: "codex",
+      model: "gpt-5.6-luna",
+      options: { reasoningEffort: "low", nested: { deep: true } },
+      runtimeMode: "full-access",
+    });
+    expect(decoded.members[1]?.enabled).toBe(false);
+    expect(encodeImBridgeSettings(decoded)).toEqual(decoded);
+  });
+
+  it("rejects duplicate member ids", () => {
+    expect(() =>
+      decodeImBridgeSettings({
+        members: [
+          { id: "alice", instanceId: "codex", model: "gpt-5.6-luna" },
+          { id: "alice", instanceId: "claudeAgent", model: "sonnet" },
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it("rejects an unsupported runtime mode", () => {
+    expect(() =>
+      decodeImBridgeSettings({
+        members: [{ id: "alice", instanceId: "codex", model: "gpt-5.6-luna", runtimeMode: "yolo" }],
+      }),
+    ).toThrow();
+  });
+
+  it("treats the imBridge patch as an optional whole-section replacement", () => {
+    expect(decodeServerSettingsPatch({}).imBridge).toBeUndefined();
+
+    const patch = decodeServerSettingsPatch({
+      imBridge: { members: [{ id: "alice", instanceId: "codex", model: "gpt-5.6-luna" }] },
+    });
+    expect(patch.imBridge?.members).toEqual([
+      {
+        id: "alice",
+        instanceId: "codex",
+        model: "gpt-5.6-luna",
+        runtimeMode: "full-access",
+      },
+    ]);
   });
 });
