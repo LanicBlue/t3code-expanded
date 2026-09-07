@@ -733,6 +733,51 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
 export type OpenCodeSettings = typeof OpenCodeSettings.Type;
 
 /**
+ * Default path of the ZCode CLI bundled with the ZCode desktop app. The CLI is
+ * a plain node script (`zcode.cjs`), so the driver spawns it through the
+ * server's own node executable rather than executing it directly.
+ */
+export const DEFAULT_ZCODE_BINARY_PATH = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+
+export const ZCodeSettings = makeProviderSettingsSchema(
+  {
+    // Off by default (like Cursor, Grok and OpenCode): a fork-specific driver
+    // that only exists where the ZCode desktop app is installed. Users opt in
+    // from Settings; machines without it surface a "disabled" snapshot rather
+    // than a failed probe on every boot.
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    binaryPath: makeBinaryPathSetting(DEFAULT_ZCODE_BINARY_PATH).pipe(
+      Schema.annotateKey({
+        title: "Binary path",
+        description: "Path to the zcode CLI script (zcode.cjs).",
+        providerSettingsForm: {
+          placeholder: DEFAULT_ZCODE_BINARY_PATH,
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    launchArgs: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Launch arguments",
+        description: "Additional CLI arguments passed to zcode app-server on session start.",
+      }),
+    ),
+    customModels: Schema.Array(Schema.String).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: ["binaryPath", "launchArgs"],
+  },
+);
+export type ZCodeSettings = typeof ZCodeSettings.Type;
+
+/**
  * A read-only quota source outside this environment's provider CLIs. The
  * only kind today is a CLIProxyAPI hub, whose management API reports the
  * windows of every pooled account. The key travels in settings for now, like
@@ -951,6 +996,7 @@ export const ServerSettings = Schema.Struct({
     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     antigravity: AntigravitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+    zcode: ZCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
   // are `ProviderInstanceConfig` envelopes. The driver-specific config blob
@@ -1120,6 +1166,13 @@ const OpenCodeSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 
+const ZCodeSettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  binaryPath: Schema.optionalKey(TrimmedString),
+  launchArgs: Schema.optionalKey(TrimmedString),
+  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+
 export const ImBridgeSettingsPatch = Schema.Struct({
   members: Schema.optionalKey(Schema.Array(ImBridgeMemberSettings)),
 });
@@ -1169,6 +1222,7 @@ export const ServerSettingsPatch = Schema.Struct({
       grok: Schema.optionalKey(GrokSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
       antigravity: Schema.optionalKey(AntigravitySettingsPatch),
+      zcode: Schema.optionalKey(ZCodeSettingsPatch),
     }),
   ),
   // Whole-map replacement for the new instance config. Patching individual
