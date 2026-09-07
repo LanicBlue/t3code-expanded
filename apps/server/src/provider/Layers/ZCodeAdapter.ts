@@ -26,11 +26,13 @@ import {
   ProviderInstanceId,
   type ProviderRuntimeEvent,
   type ZCodeSettings,
+  type ModelSelection,
   RuntimeItemId,
   type ThreadTokenUsageSnapshot,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -67,6 +69,15 @@ import {
 import { resolveZcodeLaunchArgs, zcodeLaunchArgv } from "./zcodeLaunchArgs.ts";
 
 const PROVIDER = ProviderDriverKind.make("zcode");
+
+/**
+ * The "reasoningEffort" select option (built by ZCodeProvider from
+ * `settings.thoughtLevel`) re-stated on the turn's modelSelection — the same
+ * convention Codex uses, so clients render one familiar selector.
+ */
+const readZcodeReasoningLevel = (
+  modelSelection: ModelSelection | null | undefined,
+): string | undefined => getModelSelectionStringOptionValue(modelSelection, "reasoningEffort");
 
 export interface ZCodeAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
@@ -564,7 +575,12 @@ export const makeZcodeAdapter = Effect.fn("makeZcodeAdapter")(function* (
           cwd: input.cwd ?? process.cwd(),
           runtimeMode: input.runtimeMode,
           ...(input.modelSelection?.instanceId === boundInstanceId
-            ? { model: input.modelSelection.model }
+            ? {
+                model: input.modelSelection.model,
+                ...(readZcodeReasoningLevel(input.modelSelection) !== undefined
+                  ? { thoughtLevel: readZcodeReasoningLevel(input.modelSelection) }
+                  : {}),
+              }
             : {}),
           ...(readZcodeResumeCursor(input.resumeCursor)
             ? { resumeCursor: readZcodeResumeCursor(input.resumeCursor) }
@@ -613,12 +629,17 @@ export const makeZcodeAdapter = Effect.fn("makeZcodeAdapter")(function* (
       // Non-image attachments already reach agents through the path lines
       // ProviderService adds to the prompt.
       const session = yield* requireSession(input.threadId);
+      const reasoningLevel =
+        input.modelSelection?.instanceId === boundInstanceId
+          ? readZcodeReasoningLevel(input.modelSelection)
+          : undefined;
       return yield* session.runtime
         .sendTurn({
           ...(input.input !== undefined ? { input: input.input } : {}),
           ...(input.modelSelection?.instanceId === boundInstanceId
             ? { model: input.modelSelection.model }
             : {}),
+          ...(reasoningLevel !== undefined ? { thoughtLevel: reasoningLevel } : {}),
         })
         .pipe(
           Effect.mapError((cause) => mapZcodeRuntimeError(input.threadId, "session/send", cause)),

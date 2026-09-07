@@ -328,6 +328,45 @@ describe("makeZcodeSessionRuntime (scripted client)", () => {
     }),
   );
 
+  it.effect("sendTurn applies the reasoning level via session/setThoughtLevel", () =>
+    Effect.gen(function* () {
+      const { client, calls } = makeScriptedClient({
+        "session/create": ok(createSnapshot("sess_1")),
+        "session/subscribe": ok({}),
+        "session/setThoughtLevel": ok(createSnapshot("sess_1")),
+        "session/send": ok({ accepted: true, sessionId: "sess_1", stateRevision: 2 }),
+      });
+      const runtime = yield* makeRuntime(client);
+      yield* runtime.start();
+
+      yield* runtime.sendTurn({ input: "go", thoughtLevel: "low" });
+
+      const setThoughtLevel = calls.find((call) => call.method === "session/setThoughtLevel");
+      // Probe-verified params shape: {sessionId, thoughtLevel}.
+      expect(setThoughtLevel?.params).toEqual({ sessionId: "sess_1", thoughtLevel: "low" });
+    }),
+  );
+
+  it.effect("sendTurn survives a rejected setThoughtLevel (S4 parity)", () =>
+    Effect.gen(function* () {
+      const { client } = makeScriptedClient({
+        "session/create": ok(createSnapshot("sess_1")),
+        "session/subscribe": ok({}),
+        "session/setThoughtLevel": failWith(-32603, "Unsupported thought level"),
+        "session/send": ok({ accepted: true, sessionId: "sess_1", stateRevision: 2 }),
+      });
+      const runtime = yield* makeRuntime(client);
+      yield* runtime.start();
+
+      const turn = yield* runtime.sendTurn({ input: "go", thoughtLevel: "ultra" });
+
+      // Best-effort: the send itself must still go through.
+      expect(turn.resumeCursor).toEqual({ sessionId: "sess_1" });
+      const session = yield* runtime.getSession;
+      expect(session.status).toBe("running");
+    }),
+  );
+
   it.effect("reverts the running stamp when session/send itself fails (M1)", () =>
     Effect.gen(function* () {
       const { client } = makeScriptedClient({

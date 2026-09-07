@@ -24,7 +24,15 @@ import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as NodeOS from "node:os";
 
-import type { ServerProvider, ServerProviderModel, ZCodeSettings } from "@t3tools/contracts";
+import type {
+  ModelCapabilities,
+  ProviderOptionDescriptor,
+  ServerProvider,
+  ServerProviderModel,
+  ZCodeSettings,
+} from "@t3tools/contracts";
+
+import { createModelCapabilities } from "@t3tools/shared/model";
 
 import {
   AUTH_PROBE_TIMEOUT_MS,
@@ -41,6 +49,7 @@ import {
   zcodeModelRefToSlug,
   type ZcodeModelDescriptor,
   type ZcodeModelRef,
+  type ZcodeThoughtLevelSettings,
 } from "../zcode/ZcodeProtocolClient.ts";
 import { resolveZcodeLaunchArgs, zcodeLaunchArgv } from "./zcodeLaunchArgs.ts";
 
@@ -56,18 +65,51 @@ interface ZcodeAppServerProbeSnapshot {
   readonly models: ReadonlyArray<ServerProviderModel>;
 }
 
+/**
+ * Reasoning-level select descriptor from `settings.thoughtLevel` — the same
+ * surface Codex exposes as "reasoningEffort", so clients render one familiar
+ * selector. Uses the provider-reported catalog (probe: low/high/max) with
+ * `defaultLevel` as the marked default.
+ */
+function zcodeThoughtLevelCapabilities(
+  thoughtLevel: ZcodeThoughtLevelSettings | undefined,
+): ModelCapabilities | null {
+  const levels = (thoughtLevel?.available ?? []).filter((level) => level.value.trim().length > 0);
+  if (levels.length === 0) {
+    return null;
+  }
+  const fallback = thoughtLevel?.defaultLevel ?? thoughtLevel?.current;
+  const hasKnownLevel = levels.some((level) => level.value === (thoughtLevel?.current ?? fallback));
+  const descriptor: ProviderOptionDescriptor = {
+    id: "reasoningEffort",
+    label: "Reasoning",
+    type: "select",
+    options: levels.map((level) => ({
+      id: level.value,
+      label: level.label.trim().length > 0 ? level.label : level.value,
+      ...(fallback !== undefined && level.value === fallback ? { isDefault: true } : {}),
+    })),
+    // currentValue must be one of the options; fall back to the first level
+    // when the session's current value is outside the reported catalog.
+    currentValue: hasKnownLevel ? (thoughtLevel?.current ?? fallback) : levels[0]!.value,
+  };
+  return createModelCapabilities({ optionDescriptors: [descriptor] });
+}
+
 export function zcodeModelCatalogToServerModels(
   available: ReadonlyArray<ZcodeModelDescriptor>,
   current: ZcodeModelRef | undefined,
   customModels: ReadonlyArray<string>,
+  thoughtLevel: ZcodeThoughtLevelSettings | undefined,
 ): ReadonlyArray<ServerProviderModel> {
   const currentSlug = current !== undefined ? zcodeModelRefToSlug(current) : undefined;
+  const capabilities = zcodeThoughtLevelCapabilities(thoughtLevel);
   const models: Array<ServerProviderModel> = available.map((descriptor) => ({
     slug: zcodeModelRefToSlug(descriptor.ref),
     name: descriptor.label,
     isCustom: false,
     ...(currentSlug === zcodeModelRefToSlug(descriptor.ref) ? { isDefault: true } : {}),
-    capabilities: null,
+    capabilities,
   }));
 
   const seen = new Set(models.map((model) => model.slug));
@@ -171,8 +213,9 @@ const probeZcodeAppServer = Effect.fn("probeZcodeAppServer")(function* (input: {
             snapshot.settings.model.available ?? [],
             snapshot.settings.model.current,
             input.customModels,
+            snapshot.settings.thoughtLevel,
           )
-        : zcodeModelCatalogToServerModels([], undefined, input.customModels);
+        : zcodeModelCatalogToServerModels([], undefined, input.customModels, undefined);
     if (snapshot !== undefined) {
       yield* client
         .request("session/close", { sessionId: snapshot.session.sessionId })
@@ -187,7 +230,12 @@ export const makePendingZcodeProvider = (
 ): Effect.Effect<ServerProviderDraft> =>
   Effect.gen(function* () {
     const checkedAt = yield* Effect.map(DateTime.now, DateTime.formatIso);
-    const models = zcodeModelCatalogToServerModels([], undefined, zcodeSettings.customModels);
+    const models = zcodeModelCatalogToServerModels(
+      [],
+      undefined,
+      zcodeSettings.customModels,
+      undefined,
+    );
 
     if (!zcodeSettings.enabled) {
       return buildServerProvider({
@@ -232,7 +280,12 @@ export const checkZcodeProviderStatus = Effect.fn("checkZcodeProviderStatus")(fu
 > {
   const resolvedEnvironment = environment ?? process.env;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
-  const emptyModels = zcodeModelCatalogToServerModels([], undefined, zcodeSettings.customModels);
+  const emptyModels = zcodeModelCatalogToServerModels(
+    [],
+    undefined,
+    zcodeSettings.customModels,
+    undefined,
+  );
 
   if (!zcodeSettings.enabled) {
     return buildServerProvider({

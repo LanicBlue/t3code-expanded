@@ -210,6 +210,17 @@ const ZcodeModelSettingsSchema = Schema.Struct({
 });
 export type ZcodeModelSettings = typeof ZcodeModelSettingsSchema.Type;
 
+/** `settings.thoughtLevel` — probe-verified shape (low/high/max catalog). */
+export const ZcodeThoughtLevelSettingsSchema = Schema.Struct({
+  available: Schema.optional(
+    Schema.Array(Schema.Struct({ label: Schema.String, value: Schema.String })),
+  ),
+  current: Schema.optional(Schema.String),
+  defaultLevel: Schema.optional(Schema.String),
+  enabled: Schema.optional(Schema.Boolean),
+});
+export type ZcodeThoughtLevelSettings = typeof ZcodeThoughtLevelSettingsSchema.Type;
+
 export const ZcodeWorkspaceSchema = Schema.Struct({
   workspacePath: Schema.String,
   workspaceKey: Schema.String,
@@ -219,6 +230,7 @@ export type ZcodeWorkspace = typeof ZcodeWorkspaceSchema.Type;
 const ZcodeSettingsBlockSchema = Schema.Struct({
   model: Schema.optional(ZcodeModelSettingsSchema),
   mode: Schema.optional(Schema.Struct({ current: Schema.String })),
+  thoughtLevel: Schema.optional(ZcodeThoughtLevelSettingsSchema),
 });
 export type ZcodeSettingsBlock = typeof ZcodeSettingsBlockSchema.Type;
 

@@ -203,6 +203,8 @@ export interface ZcodeSessionRuntimeOptions {
   readonly runtimeMode: RuntimeMode;
   /** Composite `<providerId>/<modelId>` slug. */
   readonly model?: string | undefined;
+  /** Reasoning level (low/high/max); applied via `session/setThoughtLevel`. */
+  readonly thoughtLevel?: string | undefined;
   readonly resumeCursor?: ZcodeResumeCursor | undefined;
 }
 
@@ -216,6 +218,8 @@ export interface ZcodeSessionRuntimeSendTurnInput {
   readonly input?: string;
   /** Composite slug; applied via `session/setModel` before the send. */
   readonly model?: string;
+  /** Reasoning level (low/high/max); applied via `session/setThoughtLevel`. */
+  readonly thoughtLevel?: string;
 }
 
 export interface ZcodeSessionRuntimeShape {
@@ -406,6 +410,15 @@ export const makeZcodeSessionRuntime = (
           .request("session/setModel", { sessionId, model: requestedModel })
           .pipe(Effect.catch(() => Effect.void));
       }
+      if (options.thoughtLevel !== undefined) {
+        // Same best-effort policy as the model above.
+        yield* client
+          .request("session/setThoughtLevel", {
+            sessionId,
+            thoughtLevel: options.thoughtLevel,
+          })
+          .pipe(Effect.catch(() => Effect.void));
+      }
 
       yield* emitSessionEvent("session/ready", "ZCode app-server session ready.");
       yield* emitEvent({
@@ -562,6 +575,27 @@ export const makeZcodeSessionRuntime = (
             ),
           );
         }
+      }
+      if (input.thoughtLevel !== undefined && input.thoughtLevel.trim().length > 0) {
+        // Best-effort, same policy as the model: an unknown level must not
+        // fail the send — continue with the session's current level.
+        yield* client
+          .request("session/setThoughtLevel", {
+            sessionId,
+            thoughtLevel: input.thoughtLevel,
+          })
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning(
+                "zcode session/setThoughtLevel failed; sending with the current level",
+                {
+                  sessionId,
+                  thoughtLevel: input.thoughtLevel,
+                  cause: error,
+                },
+              ),
+            ),
+          );
       }
       // `session/send` returns only `{accepted, stateRevision}`; the provider
       // turn id arrives asynchronously on `turn.started`, so we mint the
