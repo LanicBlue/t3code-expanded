@@ -1,6 +1,7 @@
-import { createFileRoute, redirect } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 
 import { ProjectSettingsPage } from "../components/settings/ProjectSettingsPanel";
+import { bounceToPairing } from "../lib/authGateBounce";
 
 export const Route = createFileRoute("/projects/$projectKey")({
   beforeLoad: async ({ context }) => {
@@ -8,7 +9,7 @@ export const Route = createFileRoute("/projects/$projectKey")({
       context.authGateState.status !== "authenticated" &&
       context.authGateState.status !== "hosted-static"
     ) {
-      throw redirect({ to: "/pair", replace: true });
+      bounceToPairing();
     }
   },
   component: () => <ProjectSettingsPage projectKey={Route.useParams().projectKey} />,
