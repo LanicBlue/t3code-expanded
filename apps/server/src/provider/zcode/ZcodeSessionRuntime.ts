@@ -555,49 +555,56 @@ export const makeZcodeSessionRuntime = (
     // ── operations ─────────────────────────────────────────────────────
 
     /**
-     * Refresh the session's runtime-model config from the CURRENT workspace
-     * catalog (`workspace/readState` → `session/updateRuntimeModelConfig`).
-     * Heals sessions whose historical task froze a config that no longer
-     * resolves (-32031). Best-effort: any failure simply surfaces the
-     * original send error.
+     * Re-materialize the provider session: fresh `session/create` + subscribe
+     * + model/thought-level re-application. Heals the -32031 restore gate —
+     * a historical session freezes the runtime-model config it was created
+     * with, and once the catalog rotates (app update, provider revision bump)
+     * resume can no longer restore it. There is no headless RPC that rebuilds
+     * that envelope (`workspace/readState` strips provider credentials, so
+     * `session/updateRuntimeModelConfig` cannot be fed), and `session/fork`
+     * inherits the frozen config. A fresh session is the sanctioned recovery:
+     * the stale transcript stays in the zcode store and T3's own thread
+     * history is untouched — only the in-session context resets.
      */
-    const healRuntimeModelConfig = (sessionId: string, requestedModel: string | undefined) =>
-      Effect.gen(function* () {
-        const modelRef =
-          requestedModel !== undefined ? zcodeSlugToModelRef(requestedModel) : undefined;
-        if (modelRef === undefined) return;
-        const state = yield* client.request("workspace/readState", {
-          workspace: { workspacePath: options.cwd, workspaceKey: options.cwd },
-        });
-        const catalog = (
-          state as {
-            readonly modelCatalog?: {
-              readonly revision?: unknown;
-              readonly providers?: unknown;
-            };
-          }
-        ).modelCatalog;
-        const providers = Array.isArray(catalog?.providers)
-          ? (catalog.providers as ReadonlyArray<unknown>)
-          : [];
-        const provider = providers.find(
-          (candidate) =>
-            typeof candidate === "object" &&
-            candidate !== null &&
-            (candidate as { readonly providerId?: unknown }).providerId === modelRef.providerId,
-        );
-        const revision = typeof catalog?.revision === "string" ? catalog.revision : undefined;
-        if (provider === undefined || revision === undefined) return;
-        yield* client.request("session/updateRuntimeModelConfig", {
-          sessionId,
-          runtimeModel: {
-            revision,
-            generatedAt: DateTime.formatIso(yield* DateTime.now),
-            model: modelRef,
-            provider,
-          },
-        });
+    const rematerializeSession = Effect.fn("ZcodeSessionRuntime.rematerializeSession")(function* (
+      requestedModel: string | undefined,
+      thoughtLevel: string | undefined,
+    ) {
+      const modelRef =
+        requestedModel !== undefined ? zcodeSlugToModelRef(requestedModel) : undefined;
+      const created = yield* client.request("session/create", {
+        workspace: { workspacePath: options.cwd, workspaceKey: options.cwd },
+        mode: runtimeModeToZcodeMode(options.runtimeMode),
       });
+      const snapshot = readZcodeSessionSnapshot(created);
+      if (snapshot === undefined) {
+        return yield* new ZcodeUnexpectedPayloadError({ method: "session/create" });
+      }
+      const freshId = snapshot.session.sessionId;
+      yield* applySnapshot(snapshot);
+      yield* client.request("session/subscribe", {
+        sessionId: freshId,
+        deliveryKind: "desktop-continuous",
+      });
+      if (modelRef !== undefined) {
+        // Best-effort, same policy as start(): must not fail the recovery.
+        yield* client
+          .request("session/setModel", { sessionId: freshId, model: modelRef })
+          .pipe(Effect.catch(() => Effect.void));
+      }
+      if (thoughtLevel !== undefined && thoughtLevel.trim().length > 0) {
+        yield* client
+          .request("session/setThoughtLevel", { sessionId: freshId, thoughtLevel })
+          .pipe(Effect.catch(() => Effect.void));
+      }
+      yield* emitEvent({
+        kind: "session",
+        threadId: options.threadId,
+        method: "session/started",
+        payload: { sessionId: freshId, resumed: false },
+      });
+      return freshId;
+    });
 
     const sendTurn = Effect.fn("ZcodeSessionRuntime.sendTurn")(function* (
       input: ZcodeSessionRuntimeSendTurnInput,
@@ -658,20 +665,33 @@ export const makeZcodeSessionRuntime = (
         ...(appliedModel ? { model: appliedModel } : {}),
       });
       const sendTurnRequest = () =>
-        client.request("session/send", {
-          sessionId,
-          ...(input.input !== undefined ? { content: input.input } : {}),
-        });
+        // Re-read the session id per attempt: the -32031 recovery below swaps
+        // in a fresh session, and the retry must target it.
+        Effect.flatMap(requireProviderSessionId, (sessionId) =>
+          client.request("session/send", {
+            sessionId,
+            ...(input.input !== undefined ? { content: input.input } : {}),
+          }),
+        );
       yield* sendTurnRequest().pipe(
         // A historical task freezes the runtime-model config it was created
-        // with; after the workspace catalog rotates (provider revision bumps,
-        // old models drop), restore refuses to continue until the config is
-        // refreshed — reported as -32031 on the send. Bare session/setModel
-        // cannot clear it; refreshing the runtime-model config envelope from
-        // the CURRENT catalog (the desktop picker's recovery) does. Heal once,
-        // retry the send once; any failure keeps the original error.
+        // with; after the workspace catalog rotates, restore refuses to
+        // continue and every send reports -32031. Neither session/setModel
+        // nor session/fork clears it, and the runtime-model envelope cannot
+        // be rebuilt headless — so re-materialize the session (history stays
+        // in the zcode store; the turn replays on the fresh session) and
+        // retry once. Any failure keeps the original error.
         Effect.catchIf(isZcodeModelUnavailableError, (error) =>
-          healRuntimeModelConfig(sessionId, input.model).pipe(
+          rematerializeSession(input.model, input.thoughtLevel).pipe(
+            // applySnapshot reset the running stamp; re-stamp the canonical
+            // turn id so turn.started folds onto it (see B1-regression).
+            Effect.tap(() =>
+              updateSession({
+                status: "running",
+                activeTurnId: turnId,
+                ...(appliedModel ? { model: appliedModel } : {}),
+              }),
+            ),
             Effect.andThen(sendTurnRequest()),
             Effect.catch(() => Effect.fail(error)),
           ),

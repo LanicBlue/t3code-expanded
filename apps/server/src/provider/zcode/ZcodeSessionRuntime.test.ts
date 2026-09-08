@@ -168,32 +168,20 @@ describe("makeZcodeSessionRuntime (scripted client)", () => {
   );
 
   it.effect(
-    "heals a stale historical model config (-32031) by refreshing the runtime-model envelope, then retries the send",
+    "recovers from a stale historical model config (-32031) by re-materializing the session, then retries the send",
     () =>
       Effect.gen(function* () {
         let sendAttempts = 0;
+        let createAttempts = 0;
         const { client, calls } = makeScriptedClient({
-          "session/create": ok(createSnapshot("sess_1")),
+          "session/create": () =>
+            Effect.gen(function* () {
+              createAttempts += 1;
+              return createSnapshot(createAttempts === 1 ? "sess_1" : "sess_2");
+            }),
           "session/subscribe": ok({}),
           "session/setModel": ok({}),
           "session/setThoughtLevel": ok({}),
-          "workspace/readState": ok({
-            modelCatalog: {
-              revision: "catalog-rev-2",
-              providers: [
-                {
-                  providerId: "builtin:bigmodel-coding-plan",
-                  kind: "builtin",
-                  models: [{ modelId: "GLM-5.3" }],
-                },
-              ],
-            },
-          }),
-          "session/updateRuntimeModelConfig": ok({
-            sessionId: "sess_1",
-            appliedModelRuntimeRevision: "catalog-rev-2",
-            changed: true,
-          }),
           "session/send": () =>
             Effect.gen(function* () {
               sendAttempts += 1;
@@ -205,7 +193,7 @@ describe("makeZcodeSessionRuntime (scripted client)", () => {
                     "历史任务使用的模型已不可用，请从当前模型列表中选择一个可用模型后继续。",
                 });
               }
-              return { accepted: true, sessionId: "sess_1", stateRevision: 3 };
+              return { accepted: true, sessionId: "sess_2", stateRevision: 3 };
             }),
         });
         const runtime = yield* makeRuntime(client);
@@ -217,32 +205,39 @@ describe("makeZcodeSessionRuntime (scripted client)", () => {
         });
 
         expect(sendAttempts).toBe(2);
+        expect(createAttempts).toBe(2);
         const methods = calls.map((call) => call.method);
-        const readStateAt = methods.indexOf("workspace/readState");
-        const updateAt = methods.indexOf("session/updateRuntimeModelConfig");
+        const secondCreateAt = methods.indexOf(
+          "session/create",
+          methods.indexOf("session/create") + 1,
+        );
+        const subscribeCalls = calls.filter((call) => call.method === "session/subscribe");
         const lastSendAt = methods.lastIndexOf("session/send");
-        expect(readStateAt).toBeGreaterThan(-1);
-        expect(updateAt).toBeGreaterThan(readStateAt);
-        expect(lastSendAt).toBeGreaterThan(updateAt);
-        expect(calls[updateAt]?.params).toMatchObject({
-          sessionId: "sess_1",
-          runtimeModel: {
-            revision: "catalog-rev-2",
-            model: { providerId: "builtin:bigmodel-coding-plan", modelId: "GLM-5.3" },
-          },
-        });
+        expect(secondCreateAt).toBeGreaterThan(-1);
+        expect(subscribeCalls.at(-1)?.params).toMatchObject({ sessionId: "sess_2" });
+        expect(lastSendAt).toBeGreaterThan(secondCreateAt);
+        expect(calls[lastSendAt]?.params).toMatchObject({ sessionId: "sess_2" });
         expect(turn.turnId).toBeDefined();
         expect((yield* runtime.getSession).status).toBe("running");
       }),
   );
 
-  it.effect("keeps the original -32031 error when the heal cannot build an envelope", () =>
+  it.effect("keeps the original -32031 error when re-materialization fails", () =>
     Effect.gen(function* () {
+      let createAttempts = 0;
       const { client } = makeScriptedClient({
-        "session/create": ok(createSnapshot("sess_1")),
+        "session/create": () =>
+          Effect.gen(function* () {
+            createAttempts += 1;
+            if (createAttempts === 1) return createSnapshot("sess_1");
+            return yield* new ZcodeProtocolRequestError({
+              method: "session/create",
+              code: -32603,
+              protocolMessage: "spawn failed",
+            });
+          }),
         "session/subscribe": ok({}),
         "session/setModel": ok({}),
-        "workspace/readState": ok({ modelCatalog: {} }),
         "session/send": () =>
           new ZcodeProtocolRequestError({
             method: "session/send",
