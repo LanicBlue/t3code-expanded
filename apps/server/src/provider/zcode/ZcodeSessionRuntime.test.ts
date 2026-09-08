@@ -12,6 +12,7 @@ import {
 } from "./ZcodeSessionRuntime.ts";
 import {
   ZcodeProtocolRequestError,
+  isZcodeModelUnavailableError,
   type ZcodeProtocolClientShape,
   type ZcodeProtocolNotification,
 } from "./ZcodeProtocolClient.ts";
@@ -163,6 +164,100 @@ describe("makeZcodeSessionRuntime (scripted client)", () => {
       const events = yield* collectEvents(runtime, START_EVENT_COUNT + 1);
       expect(events[START_EVENT_COUNT]?.method).toBe("turn.failed");
       expect(events[START_EVENT_COUNT]?.turnId).toBe(turn.turnId);
+    }),
+  );
+
+  it.effect(
+    "heals a stale historical model config (-32031) by refreshing the runtime-model envelope, then retries the send",
+    () =>
+      Effect.gen(function* () {
+        let sendAttempts = 0;
+        const { client, calls } = makeScriptedClient({
+          "session/create": ok(createSnapshot("sess_1")),
+          "session/subscribe": ok({}),
+          "session/setModel": ok({}),
+          "session/setThoughtLevel": ok({}),
+          "workspace/readState": ok({
+            modelCatalog: {
+              revision: "catalog-rev-2",
+              providers: [
+                {
+                  providerId: "builtin:bigmodel-coding-plan",
+                  kind: "builtin",
+                  models: [{ modelId: "GLM-5.3" }],
+                },
+              ],
+            },
+          }),
+          "session/updateRuntimeModelConfig": ok({
+            sessionId: "sess_1",
+            appliedModelRuntimeRevision: "catalog-rev-2",
+            changed: true,
+          }),
+          "session/send": () =>
+            Effect.gen(function* () {
+              sendAttempts += 1;
+              if (sendAttempts === 1) {
+                return yield* new ZcodeProtocolRequestError({
+                  method: "session/send",
+                  code: -32031,
+                  protocolMessage:
+                    "历史任务使用的模型已不可用，请从当前模型列表中选择一个可用模型后继续。",
+                });
+              }
+              return { accepted: true, sessionId: "sess_1", stateRevision: 3 };
+            }),
+        });
+        const runtime = yield* makeRuntime(client);
+
+        yield* runtime.start();
+        const turn = yield* runtime.sendTurn({
+          input: "go",
+          model: "builtin:bigmodel-coding-plan/GLM-5.3",
+        });
+
+        expect(sendAttempts).toBe(2);
+        const methods = calls.map((call) => call.method);
+        const readStateAt = methods.indexOf("workspace/readState");
+        const updateAt = methods.indexOf("session/updateRuntimeModelConfig");
+        const lastSendAt = methods.lastIndexOf("session/send");
+        expect(readStateAt).toBeGreaterThan(-1);
+        expect(updateAt).toBeGreaterThan(readStateAt);
+        expect(lastSendAt).toBeGreaterThan(updateAt);
+        expect(calls[updateAt]?.params).toMatchObject({
+          sessionId: "sess_1",
+          runtimeModel: {
+            revision: "catalog-rev-2",
+            model: { providerId: "builtin:bigmodel-coding-plan", modelId: "GLM-5.3" },
+          },
+        });
+        expect(turn.turnId).toBeDefined();
+        expect((yield* runtime.getSession).status).toBe("running");
+      }),
+  );
+
+  it.effect("keeps the original -32031 error when the heal cannot build an envelope", () =>
+    Effect.gen(function* () {
+      const { client } = makeScriptedClient({
+        "session/create": ok(createSnapshot("sess_1")),
+        "session/subscribe": ok({}),
+        "session/setModel": ok({}),
+        "workspace/readState": ok({ modelCatalog: {} }),
+        "session/send": () =>
+          new ZcodeProtocolRequestError({
+            method: "session/send",
+            code: -32031,
+            protocolMessage: "历史任务使用的模型已不可用",
+          }),
+      });
+      const runtime = yield* makeRuntime(client);
+
+      yield* runtime.start();
+      const failure = yield* runtime
+        .sendTurn({ input: "go", model: "builtin:bigmodel-coding-plan/GLM-5.3" })
+        .pipe(Effect.flip);
+      expect(isZcodeModelUnavailableError(failure)).toBe(true);
+      expect((yield* runtime.getSession).status).not.toBe("running");
     }),
   );
 

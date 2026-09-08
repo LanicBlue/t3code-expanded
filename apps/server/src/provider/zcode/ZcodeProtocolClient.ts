@@ -124,6 +124,26 @@ export function isZcodeSessionNotFoundError(error: unknown): boolean {
   );
 }
 
+/**
+ * `session/send` reports -32031 when the restored historical task's frozen
+ * runtime-model config no longer resolves against the current workspace
+ * catalog (e.g. the plan's model list rotated). Bare `session/setModel`
+ * cannot clear the warning — only refreshing the runtime-model config
+ * envelope (`session/updateRuntimeModelConfig`) restores the session.
+ */
+export const ZCODE_MODEL_UNAVAILABLE_ERROR_CODE = -32031;
+
+export function isZcodeModelUnavailableError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    (error as { readonly _tag?: unknown })._tag === "ZcodeProtocolRequestError" &&
+    "code" in error &&
+    (error as { readonly code?: unknown }).code === ZCODE_MODEL_UNAVAILABLE_ERROR_CODE
+  );
+}
+
 // ── Wire message classification (pure) ─────────────────────────────────
 
 export interface ZcodeProtocolNotification {
