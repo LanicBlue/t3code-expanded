@@ -2430,6 +2430,14 @@ export function ConnectionsSettings() {
   );
   const isLocalBackendRemotelyReachable =
     isLocalBackendNetworkAccessible || tailscaleHttpsEndpoint?.status === "available";
+  // Upstream hides the authorized-clients (session management) section unless
+  // the server binds a non-loopback host, assuming loopback means no remote
+  // clients. Tunneled deployments (frp/SSH) break that assumption — remote
+  // users arrive over loopback TCP — so any authenticated browser session on
+  // a loopback server still gets the section; its own scope checks gate what
+  // the session can read or revoke. Desktop keeps the upstream behavior.
+  const showAuthorizedClients =
+    isLocalBackendRemotelyReachable || currentAuthPolicy === "loopback-browser";
   const defaultDesktopNetworkAdvertisedEndpoint = useMemo(
     () =>
       selectPairingEndpoint(visibleDesktopNetworkAdvertisedEndpoints, defaultAdvertisedEndpointKey),
@@ -3212,7 +3220,7 @@ export function ConnectionsSettings() {
             )}
           </SettingsSection>
 
-          {isLocalBackendRemotelyReachable ? (
+          {showAuthorizedClients ? (
             <SettingsSection
               title="Authorized clients"
               headerAction={
