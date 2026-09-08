@@ -151,6 +151,27 @@ describe("session cookie isolation", () => {
     ).toMatch(/^t3_session_5775_[a-f0-9]{12}$/);
   });
 
+  it("prefers the first X-Forwarded-For hop over the loopback TCP source", () => {
+    const metadata = deriveAuthClientMetadata({
+      request: {
+        headers: {
+          "user-agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+          "x-forwarded-for": "115.229.202.32, 10.0.0.1",
+        },
+        source: {
+          remoteAddress: "::ffff:127.0.0.1",
+        },
+      } as never,
+    });
+
+    expect(metadata).toMatchObject({
+      ipAddress: "115.229.202.32",
+      browser: "Chrome",
+      os: "macOS",
+    });
+  });
+
   it("classifies loopback aliases separately from remotely reachable hosts", () => {
     expect(isRemoteReachableHost(undefined)).toBe(false);
     expect(isRemoteReachableHost("localhost")).toBe(false);

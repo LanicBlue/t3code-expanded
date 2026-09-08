@@ -183,7 +183,13 @@ export function deriveAuthClientMetadata(input: {
   readonly presented?: AuthClientPresentationMetadata;
 }): AuthClientMetadata {
   const userAgent = normalizeNonEmptyString(input.request.headers["user-agent"]);
-  const ipAddress = readRemoteAddressFromSource(input.request.source);
+  // Prefer the first X-Forwarded-For hop: tunneled deployments (frp, SSH)
+  // deliver every client as a loopback TCP source, so request.source would
+  // record the local forwarder instead of the real device. Display metadata
+  // only — it never feeds authorization decisions.
+  const forwardedFor = normalizeNonEmptyString(input.request.headers["x-forwarded-for"]);
+  const forwardedIp = normalizeNonEmptyString(forwardedFor?.split(",")[0]);
+  const ipAddress = forwardedIp ?? readRemoteAddressFromSource(input.request.source);
   const os = input.presented?.os ?? inferOs(userAgent);
   const browser = inferBrowser(userAgent);
   return {
