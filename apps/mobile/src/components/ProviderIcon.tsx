@@ -61,6 +61,19 @@ export function ProviderIcon(props: ProviderIconProps) {
     );
   }
 
+  if (props.provider === "zcode") {
+    return (
+      <Svg width={size} height={size} viewBox="0 0 32 32" fill="none">
+        <Path
+          fill={mono}
+          fillRule="evenodd"
+          clipRule="evenodd"
+          d="M5 4h22v3.6L12.8 24.4H27V28H5v-3.6L24.2 7.6H5V4Z"
+        />
+      </Svg>
+    );
+  }
+
   if (props.provider === "opencode") {
     return (
       <Svg width={size} height={size} viewBox="0 0 32 40" fill="none">
