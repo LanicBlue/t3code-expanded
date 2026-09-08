@@ -96,15 +96,14 @@ function ImBridgeMembersSection() {
   const canAppend = entries.some((entry) => entry.models.length > 0);
 
   return (
-    <SettingsSection
-      {...searchableSetting("im-bridge")}
-      title="IM 成员"
-      description="这些成员由外部 IM 桥以 T3 线程执行，改动在桥的下一个 reconcile tick（≤60s）生效。"
-    >
+    <SettingsSection {...searchableSetting("im-bridge")} title="IM 成员">
       <div
         className={cn("px-3 pb-4 pt-1 sm:px-4", !primarySettingsAvailable && "opacity-50")}
         inert={!primarySettingsAvailable}
       >
+        <p className="px-1 pb-2 text-[12px] text-muted-foreground/80">
+          这些成员由外部 IM 桥以 T3 线程执行，改动在桥的下一个 reconcile tick（≤60s）生效。
+        </p>
         {members.length === 0 ? (
           <p className="py-6 text-center text-[13px] text-muted-foreground/80">
             尚未声明成员——加一行，桥会在每个 IM 工作区 join 该成员。
