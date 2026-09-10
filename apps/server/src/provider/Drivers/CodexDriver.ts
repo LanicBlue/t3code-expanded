@@ -245,8 +245,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       const snapshotForCwd = (cwd: string) =>
         !effectiveConfig.enabled
           ? snapshot.getSnapshot
-          : Effect.all([
-              snapshot.getSnapshot,
+          : Effect.flatMap(snapshot.getSnapshot, (machineSnapshot) =>
               probeCodexSkillsForCwd({
                 binaryPath: effectiveConfig.binaryPath,
                 homePath: effectiveConfig.homePath,
@@ -257,17 +256,22 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
                 Effect.scoped,
                 Effect.timeout("20 seconds"),
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              ),
-            ]).pipe(
-              Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderDriverError({
-                    driver: DRIVER_KIND,
-                    instanceId,
-                    detail: `Failed to probe Codex skills for '${cwd}'`,
-                    cause,
-                  }),
+                Effect.map((skills) => ({ ...machineSnapshot, skills })),
+                // Skills are a per-workspace enrichment, not a health signal:
+                // a deleted workspace directory (stale registry entry, /tmp
+                // cleanup) or a hung probe must not fail the instance — that
+                // used to take the whole provider registry refresh down with
+                // it. Degrade to the machine snapshot without skills.
+                Effect.catch((cause: unknown) =>
+                  Effect.logWarning(
+                    `Codex skills probe failed for '${cwd}' — serving this workspace without Codex skills`,
+                  ).pipe(
+                    Effect.annotateLogs({
+                      reason: cause instanceof Error ? cause.message : String(cause),
+                    }),
+                    Effect.as({ ...machineSnapshot, skills: [] as typeof machineSnapshot.skills }),
+                  ),
+                ),
               ),
             );
 
