@@ -130,7 +130,7 @@ function ImBridgeMembersSection() {
           </p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[840px] text-left text-[13px]">
+            <table className="w-full min-w-[1000px] text-left text-[13px]">
               <thead className="border-b border-border/60 text-[11px] uppercase tracking-[0.08em] text-muted-foreground/70">
                 <tr>
                   <th className="px-2 py-2.5 font-semibold">成员 id / 显示名</th>
@@ -260,7 +260,7 @@ function ImBridgeMemberRow({
         ) : null}
       </td>
       <td className="px-2 py-2.5 align-top">
-        <div className="flex flex-wrap items-center gap-1.5">
+        <div className="flex items-center gap-1.5">
           <ProviderModelPicker
             activeInstanceId={member.instanceId}
             model={member.model}
