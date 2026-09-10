@@ -127,15 +127,13 @@ function ImBridgeMembersSection() {
           </p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1000px] text-left text-[13px]">
+            <table className="w-full text-left text-[13px]">
               <thead className="border-b border-border/60 text-[11px] uppercase tracking-[0.08em] text-muted-foreground/70">
                 <tr>
                   <th className="px-2 py-2.5 font-semibold">成员（名称 · id）</th>
-                  <th className="px-2 py-2.5 font-semibold">实例 / 模型</th>
-                  <th className="px-2 py-2.5 font-semibold">权限</th>
-                  <th className="px-2 py-2.5 font-semibold">人设</th>
-                  <th className="px-2 py-2.5 font-semibold">启用</th>
-                  <th className="w-px px-2 py-2.5" />
+                  <th className="px-2 py-2.5 font-semibold">运行时（实例 / 模型 / 权限）</th>
+                  <th className="w-px px-2 py-2.5 font-semibold">人设</th>
+                  <th className="w-px px-2 py-2.5 font-semibold">启用</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border/60">
@@ -227,10 +225,10 @@ function ImBridgeMemberRow({
   return (
     <tr>
       <td className="px-2 py-2.5 align-top">
-        <div className="flex items-center gap-2">
+        <div className="flex w-full items-center gap-2">
           <DraftInput
             size="sm"
-            className="min-w-28"
+            className="min-w-0 flex-1"
             value={member.displayName ?? ""}
             placeholder="成员名称"
             aria-label={`成员 ${member.displayName ?? member.id} 的名称`}
@@ -239,7 +237,7 @@ function ImBridgeMemberRow({
           {/* The identity key: generated once, immutable, select-to-copy when
               wiring im commands (`im missions <id>`, set-executor …). */}
           <span
-            className="shrink-0 font-mono text-[11px] text-muted-foreground/70"
+            className="shrink-0 font-mono text-[10.5px] text-muted-foreground/70"
             title="成员 id（自动生成，不可改）"
           >
             {member.id}
@@ -290,36 +288,34 @@ function ImBridgeMemberRow({
               }}
             />
           ) : null}
+          <Select
+            value={member.runtimeMode}
+            onValueChange={(value) => {
+              if (!value) return;
+              onPatch({ runtimeMode: value as RuntimeMode });
+            }}
+          >
+            <SelectTrigger
+              size="sm"
+              className="w-fit min-w-28 max-w-36 text-xs"
+              aria-label={`成员 ${member.id} 的权限`}
+            >
+              <SelectValue className="truncate">{runtimeModeLabel}</SelectValue>
+            </SelectTrigger>
+            <SelectPopup alignItemWithTrigger={false}>
+              {RUNTIME_MODE_OPTIONS.map((option) => (
+                <SelectItem key={option.value} hideIndicator value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
         </div>
         {instanceEntry ? null : (
           <p className="pt-1 text-xs text-muted-foreground">
             实例 {member.instanceId} 不存在，保留当前值。
           </p>
         )}
-      </td>
-      <td className="px-2 py-2.5 align-top">
-        <Select
-          value={member.runtimeMode}
-          onValueChange={(value) => {
-            if (!value) return;
-            onPatch({ runtimeMode: value as RuntimeMode });
-          }}
-        >
-          <SelectTrigger
-            size="sm"
-            className="w-full min-w-40"
-            aria-label={`成员 ${member.id} 的权限`}
-          >
-            <SelectValue>{runtimeModeLabel}</SelectValue>
-          </SelectTrigger>
-          <SelectPopup alignItemWithTrigger={false}>
-            {RUNTIME_MODE_OPTIONS.map((option) => (
-              <SelectItem key={option.value} hideIndicator value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectPopup>
-        </Select>
       </td>
       <td className="px-2 py-2.5 align-top">
         <Button
@@ -339,22 +335,21 @@ function ImBridgeMemberRow({
         />
       </td>
       <td className="px-2 py-2.5 align-top">
-        <Checkbox
-          className="mt-1"
-          checked={member.enabled !== false}
-          onCheckedChange={(checked) => onPatch({ enabled: checked === true })}
-          aria-label={`启用成员 ${member.id}`}
-        />
-      </td>
-      <td className="px-2 py-2.5 align-top">
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          aria-label={`删除成员 ${member.id}`}
-          onClick={onRemove}
-        >
-          <Trash2Icon className="size-3.5" />
-        </Button>
+        <div className="flex items-center gap-1">
+          <Checkbox
+            checked={member.enabled !== false}
+            onCheckedChange={(checked) => onPatch({ enabled: checked === true })}
+            aria-label={`启用成员 ${member.id}`}
+          />
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            aria-label={`删除成员 ${member.id}`}
+            onClick={onRemove}
+          >
+            <Trash2Icon className="size-3.5" />
+          </Button>
+        </div>
       </td>
     </tr>
   );
