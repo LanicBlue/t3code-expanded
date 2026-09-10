@@ -102,7 +102,9 @@ function ImBridgeMembersSection() {
         inert={!primarySettingsAvailable}
       >
         <p className="px-1 pb-2 text-[12px] text-muted-foreground/80">
-          这些成员由外部 IM 桥以 T3 线程执行，改动在桥的下一个 reconcile tick（≤60s）生效。
+          这些成员由外部 IM 桥以 T3 线程执行，改动在桥的下一个 reconcile tick（≤60s）生效。桥只 join
+          勾选「启用」的成员：新行默认未启用，改好 id / 实例 / 模型后再勾选，占位 id
+          与中途改名才不会作为成员留在 IM 里。
         </p>
         {members.length === 0 ? (
           <p className="py-6 text-center text-[13px] text-muted-foreground/80">

@@ -49,14 +49,14 @@ const makeMembers = (...ids: string[]): ImBridgeMembers =>
   }));
 
 describe("appendMember", () => {
-  it("targets the first enabled and available instance with its default model", () => {
+  it("targets the first enabled and available instance, disabled until configured", () => {
     expect(appendMember([], [disabledGrok, codex, claude])).toEqual([
       {
         id: "member-1",
         instanceId: "codex",
         model: "gpt-5.6-luna",
         runtimeMode: "full-access",
-        enabled: true,
+        enabled: false,
       },
     ]);
   });

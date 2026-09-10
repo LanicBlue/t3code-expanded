@@ -71,6 +71,10 @@ function nextMemberId(members: ImBridgeMembers): string {
  * back to the first instance with models) and that instance's default model.
  * Returns the list unchanged when no instance reports a model, because a
  * member with an empty model slug cannot be persisted.
+ *
+ * New rows start disabled: the bridge joins only enabled members, so the
+ * placeholder id and any rename while settling on the final id never reach
+ * IM (each would otherwise become a real member there).
  */
 export function appendMember(
   members: ImBridgeMembers,
@@ -89,7 +93,7 @@ export function appendMember(
       instanceId: entry.instanceId,
       model,
       runtimeMode: DEFAULT_RUNTIME_MODE,
-      enabled: true,
+      enabled: false,
     },
   ];
 }
