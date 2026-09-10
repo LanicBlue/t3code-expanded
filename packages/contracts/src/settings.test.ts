@@ -697,6 +697,27 @@ describe("ImBridgeSettings", () => {
     ).toThrow();
   });
 
+  it("round-trips persona and displayName as optional member fields", () => {
+    const decoded = decodeImBridgeSettings({
+      members: [
+        {
+          id: "t3-arch",
+          displayName: "软件架构师",
+          persona: "你是软件架构师……",
+          instanceId: "codex",
+          model: "gpt-5.6-luna",
+        },
+        { id: "t3-plain", instanceId: "codex", model: "gpt-5.6-luna" },
+      ],
+    });
+
+    expect(decoded.members[0]?.displayName).toBe("软件架构师");
+    expect(decoded.members[0]?.persona).toBe("你是软件架构师……");
+    expect("displayName" in (decoded.members[1] ?? {})).toBe(false);
+    expect("persona" in (decoded.members[1] ?? {})).toBe(false);
+    expect(encodeImBridgeSettings(decoded)).toEqual(decoded);
+  });
+
   it("treats the imBridge patch as an optional whole-section replacement", () => {
     expect(decodeServerSettingsPatch({}).imBridge).toBeUndefined();
 

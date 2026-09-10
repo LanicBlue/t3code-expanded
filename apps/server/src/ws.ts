@@ -132,6 +132,7 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
+import { dispatchWithImBridgePersona } from "./imBridgePersona.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -484,12 +485,15 @@ const makeWsRpcLayer = (
       // the client's request caused them.
       const hasClientOrigin =
         clientOrigin.surface !== undefined || clientOrigin.appVersion !== undefined;
+      // IM bridge members' personas (Settings → IM 成员) ride along on every
+      // turn the client starts inside their mission threads.
       const dispatchFromClient: OrchestrationEngine.OrchestrationEngineShape["dispatch"] = (
         command,
+        options,
       ) =>
-        orchestrationEngine.dispatch(
+        dispatchWithImBridgePersona(orchestrationEngine, serverSettings.getSettings)(
           command,
-          hasClientOrigin ? { origin: clientOrigin } : undefined,
+          hasClientOrigin ? { origin: clientOrigin } : options,
         );
       const recordClientCommandAnalytics = (command: OrchestrationCommand) => {
         switch (command.type) {

@@ -902,6 +902,14 @@ export type BackgroundActivitySettings = typeof BackgroundActivitySettings.Type;
  */
 export const ImBridgeMemberSettings = Schema.Struct({
   id: TrimmedNonEmptyString,
+  /** UI-only label (any text); the id stays the IM identity. */
+  displayName: Schema.optionalKey(Schema.String),
+  /**
+   * Persona prompt prepended (server-side) to every turn started on this
+   * member's threads (`im-<id>-ms_*`). Templates imported from the bundled
+   * marketplace land here.
+   */
+  persona: Schema.optionalKey(Schema.String),
   instanceId: ProviderInstanceId,
   model: TrimmedNonEmptyString,
   options: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),

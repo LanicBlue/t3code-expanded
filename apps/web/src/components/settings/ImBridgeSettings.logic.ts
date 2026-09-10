@@ -99,6 +99,25 @@ export function appendMember(
 }
 
 /**
+ * Append a member from a marketplace template: a normal append (default
+ * instance/model, disabled until configured) with the template's name as the
+ * display label and its prompt body as the persona. Returns the list
+ * unchanged when no instance reports a model (same guard as appendMember).
+ */
+export function appendMemberFromTemplate(
+  members: ImBridgeMembers,
+  entries: ReadonlyArray<ImBridgeInstanceEntry>,
+  template: { readonly name: string; readonly prompt: string },
+): ImBridgeMembers {
+  const appended = appendMember(members, entries);
+  if (appended.length === members.length) return members;
+  return patchMember(appended, appended.length - 1, {
+    displayName: template.name,
+    persona: template.prompt,
+  });
+}
+
+/**
  * Replace the member at `index` with the patched fields; out-of-range indexes
  * are a no-op. A patch value of `undefined` clears the key (used to drop a
  * member's `options` when its model changes), so the patched member never

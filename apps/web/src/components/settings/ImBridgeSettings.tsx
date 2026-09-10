@@ -8,8 +8,8 @@
  */
 import { useAtomValue } from "@effect/atom-react";
 import * as Equal from "effect/Equal";
-import { PlusIcon, Trash2Icon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { PlusIcon, ScrollTextIcon, Trash2Icon } from "lucide-react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { RuntimeMode, ServerProvider } from "@t3tools/contracts";
 import type { UnifiedSettings } from "@t3tools/contracts/settings";
 import { useNavigate } from "@tanstack/react-router";
@@ -34,10 +34,20 @@ import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { TraitsPicker } from "../chat/TraitsPicker";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
+import {
+  Dialog,
+  DialogDescription,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from "../ui/dialog";
 import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+import { Textarea } from "../ui/textarea";
 import {
   appendMember,
+  appendMemberFromTemplate,
   type ImBridgeMember,
   type ImBridgeMembers,
   type ImBridgeMemberPatch,
@@ -54,6 +64,13 @@ import {
   SettingsSection,
 } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
+
+// 2.6 MB of bundled template data sits behind this lazy chunk + a lazy fetch.
+const ImBridgeMarketplaceDrawer = lazy(() =>
+  import("./ImBridgeMarketplaceDrawer").then((module) => ({
+    default: module.ImBridgeMarketplaceDrawer,
+  })),
+);
 
 export function ImBridgeSettingsPanel() {
   return (
@@ -94,6 +111,7 @@ function ImBridgeMembersSection() {
   };
 
   const canAppend = entries.some((entry) => entry.models.length > 0);
+  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
 
   return (
     <SettingsSection {...searchableSetting("im-bridge")} title="IM 成员">
@@ -103,8 +121,8 @@ function ImBridgeMembersSection() {
       >
         <p className="px-1 pb-2 text-[12px] text-muted-foreground/80">
           这些成员由外部 IM 桥以 T3 线程执行，改动在桥的下一个 reconcile tick（≤60s）生效。桥只 join
-          勾选「启用」的成员：新行默认未启用，改好 id / 实例 / 模型后再勾选，占位 id
-          与中途改名才不会作为成员留在 IM 里。
+          勾选「启用」的成员：新行（含模板市场导入）默认未启用，改好 id / 实例 / 模型后再勾选，占位
+          id 与中途改名才不会作为成员留在 IM 里。人设由 T3 服务端注入该成员线程的每一轮，不经桥。
         </p>
         {members.length === 0 ? (
           <p className="py-6 text-center text-[13px] text-muted-foreground/80">
@@ -112,12 +130,13 @@ function ImBridgeMembersSection() {
           </p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[680px] text-left text-[13px]">
+            <table className="w-full min-w-[760px] text-left text-[13px]">
               <thead className="border-b border-border/60 text-[11px] uppercase tracking-[0.08em] text-muted-foreground/70">
                 <tr>
-                  <th className="px-2 py-2.5 font-semibold">成员 id</th>
+                  <th className="px-2 py-2.5 font-semibold">成员 id / 显示名</th>
                   <th className="px-2 py-2.5 font-semibold">实例 / 模型</th>
                   <th className="px-2 py-2.5 font-semibold">权限</th>
+                  <th className="px-2 py-2.5 font-semibold">人设</th>
                   <th className="px-2 py-2.5 font-semibold">启用</th>
                   <th className="w-px px-2 py-2.5" />
                 </tr>
@@ -140,19 +159,39 @@ function ImBridgeMembersSection() {
           </div>
         )}
         <div className="flex items-center justify-between gap-4 pt-3">
-          <Button
-            size="xs"
-            variant="outline"
-            disabled={!canAppend}
-            onClick={() => commitMembers(appendMember(members, entries))}
-          >
-            <PlusIcon className="size-3" aria-hidden />
-            加成员
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={!canAppend}
+              onClick={() => commitMembers(appendMember(members, entries))}
+            >
+              <PlusIcon className="size-3" aria-hidden />
+              加成员
+            </Button>
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={!canAppend}
+              onClick={() => setMarketplaceOpen(true)}
+            >
+              <ScrollTextIcon className="size-3" aria-hidden />
+              从模板市场加
+            </Button>
+          </div>
           {!primarySettingsAvailable ? (
             <p className="text-xs text-muted-foreground">{PRIMARY_SETTINGS_UNAVAILABLE_MESSAGE}</p>
           ) : null}
         </div>
+        <Suspense fallback={null}>
+          <ImBridgeMarketplaceDrawer
+            open={marketplaceOpen}
+            onOpenChange={setMarketplaceOpen}
+            onImport={(template) =>
+              commitMembers(appendMemberFromTemplate(members, entries, template))
+            }
+          />
+        </Suspense>
       </div>
     </SettingsSection>
   );
@@ -177,6 +216,7 @@ function ImBridgeMemberRow({
 }) {
   const navigate = useNavigate();
   const environmentId = usePrimaryEnvironmentId();
+  const [personaOpen, setPersonaOpen] = useState(false);
   const instanceEntry = entries.find((entry) => entry.instanceId === member.instanceId) ?? null;
   // Built exactly like the composer's picker input, so a member's row offers
   // the same instance rail + searchable model combobox, custom models
@@ -203,6 +243,14 @@ function ImBridgeMemberRow({
             if (id.length === 0) return;
             onPatch({ id });
           }}
+        />
+        <DraftInput
+          size="sm"
+          className="mt-1 text-muted-foreground"
+          value={member.displayName ?? ""}
+          placeholder="显示名（可选）"
+          aria-label={`成员 ${member.id} 的显示名`}
+          onCommit={(next) => onPatch({ displayName: next.trim() || undefined })}
         />
         {duplicateId ? (
           <p className="pt-1 text-xs text-destructive">id 与其他成员重复，修复后才会保存。</p>
@@ -284,6 +332,23 @@ function ImBridgeMemberRow({
         </Select>
       </td>
       <td className="px-2 py-2.5 align-top">
+        <Button
+          size="xs"
+          variant="outline"
+          aria-label={`编辑成员 ${member.id} 的人设`}
+          onClick={() => setPersonaOpen(true)}
+        >
+          <ScrollTextIcon className="size-3" aria-hidden />
+          {member.persona ? "已设" : "未设"}
+        </Button>
+        <PersonaDialog
+          member={member}
+          open={personaOpen}
+          onOpenChange={setPersonaOpen}
+          onPatch={onPatch}
+        />
+      </td>
+      <td className="px-2 py-2.5 align-top">
         <Checkbox
           className="mt-1"
           checked={member.enabled !== false}
@@ -302,5 +367,65 @@ function ImBridgeMemberRow({
         </Button>
       </td>
     </tr>
+  );
+}
+
+/**
+ * Edit one member's persona — the prompt T3's server prepends to every turn
+ * on that member's threads. Saving an empty box clears the field (patch
+ * `undefined` drops the key); the textarea seeds from the persisted value on
+ * each open so a canceled edit never half-applies.
+ */
+function PersonaDialog({
+  member,
+  open,
+  onOpenChange,
+  onPatch,
+}: {
+  readonly member: ImBridgeMember;
+  readonly open: boolean;
+  readonly onOpenChange: (open: boolean) => void;
+  readonly onPatch: (patch: ImBridgeMemberPatch) => void;
+}) {
+  const [text, setText] = useState("");
+  useEffect(() => {
+    if (open) setText(member.persona ?? "");
+  }, [open, member.persona]);
+
+  const commit = () => {
+    const trimmed = text.trim();
+    onPatch({ persona: trimmed.length > 0 ? text : undefined });
+    onOpenChange(false);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogPopup className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>成员 {member.displayName ?? member.id} 的人设</DialogTitle>
+          <DialogDescription>
+            由 T3 服务端注入该成员线程（im-{member.id}
+            -ms_*）的每一轮消息开头，不经桥；模板市场导入的人设也存这里。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogPanel>
+          <Textarea
+            className="min-h-56 font-mono text-xs leading-relaxed"
+            placeholder="你是……（留空保存即清除人设）"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            aria-label={`成员 ${member.id} 的人设文本`}
+          />
+          <div className="flex justify-end gap-2 pt-3">
+            <Button size="xs" variant="ghost" onClick={() => onOpenChange(false)}>
+              取消
+            </Button>
+            <Button size="xs" onClick={commit}>
+              保存
+            </Button>
+          </div>
+        </DialogPanel>
+      </DialogPopup>
+    </Dialog>
   );
 }

@@ -2,6 +2,7 @@ import { ProviderInstanceId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
   appendMember,
+  appendMemberFromTemplate,
   type ImBridgeInstanceEntry,
   type ImBridgeMember,
   type ImBridgeMembers,
@@ -72,6 +73,32 @@ describe("appendMember", () => {
     const modelless = makeEntry({ instanceId: ProviderInstanceId.make("empty") });
     expect(appendMember([], [modelless])).toEqual([]);
     expect(appendMember([], [])).toEqual([]);
+  });
+});
+
+describe("appendMemberFromTemplate", () => {
+  it("prefills displayName and persona on a disabled row with default instance/model", () => {
+    expect(
+      appendMemberFromTemplate([], [disabledGrok, codex], {
+        name: "软件架构师",
+        prompt: "你是软件架构师……",
+      }),
+    ).toEqual([
+      {
+        id: "member-1",
+        displayName: "软件架构师",
+        persona: "你是软件架构师……",
+        instanceId: "codex",
+        model: "gpt-5.6-luna",
+        runtimeMode: "full-access",
+        enabled: false,
+      },
+    ]);
+  });
+
+  it("passes through unchanged when no instance reports a model", () => {
+    const members = makeMembers("member-1");
+    expect(appendMemberFromTemplate(members, [], { name: "x", prompt: "y" })).toBe(members);
   });
 });
 
