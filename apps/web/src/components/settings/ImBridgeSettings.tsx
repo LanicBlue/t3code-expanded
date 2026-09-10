@@ -130,7 +130,7 @@ function ImBridgeMembersSection() {
           </p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[760px] text-left text-[13px]">
+            <table className="w-full min-w-[840px] text-left text-[13px]">
               <thead className="border-b border-border/60 text-[11px] uppercase tracking-[0.08em] text-muted-foreground/70">
                 <tr>
                   <th className="px-2 py-2.5 font-semibold">成员 id / 显示名</th>
@@ -233,25 +233,28 @@ function ImBridgeMemberRow({
   return (
     <tr>
       <td className="px-2 py-2.5 align-top">
-        <DraftInput
-          size="sm"
-          value={member.id}
-          aria-label={`成员 ${member.id} 的 id`}
-          aria-invalid={duplicateId || undefined}
-          onCommit={(next) => {
-            const id = next.trim();
-            if (id.length === 0) return;
-            onPatch({ id });
-          }}
-        />
-        <DraftInput
-          size="sm"
-          className="mt-1 text-muted-foreground"
-          value={member.displayName ?? ""}
-          placeholder="显示名（可选）"
-          aria-label={`成员 ${member.id} 的显示名`}
-          onCommit={(next) => onPatch({ displayName: next.trim() || undefined })}
-        />
+        <div className="flex items-center gap-1.5">
+          <DraftInput
+            size="sm"
+            className="min-w-24"
+            value={member.id}
+            aria-label={`成员 ${member.id} 的 id`}
+            aria-invalid={duplicateId || undefined}
+            onCommit={(next) => {
+              const id = next.trim();
+              if (id.length === 0) return;
+              onPatch({ id });
+            }}
+          />
+          <DraftInput
+            size="sm"
+            className="min-w-24 text-muted-foreground"
+            value={member.displayName ?? ""}
+            placeholder="显示名"
+            aria-label={`成员 ${member.id} 的显示名`}
+            onCommit={(next) => onPatch({ displayName: next.trim() || undefined })}
+          />
+        </div>
         {duplicateId ? (
           <p className="pt-1 text-xs text-destructive">id 与其他成员重复，修复后才会保存。</p>
         ) : null}
