@@ -51,7 +51,6 @@ import {
   type ImBridgeMember,
   type ImBridgeMembers,
   type ImBridgeMemberPatch,
-  memberIdsDuplicate,
   memberOptionSelections,
   memberOptionsFromSelections,
   patchMember,
@@ -91,10 +90,8 @@ function ImBridgeMembersSection() {
     applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings),
   );
 
-  // The roster commits as one whole array. While a row's id collides with
-  // another, the edit is kept as a local draft and the write is withheld, so
-  // the server's unique-id check never sees an invalid roster. The draft
-  // clears once the persisted roster catches up with a committed write.
+  // The roster commits as one whole array; the draft clears once the
+  // persisted roster catches up with a committed write.
   const persistedMembers = imBridge.members;
   const [draftMembers, setDraftMembers] = useState<ImBridgeMembers | null>(null);
   const members = draftMembers ?? persistedMembers;
@@ -106,7 +103,6 @@ function ImBridgeMembersSection() {
 
   const commitMembers = (next: ImBridgeMembers) => {
     setDraftMembers(next);
-    if (next.some((_, index) => memberIdsDuplicate(next, index))) return;
     updateSettings({ imBridge: { members: next } });
   };
 
@@ -120,9 +116,10 @@ function ImBridgeMembersSection() {
         inert={!primarySettingsAvailable}
       >
         <p className="px-1 pb-2 text-[12px] text-muted-foreground/80">
-          这些成员由外部 IM 桥以 T3 线程执行，改动在桥的下一个 reconcile tick（≤60s）生效。桥只 join
-          勾选「启用」的成员：新行（含模板市场导入）默认未启用，改好 id / 实例 / 模型后再勾选，占位
-          id 与中途改名才不会作为成员留在 IM 里。人设由 T3 服务端注入该成员线程的每一轮，不经桥。
+          这些成员由外部 IM 桥以 T3 线程执行，改动在桥的下一个 reconcile tick（≤60s）生效。id
+          自动生成、不可改；名称随便改。桥只 join
+          勾选「启用」的成员：新行（含模板市场导入）默认未启用，起好名、选好实例 /
+          模型后再勾选。人设由 T3 服务端注入该成员线程的每一轮，不经桥。
         </p>
         {members.length === 0 ? (
           <p className="py-6 text-center text-[13px] text-muted-foreground/80">
@@ -133,7 +130,7 @@ function ImBridgeMembersSection() {
             <table className="w-full min-w-[1000px] text-left text-[13px]">
               <thead className="border-b border-border/60 text-[11px] uppercase tracking-[0.08em] text-muted-foreground/70">
                 <tr>
-                  <th className="px-2 py-2.5 font-semibold">成员 id / 显示名</th>
+                  <th className="px-2 py-2.5 font-semibold">成员（名称 · id）</th>
                   <th className="px-2 py-2.5 font-semibold">实例 / 模型</th>
                   <th className="px-2 py-2.5 font-semibold">权限</th>
                   <th className="px-2 py-2.5 font-semibold">人设</th>
@@ -149,7 +146,6 @@ function ImBridgeMembersSection() {
                     entries={entries}
                     settings={settings}
                     providers={providers}
-                    duplicateId={memberIdsDuplicate(members, index)}
                     onPatch={(patch) => commitMembers(patchMember(members, index, patch))}
                     onRemove={() => commitMembers(removeMember(members, index))}
                   />
@@ -202,7 +198,6 @@ function ImBridgeMemberRow({
   entries,
   settings,
   providers,
-  duplicateId,
   onPatch,
   onRemove,
 }: {
@@ -210,7 +205,6 @@ function ImBridgeMemberRow({
   readonly entries: ReadonlyArray<ProviderInstanceEntry>;
   readonly settings: UnifiedSettings;
   readonly providers: ReadonlyArray<ServerProvider>;
-  readonly duplicateId: boolean;
   readonly onPatch: (patch: ImBridgeMemberPatch) => void;
   readonly onRemove: () => void;
 }) {
@@ -233,31 +227,24 @@ function ImBridgeMemberRow({
   return (
     <tr>
       <td className="px-2 py-2.5 align-top">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-2">
           <DraftInput
             size="sm"
-            className="min-w-24"
-            value={member.id}
-            aria-label={`成员 ${member.id} 的 id`}
-            aria-invalid={duplicateId || undefined}
-            onCommit={(next) => {
-              const id = next.trim();
-              if (id.length === 0) return;
-              onPatch({ id });
-            }}
-          />
-          <DraftInput
-            size="sm"
-            className="min-w-24 text-muted-foreground"
+            className="min-w-28"
             value={member.displayName ?? ""}
-            placeholder="显示名"
-            aria-label={`成员 ${member.id} 的显示名`}
+            placeholder="成员名称"
+            aria-label={`成员 ${member.displayName ?? member.id} 的名称`}
             onCommit={(next) => onPatch({ displayName: next.trim() || undefined })}
           />
+          {/* The identity key: generated once, immutable, select-to-copy when
+              wiring im commands (`im missions <id>`, set-executor …). */}
+          <span
+            className="shrink-0 font-mono text-[11px] text-muted-foreground/70"
+            title="成员 id（自动生成，不可改）"
+          >
+            {member.id}
+          </span>
         </div>
-        {duplicateId ? (
-          <p className="pt-1 text-xs text-destructive">id 与其他成员重复，修复后才会保存。</p>
-        ) : null}
       </td>
       <td className="px-2 py-2.5 align-top">
         <div className="flex items-center gap-1.5">

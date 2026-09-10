@@ -59,12 +59,20 @@ function defaultModelFor(entry: ImBridgeInstanceEntry | undefined): string {
   return entry.models.find((model) => model.isDefault)?.slug ?? entry.models[0]?.slug ?? "";
 }
 
-function nextMemberId(members: ImBridgeMembers): string {
-  const taken = new Set(members.map((member) => member.id));
-  let candidate = members.length + 1;
-  while (taken.has(`member-${candidate}`)) candidate += 1;
-  return `member-${candidate}`;
+/**
+ * Generate a fresh member id — an opaque, filename-safe machine key
+ * (`m-<8 hex>`, the shape im and the bridge's thread ids require). Ids are
+ * never hand-edited: the user surface is `displayName`, so a member's IM
+ * identity is born once and never renamed.
+ */
+export function newMemberId(generate: () => string = randomHex8): string {
+  return `m-${generate()}`;
 }
+
+const randomHex8 = () => {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
 
 /**
  * Append a member targeting the first enabled+available instance (falling
@@ -72,13 +80,13 @@ function nextMemberId(members: ImBridgeMembers): string {
  * Returns the list unchanged when no instance reports a model, because a
  * member with an empty model slug cannot be persisted.
  *
- * New rows start disabled: the bridge joins only enabled members, so the
- * placeholder id and any rename while settling on the final id never reach
- * IM (each would otherwise become a real member there).
+ * The row starts disabled with a generated id and an empty name: the bridge
+ * joins only enabled members, so drafts never reach IM.
  */
 export function appendMember(
   members: ImBridgeMembers,
   entries: ReadonlyArray<ImBridgeInstanceEntry>,
+  options: { readonly idGenerator?: () => string } = {},
 ): ImBridgeMembers {
   const entry =
     entries.find(
@@ -86,10 +94,13 @@ export function appendMember(
     ) ?? entries.find((candidate) => candidate.models.length > 0);
   const model = defaultModelFor(entry);
   if (!entry || model.length === 0) return members;
+  const taken = new Set(members.map((member) => member.id));
+  let id = newMemberId(options.idGenerator);
+  while (taken.has(id)) id = newMemberId(options.idGenerator);
   return [
     ...members,
     {
-      id: nextMemberId(members),
+      id,
       instanceId: entry.instanceId,
       model,
       runtimeMode: DEFAULT_RUNTIME_MODE,
@@ -147,13 +158,6 @@ export function patchMember(
 export function removeMember(members: ImBridgeMembers, index: number): ImBridgeMembers {
   if (index < 0 || index >= members.length) return members;
   return members.filter((_, position) => position !== index);
-}
-
-/** Whether the member at `index` shares its id with another member. */
-export function memberIdsDuplicate(members: ImBridgeMembers, index: number): boolean {
-  const member = members[index];
-  if (member === undefined) return false;
-  return members.some((candidate, position) => position !== index && candidate.id === member.id);
 }
 
 /**

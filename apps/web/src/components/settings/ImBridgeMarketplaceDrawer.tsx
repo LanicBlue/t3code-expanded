@@ -118,8 +118,8 @@ export function ImBridgeMarketplaceDrawer({
           <DialogDescription>
             内置的 agent 人设模板快照（{data ? `${data.agents.length} 个 · ` : ""}
             {data?.source.repo ?? "jnMetaCode/agency-agents-zh"} ·
-            MIT）。「导入」会新增一个未启用的成员行：人设进成员配置，显示名取模板名，id
-            与实例等你配置后再启用。
+            MIT）。「导入」会新增一个未启用的成员行：人设进成员配置、名称取模板名，id
+            自动生成；选好实例 / 模型后再勾选启用。
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>

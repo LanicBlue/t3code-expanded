@@ -6,9 +6,9 @@ import {
   type ImBridgeInstanceEntry,
   type ImBridgeMember,
   type ImBridgeMembers,
-  memberIdsDuplicate,
   memberOptionSelections,
   memberOptionsFromSelections,
+  newMemberId,
   patchMember,
   removeMember,
 } from "./ImBridgeSettings.logic";
@@ -49,11 +49,21 @@ const makeMembers = (...ids: string[]): ImBridgeMembers =>
     runtimeMode: "full-access" as const,
   }));
 
+describe("newMemberId", () => {
+  it("generates opaque m-<hex> ids that satisfy the bridge's member id shape", () => {
+    const id = newMemberId();
+    expect(id).toMatch(/^m-[0-9a-f]{8}$/);
+    expect(newMemberId()).not.toBe(id);
+  });
+});
+
 describe("appendMember", () => {
   it("targets the first enabled and available instance, disabled until configured", () => {
-    expect(appendMember([], [disabledGrok, codex, claude])).toEqual([
+    expect(
+      appendMember([], [disabledGrok, codex, claude], { idGenerator: () => "aaaaaaaa" }),
+    ).toEqual([
       {
-        id: "member-1",
+        id: "m-aaaaaaaa",
         instanceId: "codex",
         model: "gpt-5.6-luna",
         runtimeMode: "full-access",
@@ -62,11 +72,16 @@ describe("appendMember", () => {
     ]);
   });
 
-  it("falls back to the first instance with models and avoids taken placeholder ids", () => {
-    const members = makeMembers("member-1", "member-2");
-    const appended = appendMember(members, [disabledGrok]);
-    expect(appended).toHaveLength(3);
-    expect(appended[2]).toMatchObject({ id: "member-3", instanceId: "grok", model: "grok-4" });
+  it("falls back to the first instance with models and redraws colliding generated ids", () => {
+    const members = makeMembers("m-taken000");
+    const appended = appendMember(members, [disabledGrok], {
+      idGenerator: (() => {
+        let calls = 0;
+        return () => (calls++ === 0 ? "taken000" : "fresh1111");
+      })(),
+    });
+    expect(appended).toHaveLength(2);
+    expect(appended[1]).toMatchObject({ id: "m-fresh1111", instanceId: "grok", model: "grok-4" });
   });
 
   it("leaves the roster unchanged when no instance reports a model", () => {
@@ -78,26 +93,23 @@ describe("appendMember", () => {
 
 describe("appendMemberFromTemplate", () => {
   it("prefills displayName and persona on a disabled row with default instance/model", () => {
-    expect(
-      appendMemberFromTemplate([], [disabledGrok, codex], {
-        name: "软件架构师",
-        prompt: "你是软件架构师……",
-      }),
-    ).toEqual([
-      {
-        id: "member-1",
-        displayName: "软件架构师",
-        persona: "你是软件架构师……",
-        instanceId: "codex",
-        model: "gpt-5.6-luna",
-        runtimeMode: "full-access",
-        enabled: false,
-      },
-    ]);
+    const [row] = appendMemberFromTemplate([], [disabledGrok, codex], {
+      name: "软件架构师",
+      prompt: "你是软件架构师……",
+    });
+    expect(row?.id).toMatch(/^m-[0-9a-f]{8}$/);
+    expect(row).toMatchObject({
+      displayName: "软件架构师",
+      persona: "你是软件架构师……",
+      instanceId: "codex",
+      model: "gpt-5.6-luna",
+      runtimeMode: "full-access",
+      enabled: false,
+    });
   });
 
   it("passes through unchanged when no instance reports a model", () => {
-    const members = makeMembers("member-1");
+    const members = makeMembers("m-member000");
     expect(appendMemberFromTemplate(members, [], { name: "x", prompt: "y" })).toBe(members);
   });
 });
@@ -147,16 +159,6 @@ describe("removeMember", () => {
     const members = makeMembers("alice", "bob");
     expect(removeMember(members, 0)).toEqual([members[1]]);
     expect(removeMember(members, 5)).toBe(members);
-  });
-});
-
-describe("memberIdsDuplicate", () => {
-  it("flags every row sharing an id and no others", () => {
-    const members = makeMembers("alice", "bob", "alice");
-    expect(memberIdsDuplicate(members, 0)).toBe(true);
-    expect(memberIdsDuplicate(members, 1)).toBe(false);
-    expect(memberIdsDuplicate(members, 2)).toBe(true);
-    expect(memberIdsDuplicate(members, 3)).toBe(false);
   });
 });
 
