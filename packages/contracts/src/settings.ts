@@ -937,6 +937,25 @@ export const ImBridgeSettings = Schema.Struct({
 );
 export type ImBridgeSettings = typeof ImBridgeSettings.Type;
 
+const IM_BRIDGE_MISSION_INFIX = "-ms_";
+
+/**
+ * The bridge member a mission thread id belongs to, or null for any other
+ * thread. Bridge mission threads carry the deterministic shape
+ * `im-<memberId>-ms_<hex>` — mission ids are `ms_` plus hex, so `-ms_` cannot
+ * appear inside a member id — and create-race fallback suffixes
+ * (`im-<member>-<mission>-3`, `-<uuid8>`) keep the same infix. Shared by the
+ * server (persona injection, departure settle) and the web (thread counts in
+ * the member editor) so the id convention has exactly one definition.
+ */
+export function imBridgeMemberIdOfThreadId(threadId: string): string | null {
+  const index = threadId.indexOf(IM_BRIDGE_MISSION_INFIX);
+  if (index <= "im-".length || !threadId.startsWith("im-")) return null;
+  const missionTail = threadId.slice(index + IM_BRIDGE_MISSION_INFIX.length);
+  if (!/^[0-9a-f]{6,64}(-|$)/.test(missionTail)) return null;
+  return threadId.slice("im-".length, index);
+}
+
 export const ServerSettings = Schema.Struct({
   // Legacy token-by-token assistant output. Deliberately a fresh key (was
   // `enableAssistantStreaming`): decoding drops the old key, so everyone,

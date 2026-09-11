@@ -1,8 +1,9 @@
+import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
 import type { OrchestrationCommand } from "@t3tools/contracts";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 import { describe, expect, it } from "vite-plus/test";
 
-import { imBridgeMemberIdOfThread, injectImBridgePersona } from "./imBridgePersona.ts";
+import { injectImBridgePersona } from "./imBridgePersona.ts";
 
 const turnStart = (threadId: string, text = "brief"): OrchestrationCommand =>
   ({
@@ -18,18 +19,20 @@ const turnStart = (threadId: string, text = "brief"): OrchestrationCommand =>
 const settingsWith = (members: Array<{ id: string; persona?: string }>): ServerSettings =>
   ({ imBridge: { members } }) as unknown as ServerSettings;
 
-describe("imBridgeMemberIdOfThread", () => {
+describe("imBridgeMemberIdOfThreadId", () => {
   it("extracts the member id from deterministic and suffixed bridge thread ids", () => {
-    expect(imBridgeMemberIdOfThread("im-t3-glm-ms_aaaabbbbccccdddd")).toBe("t3-glm");
-    expect(imBridgeMemberIdOfThread("im-t3-glm-flash-ms_aaaabbbbccccdddd-3")).toBe("t3-glm-flash");
-    expect(imBridgeMemberIdOfThread("im-t3-codex-ms_1770a068-d41d8c")).toBe("t3-codex");
+    expect(imBridgeMemberIdOfThreadId("im-t3-glm-ms_aaaabbbbccccdddd")).toBe("t3-glm");
+    expect(imBridgeMemberIdOfThreadId("im-t3-glm-flash-ms_aaaabbbbccccdddd-3")).toBe(
+      "t3-glm-flash",
+    );
+    expect(imBridgeMemberIdOfThreadId("im-t3-codex-ms_1770a068-d41d8c")).toBe("t3-codex");
   });
 
   it("rejects non-bridge and malformed ids", () => {
-    expect(imBridgeMemberIdOfThread("chat-thread-1")).toBeNull();
-    expect(imBridgeMemberIdOfThread("im-ms_aaaabbbbccccdddd")).toBeNull(); // empty member id
-    expect(imBridgeMemberIdOfThread("im-t3-glm-ms_xyz")).toBeNull(); // mission not ms_+hex
-    expect(imBridgeMemberIdOfThread("t3-glm-ms_aaaabbbbccccdddd")).toBeNull(); // missing im- prefix
+    expect(imBridgeMemberIdOfThreadId("chat-thread-1")).toBeNull();
+    expect(imBridgeMemberIdOfThreadId("im-ms_aaaabbbbccccdddd")).toBeNull(); // empty member id
+    expect(imBridgeMemberIdOfThreadId("im-t3-glm-ms_xyz")).toBeNull(); // mission not ms_+hex
+    expect(imBridgeMemberIdOfThreadId("t3-glm-ms_aaaabbbbccccdddd")).toBeNull(); // missing im- prefix
   });
 });
 

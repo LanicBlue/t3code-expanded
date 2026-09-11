@@ -15,23 +15,11 @@
  */
 import * as Effect from "effect/Effect";
 import type { OrchestrationCommand, ServerSettingsError } from "@t3tools/contracts";
+import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 
 import type { OrchestrationDispatchError } from "./orchestration/Errors.ts";
 import type { OrchestrationEngineShape } from "./orchestration/Services/OrchestrationEngine.ts";
-
-const MISSION_INFIX = "-ms_";
-
-/** The bridge member a thread id belongs to, or null for any other thread. */
-export function imBridgeMemberIdOfThread(threadId: string): string | null {
-  const index = threadId.indexOf(MISSION_INFIX);
-  if (index <= "im-".length || !threadId.startsWith("im-")) return null;
-  // The infix already consumed "-ms_", so the tail is bare mission hex —
-  // optionally followed by a create-race suffix (`-3`, `-<uuid8>`).
-  const missionTail = threadId.slice(index + MISSION_INFIX.length);
-  if (!/^[0-9a-f]{6,64}(-|$)/.test(missionTail)) return null;
-  return threadId.slice("im-".length, index);
-}
 
 const PERSONA_HEADER = [
   "The persona below is configured for this member in T3's settings.",
@@ -51,7 +39,7 @@ export function injectImBridgePersona(
   settings: ServerSettings,
 ): OrchestrationCommand {
   if (command.type !== "thread.turn.start") return command;
-  const memberId = imBridgeMemberIdOfThread(command.threadId);
+  const memberId = imBridgeMemberIdOfThreadId(command.threadId);
   if (memberId === null) return command;
   const persona = settings.imBridge.members
     .find((member) => member.id === memberId)

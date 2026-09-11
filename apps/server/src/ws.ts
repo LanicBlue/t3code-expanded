@@ -133,6 +133,7 @@ import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
 import { dispatchWithImBridgePersona } from "./imBridgePersona.ts";
+import { removedImBridgeMemberIds, settleDepartedImBridgeThreads } from "./imBridgeDeparture.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -1997,9 +1998,23 @@ const makeWsRpcLayer = (
         [WS_METHODS.serverUpdateSettings]: ({ patch }) =>
           observeRpcEffect(
             WS_METHODS.serverUpdateSettings,
-            serverSettings
-              .updateSettings(patch)
-              .pipe(Effect.map(ServerSettings.redactServerSettingsForClient)),
+            Effect.gen(function* () {
+              const previous = yield* serverSettings.getSettings;
+              const updated = yield* serverSettings.updateSettings(patch);
+              // Deleting an IM bridge member row settles that member's
+              // in-flight mission threads right here: the bridge archives the
+              // member in IM on its next tick, and an archived member can
+              // never submit again — the thread would strand mid-work.
+              const removedMemberIds = removedImBridgeMemberIds(previous, updated);
+              if (removedMemberIds.length > 0) {
+                yield* settleDepartedImBridgeThreads(
+                  orchestrationEngine,
+                  projectionSnapshotQuery,
+                  removedMemberIds,
+                );
+              }
+              return ServerSettings.redactServerSettingsForClient(updated);
+            }),
             {
               "rpc.aggregate": "server",
             },

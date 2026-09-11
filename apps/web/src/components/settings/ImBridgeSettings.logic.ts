@@ -17,6 +17,7 @@ import {
   type ProviderOptionSelection,
   type RuntimeMode,
 } from "@t3tools/contracts";
+import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
 
 /** The instance facts the member editor needs; satisfied by `ProviderInstanceEntry`. */
 export interface ImBridgeInstanceEntry {
@@ -158,6 +159,31 @@ export function patchMember(
 export function removeMember(members: ImBridgeMembers, index: number): ImBridgeMembers {
   if (index < 0 || index >= members.length) return members;
   return members.filter((_, position) => position !== index);
+}
+
+/** Shell-thread fields the liveness rule needs; satisfied by shell snapshot rows. */
+export interface ImBridgeThreadLike {
+  readonly id: string;
+  readonly settledAt: string | null;
+  readonly settledOverride: string | null;
+}
+
+/**
+ * The member's mission threads that are still live (`im-<memberId>-ms_*`,
+ * neither settled nor settle-overridden) — the delete confirmation's
+ * "N 个进行中会话" and nothing else: settled threads no longer strand on
+ * removal, so they are not worth warning about.
+ */
+export function liveImBridgeThreadCount(
+  threads: ReadonlyArray<ImBridgeThreadLike>,
+  memberId: string,
+): number {
+  return threads.filter(
+    (thread) =>
+      imBridgeMemberIdOfThreadId(thread.id) === memberId &&
+      thread.settledAt === null &&
+      thread.settledOverride !== "settled",
+  ).length;
 }
 
 /**

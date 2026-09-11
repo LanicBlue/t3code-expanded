@@ -6,6 +6,8 @@ import {
   type ImBridgeInstanceEntry,
   type ImBridgeMember,
   type ImBridgeMembers,
+  type ImBridgeThreadLike,
+  liveImBridgeThreadCount,
   memberOptionSelections,
   memberOptionsFromSelections,
   newMemberId,
@@ -202,5 +204,30 @@ describe("memberOptionsFromSelections", () => {
     expect(memberOptionsFromSelections(undefined)).toBeUndefined();
     expect(memberOptionsFromSelections(null)).toBeUndefined();
     expect(memberOptionsFromSelections([])).toBeUndefined();
+  });
+});
+
+describe("liveImBridgeThreadCount", () => {
+  const thread = (
+    id: string,
+    fields: Partial<Pick<ImBridgeThreadLike, "settledAt" | "settledOverride">> = {},
+  ): ImBridgeThreadLike => ({ id, settledAt: null, settledOverride: null, ...fields });
+  const threads = [
+    thread("im-m-a-ms_aaaabbbbccccdddd"),
+    thread("im-m-a-ms_aaaabbbbccccdddd-3"), // create-race suffix
+    thread("im-m-a-ms_1111222233334444", { settledAt: "2026-09-11T00:00:00.000Z" }),
+    thread("im-m-a-ms_5555666677778888", { settledOverride: "settled" }),
+    thread("im-m-b-ms_9999aaaabbbbcccc"),
+    thread("ordinary-chat-thread"),
+  ];
+
+  it("counts the member's unsettled mission threads, suffixed ids included", () => {
+    expect(liveImBridgeThreadCount(threads, "m-a")).toBe(2);
+    expect(liveImBridgeThreadCount(threads, "m-b")).toBe(1);
+  });
+
+  it("ignores settled threads, other members, and non-bridge threads", () => {
+    expect(liveImBridgeThreadCount(threads, "m-c")).toBe(0);
+    expect(liveImBridgeThreadCount([], "m-a")).toBe(0);
   });
 });

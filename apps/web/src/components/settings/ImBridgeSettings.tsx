@@ -8,6 +8,7 @@
  */
 import { useAtomValue } from "@effect/atom-react";
 import * as Equal from "effect/Equal";
+import * as Option from "effect/Option";
 import { PlusIcon, ScrollTextIcon, Trash2Icon } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { RuntimeMode, ServerProvider } from "@t3tools/contracts";
@@ -28,6 +29,8 @@ import {
   type ProviderInstanceEntry,
   sortProviderInstanceEntries,
 } from "../../providerInstances";
+import { useEnvironmentQuery } from "../../state/query";
+import { environmentShell } from "../../state/shell";
 import { primaryServerProvidersAtom } from "../../state/server";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
@@ -45,12 +48,15 @@ import {
 import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Textarea } from "../ui/textarea";
+import { toastManager } from "../ui/toast";
 import {
   appendMember,
   appendMemberFromTemplate,
   type ImBridgeMember,
   type ImBridgeMembers,
   type ImBridgeMemberPatch,
+  type ImBridgeThreadLike,
+  liveImBridgeThreadCount,
   memberOptionSelections,
   memberOptionsFromSelections,
   patchMember,
@@ -106,6 +112,21 @@ function ImBridgeMembersSection() {
     updateSettings({ imBridge: { members: next } });
   };
 
+  // The delete confirmation's in-flight count: the primary environment's
+  // shell threads, filtered to this member's unsettled mission threads.
+  const environmentId = usePrimaryEnvironmentId();
+  const shellQuery = useEnvironmentQuery(
+    environmentId ? environmentShell.stateAtom(environmentId) : null,
+  );
+  const shellSnapshot = shellQuery.data?.snapshot;
+  const shellThreads: ReadonlyArray<ImBridgeThreadLike> =
+    shellSnapshot !== undefined && Option.isSome(shellSnapshot) ? shellSnapshot.value.threads : [];
+
+  const [pendingRemoval, setPendingRemoval] = useState<{
+    readonly index: number;
+    readonly member: ImBridgeMember;
+  } | null>(null);
+
   const canAppend = entries.some((entry) => entry.models.length > 0);
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
 
@@ -145,7 +166,7 @@ function ImBridgeMembersSection() {
                     settings={settings}
                     providers={providers}
                     onPatch={(patch) => commitMembers(patchMember(members, index, patch))}
-                    onRemove={() => commitMembers(removeMember(members, index))}
+                    onRemove={() => setPendingRemoval({ index, member })}
                   />
                 ))}
               </tbody>
@@ -186,8 +207,75 @@ function ImBridgeMembersSection() {
             }
           />
         </Suspense>
+        {pendingRemoval !== null ? (
+          <RemoveMemberDialog
+            member={pendingRemoval.member}
+            liveThreadCount={liveImBridgeThreadCount(shellThreads, pendingRemoval.member.id)}
+            onClose={() => setPendingRemoval(null)}
+            onConfirm={() => {
+              const { index, member } = pendingRemoval;
+              const settled = liveImBridgeThreadCount(shellThreads, member.id);
+              commitMembers(removeMember(members, index));
+              setPendingRemoval(null);
+              toastManager.add({
+                type: "success",
+                title: `已删除成员 ${member.displayName?.trim() || member.id}`,
+                description:
+                  settled > 0
+                    ? `已 settle ${settled} 个进行中的会话；桥将在下个 tick（≤60s）归档其 IM 身份并归还工位。`
+                    : "桥将在下个 tick（≤60s）归档其 IM 身份并归还工位；停驻的 mission 原地不动。",
+              });
+            }}
+          />
+        ) : null}
       </div>
     </SettingsSection>
+  );
+}
+
+/**
+ * Delete confirmation — the one destructive action on a member row. The
+ * consequences span both sides: T3 settles the member's in-flight threads
+ * immediately (server-side, inside the settings save), and the bridge
+ * archives the member in every IM workspace on its next tick.
+ */
+function RemoveMemberDialog({
+  member,
+  liveThreadCount,
+  onClose,
+  onConfirm,
+}: {
+  readonly member: ImBridgeMember;
+  readonly liveThreadCount: number;
+  readonly onClose: () => void;
+  readonly onConfirm: () => void;
+}) {
+  const label = member.displayName?.trim() || member.id;
+  return (
+    <Dialog open onOpenChange={(open) => (open ? undefined : onClose())}>
+      <DialogPopup className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>删除成员 {label}？</DialogTitle>
+          <DialogDescription>
+            该成员将从成员表移除，桥在下个 reconcile tick（≤60s）会对每个 IM 工作区执行
+            leave：身份归档、值守工位归还给你，停驻的 mission 原地不动。
+            {liveThreadCount > 0
+              ? ` 该成员名下 ${liveThreadCount} 个进行中的会话将立即 settle（在途轮次无法再提交）。`
+              : " 该成员当前没有进行中的会话。"}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogPanel>
+          <div className="flex justify-end gap-2">
+            <Button size="xs" variant="ghost" onClick={onClose}>
+              取消
+            </Button>
+            <Button size="xs" variant="destructive" onClick={onConfirm}>
+              删除
+            </Button>
+          </div>
+        </DialogPanel>
+      </DialogPopup>
+    </Dialog>
   );
 }
 
