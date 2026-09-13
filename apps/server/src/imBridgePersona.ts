@@ -1,8 +1,16 @@
 /**
  * IM Bridge persona injection — the T3 side of the bundled template
  * marketplace. A member's `persona` (Settings → IM 成员, seeded by the
- * marketplace drawer) is prepended to every turn started on that member's
- * mission threads, right where the bridge's duty preamble already lives.
+ * marketplace drawer) is prepended to the FIRST turn started on that
+ * member's mission thread; the session transcript carries it from there,
+ * so later turns (result submissions, follow-ups) go through raw and the
+ * persona never repeats in the context window.
+ *
+ * "First" is `latestTurn === null` in the projection shell at dispatch
+ * time: bridge threads are created bare (`thread.create` carries no
+ * message), so a null latest turn means no turn ever committed. A
+ * turn-error reopen deletes and recreates the thread, which re-enters
+ * the first-turn branch — the new session gets the persona again.
  *
  * Deliberately server-side: the bridge (an external process over the
  * orchestration HTTP API) stays persona-agnostic — it keeps delivering bare
@@ -14,11 +22,17 @@
  * @module imBridgePersona
  */
 import * as Effect from "effect/Effect";
-import type { OrchestrationCommand, ServerSettingsError } from "@t3tools/contracts";
+import type {
+  OrchestrationCommand,
+  OrchestrationShellSnapshot,
+  ServerSettingsError,
+  ThreadId,
+} from "@t3tools/contracts";
 import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 
 import type { OrchestrationDispatchError } from "./orchestration/Errors.ts";
+import type { ProjectionRepositoryError } from "./persistence/Errors.ts";
 import type { OrchestrationEngineShape } from "./orchestration/Services/OrchestrationEngine.ts";
 
 const PERSONA_HEADER = [
@@ -52,12 +66,32 @@ export function injectImBridgePersona(
 }
 
 /**
- * Wrap an engine dispatch with persona injection. A settings read failure must
- * never block the dispatch — the command goes through raw.
+ * Whether a thread's next turn.start is its first, from the projection
+ * shell: true while the thread is unknown or has no committed turn. A
+ * snapshot read failure fails open to "first" — a mission without its
+ * persona is worse than one duplicated header.
+ */
+export function firstTurnForBridgeThread(
+  getShellSnapshot: () => Effect.Effect<OrchestrationShellSnapshot, ProjectionRepositoryError>,
+): (threadId: ThreadId) => Effect.Effect<boolean> {
+  return (threadId) =>
+    Effect.orElseSucceed(
+      Effect.map(getShellSnapshot(), (snapshot) => {
+        const thread = snapshot.threads.find((candidate) => candidate.id === threadId);
+        return thread === undefined || thread.latestTurn === null;
+      }),
+      () => true,
+    );
+}
+
+/**
+ * Wrap an engine dispatch with first-turn-only persona injection. Settings
+ * failures never block the dispatch — the command goes through raw.
  */
 export function dispatchWithImBridgePersona(
   engine: OrchestrationEngineShape,
   getSettings: Effect.Effect<ServerSettings, ServerSettingsError>,
+  isFirstTurn: (threadId: ThreadId) => Effect.Effect<boolean> = () => Effect.succeed(true),
 ): (
   command: OrchestrationCommand,
   options?: Parameters<OrchestrationEngineShape["dispatch"]>[1],
@@ -65,10 +99,19 @@ export function dispatchWithImBridgePersona(
   return (command, options) =>
     Effect.flatMap(
       Effect.orElseSucceed(getSettings, () => null),
-      (settings) =>
-        engine.dispatch(
-          settings === null ? command : injectImBridgePersona(command, settings),
-          options,
-        ),
+      (settings) => {
+        if (
+          command.type !== "thread.turn.start" ||
+          imBridgeMemberIdOfThreadId(command.threadId) === null
+        ) {
+          return engine.dispatch(command, options);
+        }
+        const withPersona = settings === null ? command : injectImBridgePersona(command, settings);
+        // Member without a persona: nothing to gate.
+        if (withPersona === command) return engine.dispatch(command, options);
+        return Effect.flatMap(isFirstTurn(command.threadId), (first) =>
+          engine.dispatch(first ? withPersona : command, options),
+        );
+      },
     );
 }
