@@ -801,13 +801,25 @@ export const ZCodeSettings = makeProviderSettingsSchema(
         description: "Additional CLI arguments passed to zcode app-server on session start.",
       }),
     ),
+    shadowHomePath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Shadow home path",
+        description:
+          "Isolated HOME for T3's zcode app-server. Keeps T3 sessions, rollout and logs out of the ZCode desktop's shared ~/.zcode store (auth/config are copied in, agents/skills/plugins stay linked).",
+        providerSettingsForm: {
+          placeholder: "~/.t3/zcode-home",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     customModels: Schema.Array(Schema.String).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath", "launchArgs"],
+    order: ["binaryPath", "launchArgs", "shadowHomePath"],
   },
 );
 export type ZCodeSettings = typeof ZCodeSettings.Type;

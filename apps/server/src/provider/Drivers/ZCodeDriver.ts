@@ -32,6 +32,11 @@ import {
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
+  materializeZcodeShadowHome,
+  resolveZcodeShadowHomePath,
+  zcodeShadowHomeEnvironment,
+} from "./ZcodeShadowHome.ts";
+import {
   makeCachedProviderMaintenanceResolution,
   makeManualOnlyProviderMaintenanceCapabilities,
   type ProviderMaintenanceCapabilitiesResolver,
@@ -92,10 +97,41 @@ export const ZCodeDriver: ProviderDriver<ZCodeSettings, ZCodeDriverEnv> = {
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies ZCodeSettings;
+      // Shadow home: without it, T3's zcode sessions land in the desktop
+      // app's shared ~/.zcode store (listed there, and opening them in the
+      // desktop steals session ownership). Every zcode process this driver
+      // spawns — adapter app-server, probes, text generation — runs with
+      // HOME pointed at the shadow directory instead.
+      const shadowHomePath = resolveZcodeShadowHomePath(config);
+      if (shadowHomePath instanceof Error) {
+        return yield* new ProviderDriverError({
+          driver: DRIVER_KIND,
+          instanceId,
+          detail: shadowHomePath.message,
+          cause: shadowHomePath,
+        });
+      }
+      if (shadowHomePath !== undefined) {
+        yield* materializeZcodeShadowHome({ shadowHomePath }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: cause.message,
+                cause,
+              }),
+          ),
+        );
+      }
+      const zcodeProcessEnv =
+        shadowHomePath !== undefined
+          ? zcodeShadowHomeEnvironment(shadowHomePath, processEnv)
+          : processEnv;
       const resolveMaintenance = yield* makeCachedProviderMaintenanceResolution(
         resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
           binaryPath: effectiveConfig.binaryPath,
-          env: processEnv,
+          env: zcodeProcessEnv,
         }).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -105,11 +141,11 @@ export const ZCodeDriver: ProviderDriver<ZCodeSettings, ZCodeDriverEnv> = {
 
       const adapter = yield* makeZcodeAdapter(effectiveConfig, {
         instanceId,
-        environment: processEnv,
+        environment: zcodeProcessEnv,
       });
-      const textGeneration = yield* makeZcodeTextGeneration(effectiveConfig, processEnv);
+      const textGeneration = yield* makeZcodeTextGeneration(effectiveConfig, zcodeProcessEnv);
 
-      const checkProvider = checkZcodeProviderStatus(effectiveConfig, processEnv).pipe(
+      const checkProvider = checkZcodeProviderStatus(effectiveConfig, zcodeProcessEnv).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.provideService(FileSystem.FileSystem, fileSystem),
