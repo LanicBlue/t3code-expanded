@@ -45,7 +45,7 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
 // ── Errors ─────────────────────────────────────────────────────────────
 
-export class ZcodeProtocolSpawnError extends Schema.TaggedErrorClass<ZcodeProtocolSpawnError>()(
+export class ZcodeProtocolSpawnError extends Schema.TaggedError<ZcodeProtocolSpawnError>()(
   "ZcodeProtocolSpawnError",
   {
     command: Schema.String,
@@ -57,7 +57,7 @@ export class ZcodeProtocolSpawnError extends Schema.TaggedErrorClass<ZcodeProtoc
   }
 }
 
-export class ZcodeProtocolTransportError extends Schema.TaggedErrorClass<ZcodeProtocolTransportError>()(
+export class ZcodeProtocolTransportError extends Schema.TaggedError<ZcodeProtocolTransportError>()(
   "ZcodeProtocolTransportError",
   {
     operation: Schema.String,
@@ -69,7 +69,7 @@ export class ZcodeProtocolTransportError extends Schema.TaggedErrorClass<ZcodePr
   }
 }
 
-export class ZcodeProtocolRequestError extends Schema.TaggedErrorClass<ZcodeProtocolRequestError>()(
+export class ZcodeProtocolRequestError extends Schema.TaggedError<ZcodeProtocolRequestError>()(
   "ZcodeProtocolRequestError",
   {
     method: Schema.String,
@@ -82,7 +82,7 @@ export class ZcodeProtocolRequestError extends Schema.TaggedErrorClass<ZcodeProt
   }
 }
 
-export class ZcodeProtocolProcessExitedError extends Schema.TaggedErrorClass<ZcodeProtocolProcessExitedError>()(
+export class ZcodeProtocolProcessExitedError extends Schema.TaggedError<ZcodeProtocolProcessExitedError>()(
   "ZcodeProtocolProcessExitedError",
   {
     code: Schema.Number,
@@ -94,7 +94,7 @@ export class ZcodeProtocolProcessExitedError extends Schema.TaggedErrorClass<Zco
   }
 }
 
-export class ZcodeProtocolInputStreamEndedError extends Schema.TaggedErrorClass<ZcodeProtocolInputStreamEndedError>()(
+export class ZcodeProtocolInputStreamEndedError extends Schema.TaggedError<ZcodeProtocolInputStreamEndedError>()(
   "ZcodeProtocolInputStreamEndedError",
   {},
 ) {

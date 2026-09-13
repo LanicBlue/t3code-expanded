@@ -24,6 +24,7 @@
  *
  * @module provider/Drivers/ZcodeShadowHome
  */
+// @effect-diagnostics nodeBuiltinImport:off
 import type { ZCodeSettings } from "@t3tools/contracts";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -39,7 +40,7 @@ const COPY_CONFIG_FILES = ["cli/config.json", "v2/config.json"] as const;
 /** Symlinked: static user-level content shared with the real home. */
 const LINKED_ENTRIES = ["cli/agents", "cli/plugins", "cli/memories", "skills"] as const;
 
-export class ZcodeShadowHomePathConflictError extends Schema.TaggedErrorClass<ZcodeShadowHomePathConflictError>()(
+export class ZcodeShadowHomePathConflictError extends Schema.TaggedError<ZcodeShadowHomePathConflictError>()(
   "ZcodeShadowHomePathConflictError",
   {
     shadowHomePath: Schema.String,
@@ -51,7 +52,7 @@ export class ZcodeShadowHomePathConflictError extends Schema.TaggedErrorClass<Zc
   }
 }
 
-export class ZcodeShadowHomeFileSystemError extends Schema.TaggedErrorClass<ZcodeShadowHomeFileSystemError>()(
+export class ZcodeShadowHomeFileSystemError extends Schema.TaggedError<ZcodeShadowHomeFileSystemError>()(
   "ZcodeShadowHomeFileSystemError",
   {
     operation: Schema.Literals([
@@ -71,7 +72,7 @@ export class ZcodeShadowHomeFileSystemError extends Schema.TaggedErrorClass<Zcod
   }
 }
 
-export class ZcodeShadowHomeEntryConflictError extends Schema.TaggedErrorClass<ZcodeShadowHomeEntryConflictError>()(
+export class ZcodeShadowHomeEntryConflictError extends Schema.TaggedError<ZcodeShadowHomeEntryConflictError>()(
   "ZcodeShadowHomeEntryConflictError",
   {
     entry: Schema.String,

@@ -568,7 +568,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "IM Bridge",
     to: "/settings/im",
     searchTerms: ["im mission bridge infinite member 成员"],
-    primaryOnly: true,
+    environmentOnly: true,
   },
   {
     id: "source-control",
@@ -721,6 +721,9 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/integrations": null,
   "/settings/source-control": "environment-defaults",
   "/settings/connections": "connections",
+  // The IM bridge member table is environment-wide; there is no project
+  // selection to fan out to.
+  "/settings/im": null,
   "/settings/archived": "project-defaults",
 };
 

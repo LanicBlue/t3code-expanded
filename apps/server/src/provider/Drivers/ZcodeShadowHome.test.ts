@@ -1,9 +1,11 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Schema from "effect/Schema";
 
 import {
   materializeZcodeShadowHome,
@@ -18,13 +20,18 @@ const makeTempDir = Effect.fn("ZcodeShadowHome.test.makeTempDir")(function* (pre
   return yield* fileSystem.makeTempDirectoryScoped({ prefix });
 });
 
+class WriteTextFileError extends Schema.TaggedError<WriteTextFileError>()("WriteTextFileError", {
+  filePath: Schema.String,
+  cause: Schema.Defect(),
+}) {}
+
 const writeTextFile = (filePath: string, contents: string) =>
   Effect.tryPromise({
     try: async () => {
       await NodeFS.promises.mkdir(NodePath.dirname(filePath), { recursive: true });
       await NodeFS.promises.writeFile(filePath, contents);
     },
-    catch: (cause) => new Error(`writeTextFile ${filePath} failed: ${String(cause)}`),
+    catch: (cause) => new WriteTextFileError({ filePath, cause }),
   });
 
 const fixtureHome = Effect.fn("ZcodeShadowHome.test.fixtureHome")(function* () {

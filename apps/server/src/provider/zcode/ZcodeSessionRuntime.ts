@@ -79,7 +79,7 @@ export function readZcodeResumeCursor(
   return isZcodeResumeCursor(resumeCursor) ? resumeCursor : undefined;
 }
 
-export class ZcodeSessionIdMissingError extends Schema.TaggedErrorClass<ZcodeSessionIdMissingError>()(
+export class ZcodeSessionIdMissingError extends Schema.TaggedError<ZcodeSessionIdMissingError>()(
   "ZcodeSessionIdMissingError",
   {
     threadId: Schema.String,
@@ -90,7 +90,7 @@ export class ZcodeSessionIdMissingError extends Schema.TaggedErrorClass<ZcodeSes
   }
 }
 
-export class ZcodeUnexpectedPayloadError extends Schema.TaggedErrorClass<ZcodeUnexpectedPayloadError>()(
+export class ZcodeUnexpectedPayloadError extends Schema.TaggedError<ZcodeUnexpectedPayloadError>()(
   "ZcodeUnexpectedPayloadError",
   {
     method: Schema.String,
@@ -101,7 +101,7 @@ export class ZcodeUnexpectedPayloadError extends Schema.TaggedErrorClass<ZcodeUn
   }
 }
 
-export class ZcodeSessionIdentifierError extends Schema.TaggedErrorClass<ZcodeSessionIdentifierError>()(
+export class ZcodeSessionIdentifierError extends Schema.TaggedError<ZcodeSessionIdentifierError>()(
   "ZcodeSessionIdentifierError",
   {
     purpose: Schema.String,

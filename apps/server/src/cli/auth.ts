@@ -96,7 +96,7 @@ const scopesFlag = Flag.string("scopes").pipe(
   Flag.optional,
 );
 
-class InvalidPairingScopesError extends Schema.TaggedErrorClass<InvalidPairingScopesError>()(
+class InvalidPairingScopesError extends Schema.TaggedError<InvalidPairingScopesError>()(
   "InvalidPairingScopesError",
   { message: Schema.String },
 ) {}

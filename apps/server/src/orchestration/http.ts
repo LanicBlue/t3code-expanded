@@ -2,6 +2,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
+  ServerSettingsError,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -29,11 +30,25 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
     const orchestrationEngine = yield* OrchestrationEngineService;
     // The bridge dispatches exclusively through this route; its members'
     // personas are injected here, server-side, so the bridge stays
-    // persona-agnostic.
-    const dispatch = dispatchWithImBridgePersona(
-      orchestrationEngine,
-      (yield* ServerSettings.ServerSettingsService).getSettings,
+    // persona-agnostic. Minimal boots (headless project CLI server) mount no
+    // settings service; without it there are no bridge members either, so the
+    // getter reports the same shape as a failed read and dispatch passes the
+    // command through raw.
+    const getSettings = Effect.flatMap(
+      Effect.serviceOption(ServerSettings.ServerSettingsService),
+      Option.match({
+        onNone: () =>
+          Effect.fail(
+            new ServerSettingsError({
+              settingsPath: "settings.json",
+              operation: "read-file",
+              cause: new Error("ServerSettingsService is not mounted in this boot"),
+            }),
+          ),
+        onSome: (service) => service.getSettings,
+      }),
     );
+    const dispatch = dispatchWithImBridgePersona(orchestrationEngine, getSettings);
 
     return handlers
       .handle(
