@@ -24,7 +24,7 @@ export function getDesktopUrl(isDevelopment: boolean): string {
   return `${getDesktopOrigin(isDevelopment)}/`;
 }
 
-export class ElectronProtocolRegistrationError extends Schema.TaggedErrorClass<ElectronProtocolRegistrationError>()(
+export class ElectronProtocolRegistrationError extends Schema.TaggedError<ElectronProtocolRegistrationError>()(
   "ElectronProtocolRegistrationError",
   {
     scheme: Schema.String,
@@ -36,7 +36,7 @@ export class ElectronProtocolRegistrationError extends Schema.TaggedErrorClass<E
   }
 }
 
-export class ElectronProtocolUnregistrationError extends Schema.TaggedErrorClass<ElectronProtocolUnregistrationError>()(
+export class ElectronProtocolUnregistrationError extends Schema.TaggedError<ElectronProtocolUnregistrationError>()(
   "ElectronProtocolUnregistrationError",
   {
     scheme: Schema.String,
@@ -91,7 +91,9 @@ export function makeDesktopContentSecurityPolicy(input: DesktopProtocolRegistrat
     "style-src 'self' 'unsafe-inline'",
     `font-src 'self' ${input.scheme}: data:`,
     "worker-src 'self' blob:",
-    "frame-src 'self' https://challenges.cloudflare.com",
+    // Document viewers use local Blob URLs and signed assets from runtime environments.
+    // HTML viewers retain their own sandbox; the renderer's script policy stays unchanged.
+    "frame-src 'self' blob: http: https:",
     "form-action 'self'",
   ].join("; ");
 }
