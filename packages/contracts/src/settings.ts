@@ -1008,13 +1008,13 @@ export type BackgroundActivitySettings = typeof BackgroundActivitySettings.Type;
  * the bridge's own config.
  */
 export const ImBridgeMemberSettings = Schema.Struct({
-  id: TrimmedNonEmptyString,
+  id: TrimmedNonEmptyString.check(Schema.isPattern(/^(?!.*-ms_)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/)),
   /** UI-only label (any text); the id stays the IM identity. */
   displayName: Schema.optionalKey(Schema.String),
   /**
-   * Persona prompt prepended (server-side) to every turn started on this
-   * member's threads (`im-<id>-ms_*`). Templates imported from the bundled
-   * marketplace land here.
+   * Persona prompt prepended server-side when a T3 session for this member
+   * starts (and again only when that session is replaced). Templates imported
+   * from the bundled marketplace land here.
    */
   persona: Schema.optionalKey(Schema.String),
   instanceId: ProviderInstanceId,

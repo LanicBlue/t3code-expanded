@@ -89,12 +89,15 @@ describe("injectImBridgePersona", () => {
 const threadId = (value: string): ThreadId => value as unknown as ThreadId;
 
 const shellWithThreads = (
-  threads: Array<{ id: string; latestTurn: unknown }>,
+  threads: Array<{ id: string; latestTurn: unknown; session?: { status: string } | null }>,
 ): OrchestrationShellSnapshot =>
   ({
     snapshotSequence: 1,
     projects: [],
-    threads,
+    threads: threads.map((thread) => ({
+      ...thread,
+      session: thread.session === undefined ? { status: "ready" } : thread.session,
+    })),
     updatedAt: "2026-09-13T00:00:00.000Z",
   }) as unknown as OrchestrationShellSnapshot;
 
@@ -116,6 +119,33 @@ describe("firstTurnForBridgeThread", () => {
       ),
     );
     expect(Effect.runSync(first(threadId("im-t3-glm-ms_aaaabbbbccccdddd")))).toBe(false);
+  });
+
+  it("treats stopped, errored, and missing sessions as fresh replacements", () => {
+    const first = firstTurnForBridgeThread(() =>
+      Effect.succeed(
+        shellWithThreads([
+          {
+            id: "im-t3-glm-ms_aaaabbbbccccdddd",
+            latestTurn: { state: "error" },
+            session: { status: "error" },
+          },
+          {
+            id: "im-t3-glm-ms_0000000000000001",
+            latestTurn: { state: "completed" },
+            session: { status: "stopped" },
+          },
+          {
+            id: "im-t3-glm-ms_0000000000000002",
+            latestTurn: { state: "completed" },
+            session: null,
+          },
+        ]),
+      ),
+    );
+    expect(Effect.runSync(first(threadId("im-t3-glm-ms_aaaabbbbccccdddd")))).toBe(true);
+    expect(Effect.runSync(first(threadId("im-t3-glm-ms_0000000000000001")))).toBe(true);
+    expect(Effect.runSync(first(threadId("im-t3-glm-ms_0000000000000002")))).toBe(true);
   });
 
   it("fails open to first when the shell snapshot read fails", () => {
@@ -191,5 +221,15 @@ describe("dispatchWithImBridgePersona", () => {
     expect((dispatched[0] as { message: { text: string } }).message.text).toContain(
       "你是软件架构师",
     );
+  });
+
+  it("fails closed when bridge member settings cannot be read", () => {
+    const { engine, dispatched } = makeEngine();
+    const dispatch = dispatchWithImBridgePersona(
+      engine as never,
+      Effect.fail(new Error("settings unavailable") as never),
+    );
+    expect(() => Effect.runSync(dispatch(turnStart(bridgeThread)))).toThrow();
+    expect(dispatched).toHaveLength(0);
   });
 });

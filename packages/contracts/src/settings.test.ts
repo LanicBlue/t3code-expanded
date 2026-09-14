@@ -878,6 +878,16 @@ describe("ImBridgeSettings", () => {
     ).toThrow();
   });
 
+  it("rejects member ids that cannot round-trip through IM sessions and bridge thread ids", () => {
+    for (const id of ["has space", "../evil", "t3-ms_ambiguous", "x/y"]) {
+      expect(() =>
+        decodeImBridgeSettings({
+          members: [{ id, instanceId: "codex", model: "gpt-5.6-luna" }],
+        }),
+      ).toThrow();
+    }
+  });
+
   it("rejects an unsupported runtime mode", () => {
     expect(() =>
       decodeImBridgeSettings({
