@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import { expect, it } from "@effect/vitest";
+import { afterAll, expect, it } from "@effect/vitest";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -35,11 +35,21 @@ const driver = (value: string) => ProviderDriverKind.make(value);
 // These write `#!/bin/sh` stubs and evaluate them with darwin/linux path
 // semantics; a Windows temp path cannot be split on `:`.
 const windowsHost = HostProcessPlatform.defaultValue() === "win32";
+// Fixture paths are tracked and removed in afterAll; a killed run still leaks,
+// but normal runs no longer strand one temp dir per test in $TMPDIR.
+const tempDirs: Array<string> = [];
 const makeTempDir = (name: string) =>
   Crypto.Crypto.pipe(
     Effect.flatMap((crypto) => crypto.randomUUIDv4),
-    Effect.map((id) => NodePath.join(NodeOS.tmpdir(), `${name}-${id}`)),
+    Effect.map((id) => {
+      const dir = NodePath.join(NodeOS.tmpdir(), `${name}-${id}`);
+      tempDirs.push(dir);
+      return dir;
+    }),
   );
+afterAll(() => {
+  for (const dir of tempDirs) NodeFS.rmSync(dir, { recursive: true, force: true });
+});
 const isNativeTestCommandPath =
   (expectedPathSegment: string) =>
   (commandPath: string): boolean =>

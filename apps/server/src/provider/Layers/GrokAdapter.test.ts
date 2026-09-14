@@ -5,7 +5,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { afterAll, assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -43,8 +43,20 @@ const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.
 // process instead, so the mock never sees a signal to log.
 const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 
+// Fixture dirs are tracked and removed in afterAll; a killed run still leaks,
+// but normal runs no longer strand one mkdtemp per test in $TMPDIR.
+const tempDirs: Array<string> = [];
+const mkdtempTracked = async (prefix: string) => {
+  const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+};
+afterAll(async () => {
+  for (const dir of tempDirs) await NodeFSP.rm(dir, { recursive: true, force: true });
+});
+
 async function makeMockGrokWrapper(extraEnv?: Record<string, string>) {
-  const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-mock-"));
+  const dir = await mkdtempTracked("grok-acp-mock-");
   return writeFakeCli({
     directory: dir,
     name: "fake-grok",
@@ -235,9 +247,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect("sends runtime context with the current model without changing saved prompts", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-runtime-context");
-      const tempDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-runtime-context-")),
-      );
+      const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-runtime-context-"));
       const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockGrokWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
@@ -362,9 +372,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect.skipIf(windowsHost)("closes the ACP child process when a session stops", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-stop-session-close");
-      const tempDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-adapter-exit-log-")),
-      );
+      const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-adapter-exit-log-"));
       const exitLogPath = NodePath.join(tempDir, "exit.log");
 
       const wrapperPath = yield* Effect.promise(() =>
@@ -1124,9 +1132,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect("does not let a cancelled prompt settlement consume the follow-up prompt slot", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-cancelled-settlement-before-follow-up");
-      const tempDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-cancel-race-")),
-      );
+      const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-acp-cancel-race-"));
       const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockGrokWrapper({
@@ -1206,9 +1212,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect("cancels an in-flight prompt when a mid-turn sendTurn steers", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-steer-cancels-in-flight");
-      const tempDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-steer-")),
-      );
+      const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-acp-steer-"));
       const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockGrokWrapper({
@@ -1289,9 +1293,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     () =>
       Effect.gen(function* () {
         const threadId = ThreadId.make("grok-steer-during-prep");
-        const tempDir = yield* Effect.promise(() =>
-          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-steer-prep-")),
-        );
+        const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-acp-steer-prep-"));
         const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
         const wrapperPath = yield* Effect.promise(() =>
           makeMockGrokWrapper({
@@ -1361,9 +1363,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect("keeps the original prompt running when a steer fails during preparation", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-failed-steer-keeps-original-prompt");
-      const tempDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-failed-steer-")),
-      );
+      const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-acp-failed-steer-"));
       const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockGrokWrapper({
@@ -1943,9 +1943,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect("responds to ACP approvals using provider-supplied option ids", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-custom-approval-option-id");
-      const tempDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-")),
-      );
+      const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-acp-"));
       const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockGrokWrapper({
@@ -2081,9 +2079,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect("keeps a Grok turn running when Always allow has no allow_always option", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-always-allow-without-allow-always");
-      const tempDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-")),
-      );
+      const tempDir = yield* Effect.promise(() => mkdtempTracked("grok-acp-"));
       const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockGrokWrapper({
@@ -2195,9 +2191,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
   it.effect("captures a plan under the provider instance GROK_HOME", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-instance-plan-home");
-      const grokHome = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-instance-home-")),
-      );
+      const grokHome = yield* Effect.promise(() => mkdtempTracked("grok-instance-home-"));
       const wrapperPath = yield* Effect.promise(() =>
         makeMockGrokWrapper({
           T3_ACP_EMIT_XAI_PLAN_MD_WRITE: "1",

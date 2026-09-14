@@ -15,7 +15,7 @@ import {
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
-import { assert, it } from "@effect/vitest";
+import { afterAll, assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
@@ -26,6 +26,23 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as CliError from "effect/unstable/cli/CliError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
+
+// Fixture dirs are tracked and removed in afterAll; a killed run still leaks,
+// but normal runs no longer strand one mkdtemp per test in $TMPDIR. Tests that
+// rename a fixture (removed/alias scenarios) track the new path too.
+const tempDirs: Array<string> = [];
+const mkdtempTracked = (prefix: string) => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+};
+const trackTempDir = (dir: string) => {
+  tempDirs.push(dir);
+  return dir;
+};
+afterAll(() => {
+  for (const dir of tempDirs) NodeFS.rmSync(dir, { recursive: true, force: true });
+});
 
 import { cli, makeCli } from "./bin.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
@@ -142,12 +159,8 @@ const makeProjectLookupFixture = Effect.fn("makeProjectLookupFixture")(function*
   withThread: boolean,
   removeWorkspace: boolean,
 ) {
-  const baseDir = NodeFS.mkdtempSync(
-    NodePath.join(NodeOS.tmpdir(), "t3-cli-project-lookup-state-"),
-  );
-  const workspaceRoot = NodeFS.mkdtempSync(
-    NodePath.join(NodeOS.tmpdir(), "t3-cli-project-lookup-git-"),
-  );
+  const baseDir = mkdtempTracked("t3-cli-project-lookup-state-");
+  const workspaceRoot = mkdtempTracked("t3-cli-project-lookup-git-");
   NodeChildProcess.execFileSync("git", ["init", "--initial-branch=main", workspaceRoot], {
     stdio: "ignore",
   });
@@ -175,7 +188,8 @@ const makeProjectLookupFixture = Effect.fn("makeProjectLookupFixture")(function*
     }).pipe(Effect.provide(makeProjectPersistenceLayer(config)));
   }
   if (removeWorkspace) {
-    NodeFS.renameSync(workspaceRoot, `${workspaceRoot}-removed`);
+    const removedPath = trackTempDir(`${workspaceRoot}-removed`);
+    NodeFS.renameSync(workspaceRoot, removedPath);
     assert.isFalse(NodeFS.existsSync(workspaceRoot));
   }
   return { baseDir, workspaceRoot, project };
@@ -232,9 +246,7 @@ it.layer(NodeServices.layer)("project lookup with unavailable workspaces", (it) 
   it.effect("cannot remove the old environment's ID from a replacement empty database", () =>
     Effect.gen(function* () {
       const { baseDir, project } = yield* makeProjectLookupFixture(true, true);
-      const replacementDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-project-lookup-new-state-"),
-      );
+      const replacementDir = mkdtempTracked("t3-cli-project-lookup-new-state-");
       const error = yield* runCliWithRuntime([
         "project",
         "remove",
@@ -323,7 +335,7 @@ it.layer(NodeServices.layer)("project lookup with unavailable workspaces", (it) 
         renamed.projects.find((candidate) => candidate.id === project.id)!.title,
         "Normalized",
       );
-      const aliasPath = `${workspaceRoot}-alias`;
+      const aliasPath = trackTempDir(`${workspaceRoot}-alias`);
       NodeFS.symlinkSync(workspaceRoot, aliasPath, "junction");
       const error = yield* runCliWithRuntime([
         "project",
@@ -470,9 +482,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("reports fresh headless connect state without requiring local configuration", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-status-test-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-cloud-status-test-");
       const { output } = yield* captureStdout(
         runConnectCli(["connect", "status", "--base-dir", baseDir, "--json"]),
       );
@@ -495,9 +505,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("reports actionable human-readable headless connect state", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-status-human-test-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-cloud-status-human-test-");
       const { output } = yield* captureStdout(
         runConnectCli(["connect", "status", "--base-dir", baseDir]),
       );
@@ -511,9 +519,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("accepts the --headless login override without enabling access", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-login-test-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-cloud-login-test-");
       const { secretsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
       NodeFS.mkdirSync(secretsDir, { recursive: true });
       NodeFS.writeFileSync(
@@ -546,9 +552,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("disables headless connect without a running server", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-unlink-test-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-cloud-unlink-test-");
       const { output } = yield* captureStdout(
         runConnectCli(["connect", "unlink", "--base-dir", baseDir]),
       );
@@ -559,9 +563,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("logs out of headless connect and removes the stored CLI authorization", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-cloud-logout-test-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-cloud-logout-test-");
       const { secretsDir } = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
       const tokenPath = NodePath.join(secretsDir, "cloud-cli-oauth-token.bin");
       NodeFS.mkdirSync(secretsDir, { recursive: true });
@@ -581,9 +583,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("executes auth pairing subcommands and redacts secrets from list output", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-auth-pairing-test-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-auth-pairing-test-");
 
       const createdOutput = yield* captureStdout(
         runCli(["auth", "pairing", "create", "--base-dir", baseDir, "--json"]),
@@ -613,9 +613,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("executes auth session subcommands and redacts secrets from list output", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-auth-session-test-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-auth-session-test-");
 
       const issuedOutput = yield* captureStdout(
         runCli(["auth", "session", "issue", "--base-dir", baseDir, "--json"]),
@@ -690,12 +688,8 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("adds, renames, and removes projects offline through the orchestration engine", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-offline-test-"),
-      );
-      const workspaceRoot = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-workspace-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-projects-offline-test-");
+      const workspaceRoot = mkdtempTracked("t3-cli-projects-workspace-");
 
       yield* runCliWithRuntime([
         "project",
@@ -738,12 +732,8 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("force removes projects that still contain threads", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-force-remove-test-"),
-      );
-      const workspaceRoot = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-force-remove-workspace-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-projects-force-remove-test-");
+      const workspaceRoot = mkdtempTracked("t3-cli-projects-force-remove-workspace-");
 
       yield* runCliWithRuntime(["project", "add", workspaceRoot, "--base-dir", baseDir]);
       const afterAdd = yield* readPersistedSnapshot(baseDir);
@@ -795,12 +785,8 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("routes project commands through a running server when runtime state is present", () =>
     Effect.gen(function* () {
-      const baseDir = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-live-test-"),
-      );
-      const workspaceRoot = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-live-workspace-"),
-      );
+      const baseDir = mkdtempTracked("t3-cli-projects-live-test-");
+      const workspaceRoot = mkdtempTracked("t3-cli-projects-live-workspace-");
 
       yield* withLiveProjectCliServer(baseDir, () =>
         Effect.gen(function* () {
@@ -827,9 +813,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
 
   it.effect("rejects dev-url on project commands", () =>
     Effect.gen(function* () {
-      const workspaceRoot = NodeFS.mkdtempSync(
-        NodePath.join(NodeOS.tmpdir(), "t3-cli-projects-unknown-option-workspace-"),
-      );
+      const workspaceRoot = mkdtempTracked("t3-cli-projects-unknown-option-workspace-");
       const error = yield* runCliWithRuntime([
         "project",
         "add",

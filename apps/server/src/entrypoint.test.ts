@@ -4,12 +4,22 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
-import { describe, expect, it } from "vite-plus/test";
+import { afterAll, describe, expect, it } from "vite-plus/test";
 
 import { isEntrypoint } from "./entrypoint.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
-const makeTempDir = () => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-entrypoint-test-"));
+// Fixture dirs are tracked and removed in afterAll; a killed run still leaks,
+// but normal runs no longer strand one mkdtemp per test in $TMPDIR.
+const tempDirs: Array<string> = [];
+const makeTempDir = () => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-entrypoint-test-"));
+  tempDirs.push(dir);
+  return dir;
+};
+afterAll(() => {
+  for (const dir of tempDirs) NodeFS.rmSync(dir, { recursive: true, force: true });
+});
 
 describe("isEntrypoint", () => {
   it("uses the runtime answer when Node provides one", () => {
