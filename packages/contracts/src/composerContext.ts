@@ -277,5 +277,15 @@ export const OrchestrationMessageContext = Schema.Struct({
         (records) => new Set(records.map((record) => record.contextId)).size === records.length,
       ),
     ),
+  /**
+   * Context to prepend to the message text only when this turn starts a
+   * provider session that carries no conversation history (a truly fresh
+   * provider thread). Assembled by the sender (e.g. the IM bridge's stable
+   * mission context plus the member persona); chosen by the server's session
+   * lifecycle, which is the only place that knows whether the turn resumes
+   * history. Older servers decode this schema without the field and silently
+   * drop it, degrading to text-only delivery.
+   */
+  freshContext: Schema.optional(Schema.String),
 });
 export type OrchestrationMessageContext = typeof OrchestrationMessageContext.Type;

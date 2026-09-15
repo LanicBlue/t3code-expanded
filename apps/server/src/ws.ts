@@ -136,7 +136,7 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
-import { dispatchWithImBridgePersona, firstTurnForBridgeThread } from "./imBridgePersona.ts";
+import { dispatchWithImBridgePersona } from "./imBridgePersona.ts";
 import { removedImBridgeMemberIds, settleDepartedImBridgeThreads } from "./imBridgeDeparture.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
@@ -505,18 +505,17 @@ const makeWsRpcLayer = (
       // the client's request caused them.
       const hasClientOrigin =
         clientOrigin.surface !== undefined || clientOrigin.appVersion !== undefined;
-      // IM bridge members' personas (Settings → IM 成员) ride along on the
-      // first turn of their mission threads; the transcript carries the
-      // persona from there.
+      // IM bridge members' personas (Settings → IM 成员) ride the message's
+      // freshContext; the provider command reactor prepends it only when the
+      // turn starts a provider thread with no conversation history.
       const dispatchFromClient: OrchestrationEngine.OrchestrationEngineShape["dispatch"] = (
         command,
         options,
       ) =>
-        dispatchWithImBridgePersona(
-          orchestrationEngine,
-          serverSettings.getSettings,
-          firstTurnForBridgeThread(() => projectionSnapshotQuery.getShellSnapshot()),
-        )(command, hasClientOrigin ? { origin: clientOrigin } : options);
+        dispatchWithImBridgePersona(orchestrationEngine, serverSettings.getSettings)(
+          command,
+          hasClientOrigin ? { origin: clientOrigin } : options,
+        );
       const recordClientCommandAnalytics = (command: OrchestrationCommand) => {
         switch (command.type) {
           case "thread.create":

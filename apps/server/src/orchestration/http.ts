@@ -17,7 +17,7 @@ import {
   failEnvironmentNotFound,
   requireEnvironmentScope,
 } from "../auth/http.ts";
-import { dispatchWithImBridgePersona, firstTurnForBridgeThread } from "../imBridgePersona.ts";
+import { dispatchWithImBridgePersona } from "../imBridgePersona.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -48,11 +48,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         onSome: (service) => service.getSettings,
       }),
     );
-    const dispatch = dispatchWithImBridgePersona(
-      orchestrationEngine,
-      getSettings,
-      firstTurnForBridgeThread(() => projectionSnapshotQuery.getShellSnapshot()),
-    );
+    const dispatch = dispatchWithImBridgePersona(orchestrationEngine, getSettings);
 
     return handlers
       .handle(

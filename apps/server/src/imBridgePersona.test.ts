@@ -1,25 +1,23 @@
 import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
-import type {
-  OrchestrationCommand,
-  OrchestrationShellSnapshot,
-  ThreadId,
-} from "@t3tools/contracts";
+import type { OrchestrationCommand } from "@t3tools/contracts";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vite-plus/test";
 
-import {
-  dispatchWithImBridgePersona,
-  firstTurnForBridgeThread,
-  injectImBridgePersona,
-} from "./imBridgePersona.ts";
+import { dispatchWithImBridgePersona, injectImBridgePersona } from "./imBridgePersona.ts";
 
-const turnStart = (threadId: string, text = "brief"): OrchestrationCommand =>
+const turnStart = (threadId: string, text = "brief", freshContext?: string): OrchestrationCommand =>
   ({
     type: "thread.turn.start",
     commandId: "cmd-1",
     threadId,
-    message: { messageId: "m-1", role: "user", text, attachments: [] },
+    message: {
+      messageId: "m-1",
+      role: "user",
+      text,
+      attachments: [],
+      ...(freshContext !== undefined ? { context: { version: 1, records: [], freshContext } } : {}),
+    },
     runtimeMode: "full-access",
     interactionMode: "default",
     createdAt: "2026-09-10T00:00:00.000Z",
@@ -46,18 +44,30 @@ describe("imBridgeMemberIdOfThreadId", () => {
 });
 
 describe("injectImBridgePersona", () => {
-  it("prepends the member persona to a turn.start on that member's thread", () => {
-    const command = turnStart("im-t3-glm-ms_aaaabbbbccccdddd", "duty brief");
+  it("merges the persona into the turn's freshContext, before any sender context, text untouched", () => {
+    const command = turnStart("im-t3-glm-ms_aaaabbbbccccdddd", "duty brief", "stable mission ctx");
     const injected = injectImBridgePersona(
       command,
       settingsWith([{ id: "t3-glm", persona: "你是软件架构师" }]),
     );
     if (injected.type !== "thread.turn.start") throw new Error("expected turn.start");
-    expect(injected.message.text).toContain("你是软件架构师");
-    expect(injected.message.text.endsWith("duty brief")).toBe(true);
-    expect(injected.message.text.indexOf("你是软件架构师")).toBeLessThan(
-      injected.message.text.indexOf("duty brief"),
+    // The message text is delivered untouched; the persona rides freshContext.
+    expect(injected.message.text).toBe("duty brief");
+    const freshContext = injected.message.context?.freshContext ?? "";
+    expect(freshContext).toContain("你是软件架构师");
+    expect(freshContext.indexOf("你是软件架构师")).toBeLessThan(
+      freshContext.indexOf("stable mission ctx"),
     );
+    expect(injected.message.context?.records).toEqual([]);
+  });
+
+  it("seeds a context for messages that carried none", () => {
+    const injected = injectImBridgePersona(
+      turnStart("im-t3-glm-ms_aaaabbbbccccdddd"),
+      settingsWith([{ id: "t3-glm", persona: "你是软件架构师" }]),
+    );
+    if (injected.type !== "thread.turn.start") throw new Error("expected turn.start");
+    expect(injected.message.context?.freshContext).toContain("你是软件架构师");
   });
 
   it("passes through untouched for members without a persona, other threads, and other commands", () => {
@@ -86,74 +96,6 @@ describe("injectImBridgePersona", () => {
   });
 });
 
-const threadId = (value: string): ThreadId => value as unknown as ThreadId;
-
-const shellWithThreads = (
-  threads: Array<{ id: string; latestTurn: unknown; session?: { status: string } | null }>,
-): OrchestrationShellSnapshot =>
-  ({
-    snapshotSequence: 1,
-    projects: [],
-    threads: threads.map((thread) => ({
-      ...thread,
-      session: thread.session === undefined ? { status: "ready" } : thread.session,
-    })),
-    updatedAt: "2026-09-13T00:00:00.000Z",
-  }) as unknown as OrchestrationShellSnapshot;
-
-describe("firstTurnForBridgeThread", () => {
-  it("treats unknown threads and threads without a committed turn as first", () => {
-    const first = firstTurnForBridgeThread(() =>
-      Effect.succeed(shellWithThreads([{ id: "im-t3-glm-ms_aaaabbbbccccdddd", latestTurn: null }])),
-    );
-    expect(Effect.runSync(first(threadId("im-t3-glm-ms_aaaabbbbccccdddd")))).toBe(true);
-    expect(Effect.runSync(first(threadId("im-t3-glm-ms_0000000000000001")))).toBe(true);
-  });
-
-  it("treats threads with any committed turn as not first", () => {
-    const first = firstTurnForBridgeThread(() =>
-      Effect.succeed(
-        shellWithThreads([
-          { id: "im-t3-glm-ms_aaaabbbbccccdddd", latestTurn: { state: "completed" } },
-        ]),
-      ),
-    );
-    expect(Effect.runSync(first(threadId("im-t3-glm-ms_aaaabbbbccccdddd")))).toBe(false);
-  });
-
-  it("treats stopped, errored, and missing sessions as fresh replacements", () => {
-    const first = firstTurnForBridgeThread(() =>
-      Effect.succeed(
-        shellWithThreads([
-          {
-            id: "im-t3-glm-ms_aaaabbbbccccdddd",
-            latestTurn: { state: "error" },
-            session: { status: "error" },
-          },
-          {
-            id: "im-t3-glm-ms_0000000000000001",
-            latestTurn: { state: "completed" },
-            session: { status: "stopped" },
-          },
-          {
-            id: "im-t3-glm-ms_0000000000000002",
-            latestTurn: { state: "completed" },
-            session: null,
-          },
-        ]),
-      ),
-    );
-    expect(Effect.runSync(first(threadId("im-t3-glm-ms_aaaabbbbccccdddd")))).toBe(true);
-    expect(Effect.runSync(first(threadId("im-t3-glm-ms_0000000000000001")))).toBe(true);
-    expect(Effect.runSync(first(threadId("im-t3-glm-ms_0000000000000002")))).toBe(true);
-  });
-
-  it("fails open to first when the shell snapshot read fails", () => {
-    const first = firstTurnForBridgeThread(() => Effect.fail("projection down" as never));
-    expect(Effect.runSync(first(threadId("im-t3-glm-ms_aaaabbbbccccdddd")))).toBe(true);
-  });
-});
-
 describe("dispatchWithImBridgePersona", () => {
   const personaSettings = settingsWith([{ id: "t3-glm", persona: "你是软件架构师" }]);
   const bridgeThread = "im-t3-glm-ms_aaaabbbbccccdddd";
@@ -169,58 +111,37 @@ describe("dispatchWithImBridgePersona", () => {
     return { engine, dispatched };
   };
 
-  it("injects the persona on the thread's first turn", () => {
+  it("puts the persona in freshContext on every dispatched bridge turn — the reactor decides when it rides", () => {
     const { engine, dispatched } = makeEngine();
-    const dispatch = dispatchWithImBridgePersona(
-      engine as never,
-      Effect.succeed(personaSettings),
-      () => Effect.succeed(true),
-    );
-    Effect.runSync(dispatch(turnStart(bridgeThread)));
-    expect(dispatched).toHaveLength(1);
-    expect((dispatched[0] as { message: { text: string } }).message.text).toContain(
-      "你是软件架构师",
-    );
+    const dispatch = dispatchWithImBridgePersona(engine as never, Effect.succeed(personaSettings));
+    Effect.runSync(dispatch(turnStart(bridgeThread, "round 1")));
+    Effect.runSync(dispatch(turnStart(bridgeThread, "round 2")));
+    for (const command of dispatched) {
+      const message = (command as { message: { context?: { freshContext?: string } } }).message;
+      expect(message.context?.freshContext).toContain("你是软件架构师");
+    }
   });
 
-  it("passes later turns through raw — the transcript already carries the persona", () => {
+  it("passes non-bridge commands and persona-less members through raw", () => {
     const { engine, dispatched } = makeEngine();
-    const command = turnStart(bridgeThread, "result submission");
-    const dispatch = dispatchWithImBridgePersona(
-      engine as never,
-      Effect.succeed(personaSettings),
-      () => Effect.succeed(false),
-    );
-    Effect.runSync(dispatch(command));
-    expect(dispatched).toEqual([command]);
-  });
-
-  it("never consults the first-turn predicate for non-bridge commands or persona-less members", () => {
-    const { engine, dispatched } = makeEngine();
-    let predicateCalls = 0;
-    const dispatch = dispatchWithImBridgePersona(
-      engine as never,
-      Effect.succeed(personaSettings),
-      () => {
-        predicateCalls += 1;
-        return Effect.succeed(false);
-      },
-    );
+    const dispatch = dispatchWithImBridgePersona(engine as never, Effect.succeed(personaSettings));
     const plain = turnStart("some-other-thread");
     const noPersona = turnStart("im-t3-codex-ms_aaaabbbbccccdddd");
     Effect.runSync(dispatch(plain));
     Effect.runSync(dispatch(noPersona));
     expect(dispatched).toEqual([plain, noPersona]);
-    expect(predicateCalls).toBe(0);
   });
 
-  it("defaults to injecting when no predicate is supplied", () => {
+  it("is pure in the command — retrying a dispatch never stacks personas", () => {
     const { engine, dispatched } = makeEngine();
     const dispatch = dispatchWithImBridgePersona(engine as never, Effect.succeed(personaSettings));
-    Effect.runSync(dispatch(turnStart(bridgeThread)));
-    expect((dispatched[0] as { message: { text: string } }).message.text).toContain(
-      "你是软件架构师",
-    );
+    const command = turnStart(bridgeThread);
+    Effect.runSync(dispatch(command));
+    const first = dispatched[0] as { message: { context?: { freshContext?: string } } };
+    Effect.runSync(dispatch(command));
+    const second = dispatched[1] as { message: { context?: { freshContext?: string } } };
+    expect(second).toEqual(first);
+    expect((first.message.context?.freshContext ?? "").match(/你是软件架构师/g)).toHaveLength(1);
   });
 
   it("fails closed when bridge member settings cannot be read", () => {

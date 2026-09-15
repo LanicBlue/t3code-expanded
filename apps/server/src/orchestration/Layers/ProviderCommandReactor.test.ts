@@ -928,6 +928,47 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
+  effectIt.effect(
+    "prepends message freshContext only when the provider thread starts history-less",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        const turnStart = (messageId: string, freshContext?: string) =>
+          harness.engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make(`cmd-${messageId}`),
+            threadId: ThreadId.make("thread-1"),
+            message: {
+              messageId: asMessageId(messageId),
+              role: "user",
+              text: "round brief",
+              attachments: [],
+              ...(freshContext !== undefined
+                ? { context: { version: 1, records: [], freshContext } }
+                : {}),
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          });
+
+        // First turn on a new thread: the provider thread starts with no
+        // conversation history, so the sender's freshContext rides the input.
+        yield* turnStart("user-fresh", "STABLE MISSION CONTEXT");
+        yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
+        const freshInput = String(harness.sendTurn.mock.calls[0]?.[0]?.input ?? "");
+        expect(freshInput.startsWith("STABLE MISSION CONTEXT\n\nround brief")).toBe(true);
+
+        // Second turn while the provider session is live (carries history):
+        // raw text only, and the session is reused rather than restarted.
+        yield* turnStart("user-resumed", "STABLE MISSION CONTEXT");
+        yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 2));
+        const resumedInput = String(harness.sendTurn.mock.calls[1]?.[0]?.input ?? "");
+        expect(resumedInput).toBe("round brief");
+        expect(harness.startSession.mock.calls.length).toBe(1);
+      }),
+  );
+
   effectIt.effect("retains a turn dispatched immediately after start until activation", () =>
     Effect.gen(function* () {
       const activation = yield* Deferred.make<void>();
