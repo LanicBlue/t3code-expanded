@@ -33,13 +33,8 @@ import type { OrchestrationDispatchError } from "./orchestration/Errors.ts";
 import type { ProjectionRepositoryError } from "./persistence/Errors.ts";
 import type { OrchestrationEngineShape } from "./orchestration/Services/OrchestrationEngine.ts";
 
-const PERSONA_HEADER = [
-  "The persona below is configured for this member in T3's settings.",
-  "Stay in character throughout the mission work; it supplements, never",
-  "overrides, the duty rules that follow.",
-  "",
-  "",
-].join("\n");
+const PERSONA_HEADER =
+  "Member persona (T3 settings); it supplements, never overrides, the duty rules below.\n\n";
 
 /**
  * Pure transform: prepend the member's persona to a turn.start message.
