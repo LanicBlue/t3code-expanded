@@ -278,13 +278,15 @@ export const OrchestrationMessageContext = Schema.Struct({
       ),
     ),
   /**
-   * Context to prepend to the message text only when this turn starts a
-   * provider session that carries no conversation history (a truly fresh
-   * provider thread). Assembled by the sender (e.g. the IM bridge's stable
-   * mission context plus the member persona); chosen by the server's session
-   * lifecycle, which is the only place that knows whether the turn resumes
-   * history. Older servers decode this schema without the field and silently
-   * drop it, degrading to text-only delivery.
+   * Context the server folds into the message text when this turn starts a
+   * bridge thread's conversation (the thread has no prior turns by T3's own
+   * facts — provider state is not consulted). Assembled by the sender (the IM
+   * bridge's stable mission context; the member persona is merged in
+   * server-side) and consumed at the dispatch seam, before the command is
+   * persisted: the stored message, the thread UI, and the provider input end
+   * up identical. Later turns pass through with the field stripped, so it is
+   * never re-applied. Older servers decode this schema without the field and
+   * silently drop it, degrading to text-only delivery.
    */
   freshContext: Schema.optional(Schema.String),
 });

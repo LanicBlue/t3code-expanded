@@ -17,7 +17,10 @@ import {
   failEnvironmentNotFound,
   requireEnvironmentScope,
 } from "../auth/http.ts";
-import { dispatchWithImBridgePersona } from "../imBridgePersona.ts";
+import {
+  dispatchWithImBridgePersona,
+  imBridgeThreadStartsConversation,
+} from "../imBridgePersona.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -29,8 +32,10 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const orchestrationEngine = yield* OrchestrationEngineService;
     // The bridge dispatches exclusively through this route; its members'
-    // personas are injected here, server-side, so the bridge stays
-    // persona-agnostic. Minimal boots (headless project CLI server) mount no
+    // personas and the mission's stable context are folded into the first
+    // turn's message text here, server-side, so the bridge stays
+    // persona-agnostic and the stored message is the complete input.
+    // Minimal boots (headless project CLI server) mount no
     // settings service; without it there are no bridge members either, so the
     // getter reports the same shape as a failed read and dispatch passes the
     // command through raw.
@@ -48,7 +53,11 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         onSome: (service) => service.getSettings,
       }),
     );
-    const dispatch = dispatchWithImBridgePersona(orchestrationEngine, getSettings);
+    const dispatch = dispatchWithImBridgePersona(
+      orchestrationEngine,
+      getSettings,
+      imBridgeThreadStartsConversation(() => projectionSnapshotQuery.getShellSnapshot()),
+    );
 
     return handlers
       .handle(

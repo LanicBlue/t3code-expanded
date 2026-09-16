@@ -929,7 +929,7 @@ describe("ProviderCommandReactor", () => {
   );
 
   effectIt.effect(
-    "prepends message freshContext only when the provider thread starts history-less",
+    "passes message text through regardless of context.freshContext — the fold lives at dispatch",
     () =>
       Effect.gen(function* () {
         const harness = yield* Effect.promise(() => createHarness());
@@ -952,24 +952,18 @@ describe("ProviderCommandReactor", () => {
             createdAt: "2026-01-01T00:00:00.000Z",
           });
 
-        // First turn on a new thread: the provider thread starts with no
-        // conversation history, so the sender's freshContext rides the input.
+        // The provider input is the stored message text verbatim on a new
+        // thread (the dispatch seam already folded any freshContext into it)
+        // and on later turns, live or re-pulled after the session settles.
         yield* turnStart("user-fresh", "STABLE MISSION CONTEXT");
         yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
-        const freshInput = String(harness.sendTurn.mock.calls[0]?.[0]?.input ?? "");
-        expect(freshInput.startsWith("STABLE MISSION CONTEXT\n\nround brief")).toBe(true);
+        expect(String(harness.sendTurn.mock.calls[0]?.[0]?.input ?? "")).toBe("round brief");
 
-        // Second turn while the provider session is live (carries history):
-        // raw text only, and the session is reused rather than restarted.
         yield* turnStart("user-resumed", "STABLE MISSION CONTEXT");
         yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 2));
-        const resumedInput = String(harness.sendTurn.mock.calls[1]?.[0]?.input ?? "");
-        expect(resumedInput).toBe("round brief");
+        expect(String(harness.sendTurn.mock.calls[1]?.[0]?.input ?? "")).toBe("round brief");
         expect(harness.startSession.mock.calls.length).toBe(1);
 
-        // Third turn after the session settled and stopped (the between-rounds
-        // re-pull): the provider thread keeps its persisted transcript, so the
-        // restarted session is resumed, not fresh — raw text only.
         yield* harness.engine.dispatch({
           type: "thread.session.set",
           commandId: CommandId.make("cmd-session-set-stopped-fresh-context"),
@@ -988,8 +982,7 @@ describe("ProviderCommandReactor", () => {
         });
         yield* turnStart("user-repulled", "STABLE MISSION CONTEXT");
         yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 3));
-        const repulledInput = String(harness.sendTurn.mock.calls[2]?.[0]?.input ?? "");
-        expect(repulledInput).toBe("round brief");
+        expect(String(harness.sendTurn.mock.calls[2]?.[0]?.input ?? "")).toBe("round brief");
         expect(harness.startSession.mock.calls.length).toBe(2);
       }),
   );

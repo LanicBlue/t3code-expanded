@@ -883,7 +883,7 @@ const make = Effect.gen(function* () {
         !shouldRestartForModelSelectionChange
       ) {
         yield* refreshWorkspaceSnapshot;
-        return { threadId: existingSessionThreadId, fresh: false };
+        return existingSessionThreadId;
       }
 
       const resumeCursor = shouldRestartForModelChange
@@ -920,28 +920,17 @@ const make = Effect.gen(function* () {
         cwd: restartedSession.cwd,
       });
       yield* bindSessionToThread(restartedSession);
-      // Only a model-change restart deliberately discards the conversation;
-      // a cursor-less restart still continues the provider thread's persisted
-      // transcript, so the turn is resumed, not fresh.
-      return { threadId: restartedSession.threadId, fresh: shouldRestartForModelChange };
+      return restartedSession.threadId;
     }
 
     const startedSession = yield* startProviderSession(undefined);
     yield* bindSessionToThread(startedSession);
-    // A stopped-session re-pull continues the provider thread's existing
-    // conversation — providers persist transcripts per thread (codex rollouts,
-    // zcode sessions), so the restarted session is not history-less. Only a
-    // thread that never ran a session starts a fresh conversation.
-    return { threadId: startedSession.threadId, fresh: thread.session === null };
+    return startedSession.threadId;
   });
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly messageText: string;
-    /** Prepended by the sender for provider threads with no history (see
-     * OrchestrationMessageContext.freshContext); the session lifecycle above
-     * is the only authority on whether this turn starts history-less. */
-    readonly freshContext?: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
     readonly interactionMode?: "default" | "plan";
@@ -953,17 +942,14 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    const session = yield* ensureSessionForThread(input.threadId, input.createdAt, {
+    yield* ensureSessionForThread(input.threadId, input.createdAt, {
       ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
       pendingTurnStart: true,
     });
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
-    const messageText =
-      session.fresh && input.freshContext !== undefined && input.freshContext.trim().length > 0
-        ? `${input.freshContext.trim()}\n\n${input.messageText}`
-        : input.messageText;
+    const messageText = input.messageText;
     const normalizedInput = toNonEmptyProviderInput(messageText);
     const normalizedAttachments = input.attachments ?? [];
     const activeSession = yield* providerService
@@ -1565,9 +1551,6 @@ const make = Effect.gen(function* () {
         text: message.text,
         records: message.context?.records ?? [],
       }),
-      ...(message.context?.freshContext !== undefined
-        ? { freshContext: message.context.freshContext }
-        : {}),
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }
