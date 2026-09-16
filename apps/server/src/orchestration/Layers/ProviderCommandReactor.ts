@@ -920,14 +920,19 @@ const make = Effect.gen(function* () {
         cwd: restartedSession.cwd,
       });
       yield* bindSessionToThread(restartedSession);
-      // A restart without a resume cursor starts a provider thread with no
-      // conversation history — the turn's freshContext must ride it.
-      return { threadId: restartedSession.threadId, fresh: resumeCursor === undefined };
+      // Only a model-change restart deliberately discards the conversation;
+      // a cursor-less restart still continues the provider thread's persisted
+      // transcript, so the turn is resumed, not fresh.
+      return { threadId: restartedSession.threadId, fresh: shouldRestartForModelChange };
     }
 
     const startedSession = yield* startProviderSession(undefined);
     yield* bindSessionToThread(startedSession);
-    return { threadId: startedSession.threadId, fresh: true };
+    // A stopped-session re-pull continues the provider thread's existing
+    // conversation — providers persist transcripts per thread (codex rollouts,
+    // zcode sessions), so the restarted session is not history-less. Only a
+    // thread that never ran a session starts a fresh conversation.
+    return { threadId: startedSession.threadId, fresh: thread.session === null };
   });
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {

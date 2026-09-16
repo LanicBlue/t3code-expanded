@@ -966,6 +966,31 @@ describe("ProviderCommandReactor", () => {
         const resumedInput = String(harness.sendTurn.mock.calls[1]?.[0]?.input ?? "");
         expect(resumedInput).toBe("round brief");
         expect(harness.startSession.mock.calls.length).toBe(1);
+
+        // Third turn after the session settled and stopped (the between-rounds
+        // re-pull): the provider thread keeps its persisted transcript, so the
+        // restarted session is resumed, not fresh — raw text only.
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-stopped-fresh-context"),
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "stopped",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-01-01T00:00:02.000Z",
+          },
+          createdAt: "2026-01-01T00:00:02.000Z",
+        });
+        yield* turnStart("user-repulled", "STABLE MISSION CONTEXT");
+        yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 3));
+        const repulledInput = String(harness.sendTurn.mock.calls[2]?.[0]?.input ?? "");
+        expect(repulledInput).toBe("round brief");
+        expect(harness.startSession.mock.calls.length).toBe(2);
       }),
   );
 
