@@ -338,6 +338,24 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
             "utf8",
           ),
         ).toBe('{"revision":28}');
+        // The runtime-store layout mirror rides along: standalone one-shot
+        // CLIs resolve their active builtin release from that path.
+        expect(
+          NodeFS.readFileSync(
+            NodePath.join(
+              shadow,
+              ".zcode",
+              "v2",
+              "runtime",
+              "provider",
+              "darwin-arm64",
+              "3.12.3",
+              "endpoint-abc",
+              "zcode-builtin.json",
+            ),
+            "utf8",
+          ),
+        ).toBe('{"revision":28}');
       }),
     );
 

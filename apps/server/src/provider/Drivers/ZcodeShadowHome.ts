@@ -243,12 +243,22 @@ export function buildZcodePersonalProviderConfigFile(
 /**
  * Locate a zcode-builtin store to copy: the app-bundle copy next to the CLI
  * (stable across desktop-managed CDN refreshes), else the newest runtime
- * store cache the desktop keeps under the real home.
+ * store cache the desktop keeps under the real home. For runtime-tree sources
+ * the path relative to `<home>/.zcode/v2` is returned too — standalone
+ * (one-shot `--prompt`) CLIs resolve their "active" builtin release from that
+ * runtime-store layout regardless of the env pair, so the shadow home needs
+ * the same shape or those runs fall back to a network refresh that flakes.
  */
+interface ZcodeBuiltinStoreSource {
+  readonly path: string;
+  /** Path under `<home>/.zcode/v2` when copied from the real home's runtime tree. */
+  readonly runtimeRelPath?: string;
+}
+
 function resolveZcodeBuiltinStoreSource(
   binaryPath: string | undefined,
   realZcode: string,
-): string | undefined {
+): ZcodeBuiltinStoreSource | undefined {
   if (binaryPath !== undefined && binaryPath.trim().length > 0) {
     const bundled = NodePath.resolve(
       NodePath.dirname(binaryPath),
@@ -257,7 +267,7 @@ function resolveZcodeBuiltinStoreSource(
       "provider",
       BUILTIN_STORE_FILENAME,
     );
-    if (NodeFS.existsSync(bundled)) return bundled;
+    if (NodeFS.existsSync(bundled)) return { path: bundled };
   }
   const runtimeRoot = NodePath.join(realZcode, "v2", "runtime", "provider");
   let best: { readonly path: string; readonly mtime: number } | undefined;
@@ -280,7 +290,10 @@ function resolveZcodeBuiltinStoreSource(
     }
   };
   walk(runtimeRoot);
-  return best?.path;
+  if (best === undefined) return undefined;
+  const relative = NodePath.relative(NodePath.join(realZcode, "v2"), best.path);
+  if (relative.length === 0 || relative.startsWith("..")) return { path: best.path };
+  return { path: best.path, runtimeRelPath: relative };
 }
 
 const realHomeStub = (realHomeDir: string) =>
@@ -381,7 +394,7 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
     if (builtinStoreSource !== undefined && Option.isSome(personalConfig)) {
       yield* makeDirectory(providerConfigDirPath);
       yield* Effect.tryPromise({
-        try: () => NodeFS.promises.copyFile(builtinStoreSource, builtinStorePath),
+        try: () => NodeFS.promises.copyFile(builtinStoreSource.path, builtinStorePath),
         catch: fsError("copyFile", builtinStorePath),
       });
       yield* encodePersonalConfigJson(personalConfig.value).pipe(
@@ -400,13 +413,38 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
           }),
         ),
       );
-    } else if (NodeFS.existsSync(providerConfigDirPath)) {
+      // Mirror the builtin store into the runtime-store layout the CLI itself
+      // uses for its "active" release: standalone (one-shot `--prompt`) runs
+      // resolve from that layout, not the env pair, and without it they lean
+      // on a network refresh that flakes in windows. Mirrored at the real
+      // home's current version path — a desktop update may age it until the
+      // next T3 restart re-materializes.
+      if (builtinStoreSource.runtimeRelPath !== undefined) {
+        const mirrorPath = NodePath.join(shadowZcode, "v2", builtinStoreSource.runtimeRelPath);
+        yield* makeDirectory(NodePath.dirname(mirrorPath));
+        yield* Effect.tryPromise({
+          try: () => NodeFS.promises.copyFile(builtinStoreSource.path, mirrorPath),
+          catch: fsError("copyFile", mirrorPath),
+        });
+      }
+    } else {
       // The pair is no longer derivable — drop a stale pair instead of
       // pointing the env at outdated providers.
-      yield* Effect.tryPromise({
-        try: () => NodeFS.promises.rm(providerConfigDirPath, { recursive: true, force: true }),
-        catch: fsError("remove", providerConfigDirPath),
-      });
+      if (NodeFS.existsSync(providerConfigDirPath)) {
+        yield* Effect.tryPromise({
+          try: () => NodeFS.promises.rm(providerConfigDirPath, { recursive: true, force: true }),
+          catch: fsError("remove", providerConfigDirPath),
+        });
+      }
+      if (builtinStoreSource?.runtimeRelPath !== undefined) {
+        const mirrorPath = NodePath.join(shadowZcode, "v2", builtinStoreSource.runtimeRelPath);
+        if (NodeFS.existsSync(mirrorPath)) {
+          yield* Effect.tryPromise({
+            try: () => NodeFS.promises.rm(mirrorPath, { force: true }),
+            catch: fsError("remove", mirrorPath),
+          });
+        }
+      }
     }
 
     // Static shared entries: symlink once; fix a stale link, never overwrite a
