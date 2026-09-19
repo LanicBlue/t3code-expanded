@@ -112,7 +112,10 @@ export const ZCodeDriver: ProviderDriver<ZCodeSettings, ZCodeDriverEnv> = {
         });
       }
       if (shadowHomePath !== undefined) {
-        yield* materializeZcodeShadowHome({ shadowHomePath }).pipe(
+        yield* materializeZcodeShadowHome({
+          shadowHomePath,
+          binaryPath: config.binaryPath,
+        }).pipe(
           Effect.mapError(
             (cause) =>
               new ProviderDriverError({

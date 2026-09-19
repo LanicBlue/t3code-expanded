@@ -7,10 +7,16 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 
+const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
 import {
+  buildZcodePersonalProviderRules,
   materializeZcodeShadowHome,
   resolveZcodeShadowHomePath,
+  zcodeProviderConfigEnvironment,
   zcodeShadowHomeEnvironment,
+  ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV,
+  ZCODE_PERSONAL_PROVIDER_CONFIG_FILE_ENV,
   ZcodeShadowHomeEntryConflictError,
   ZcodeShadowHomePathConflictError,
 } from "./ZcodeShadowHome.ts";
@@ -95,6 +101,67 @@ describe("zcodeShadowHomeEnvironment (pure)", () => {
       HOME: "/srv/zcode-shadow",
       USERPROFILE: "/srv/zcode-shadow",
     });
+  });
+
+  it("adds the provider-config env pair once both files are materialized", () => {
+    const env = zcodeShadowHomeEnvironment("/srv/zcode-shadow", {});
+    expect(ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV in env).toBe(false);
+    expect(zcodeProviderConfigEnvironment("/srv/zcode-shadow")).toEqual({});
+  });
+});
+
+describe("buildZcodePersonalProviderRules (pure)", () => {
+  const legacyMap = {
+    "builtin:bigmodel-coding-plan": {
+      name: "BigModel - Coding Plan",
+      kind: "anthropic",
+      options: { apiKey: "sk-test", baseURL: "https://open.bigmodel.cn/api/anthropic" },
+      enabled: true,
+      models: { "GLM-5.3-Flash": {}, "GLM-5.3": {} },
+    },
+    "builtin:zai": {
+      name: "Z.ai - API Key",
+      kind: "anthropic",
+      options: { apiKey: "sk-zai", baseURL: "https://api.z.ai/api" },
+      enabled: false,
+      models: { "GLM-5.3": {} },
+    },
+    "builtin:oauth-entry": { name: "OAuth", kind: "anthropic", options: {}, models: {} },
+    "custom-plain": {
+      kind: "openai",
+      options: { apiKey: "sk-openai", baseURL: "https://api.example.com/v1" },
+      models: { "gpt-x": {} },
+    },
+  };
+
+  it("migrates API-key entries, strips the builtin: prefix, skips credential-less ones", () => {
+    const rules = buildZcodePersonalProviderRules(legacyMap);
+    expect(rules.map((rule) => rule.providerId)).toEqual([
+      "bigmodel-coding-plan",
+      "zai",
+      "custom-plain",
+    ]);
+    expect(rules[0]).toEqual({
+      providerId: "bigmodel-coding-plan",
+      providerName: "BigModel - Coding Plan",
+      enabled: true,
+      config: {
+        group: "standard-personal",
+        access: { type: "api-key", apiKey: "sk-test" },
+        api: {
+          type: "anthropic-messages",
+          baseUrl: "https://open.bigmodel.cn/api/anthropic",
+        },
+        personalModelIds: ["GLM-5.3-Flash", "GLM-5.3"],
+      },
+    });
+    expect(rules[1]!.enabled).toBe(false);
+    expect(rules[2]!.config.api.type).toBe("openai-chat-completions");
+  });
+
+  it("returns empty for non-object input", () => {
+    expect(buildZcodePersonalProviderRules(undefined)).toEqual([]);
+    expect(buildZcodePersonalProviderRules("nope")).toEqual([]);
   });
 });
 
@@ -191,6 +258,124 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
         yield* materializeZcodeShadowHome({ shadowHomePath: shadow, realHomeDir: realHome });
         expect(NodeFS.existsSync(NodePath.join(shadow, ".zcode", "cli"))).toBe(true);
         expect(NodeFS.existsSync(NodePath.join(shadow, ".zcode", "skills"))).toBe(false);
+      }),
+    );
+
+    it.effect("materializes the provider-config pair from legacy providers + bundle store", () =>
+      Effect.gen(function* () {
+        const realHome = yield* makeTempDir("t3code-zcode-real-");
+        const shadow = yield* makeTempDir("t3code-zcode-shadow-");
+        const bundle = yield* makeTempDir("t3code-zcode-bundle-");
+        // App-bundle layout: <bundle>/glm/zcode.cjs + <bundle>/config/provider/zcode-builtin.json
+        const binaryPath = NodePath.join(bundle, "glm", "zcode.cjs");
+        yield* writeTextFile(
+          NodePath.join(realHome, ".zcode", "v2", "config.json"),
+          '{"provider":{"builtin:bigmodel-coding-plan":{"name":"BigModel - Coding Plan","kind":"anthropic","options":{"apiKey":"sk-test","baseURL":"https://open.bigmodel.cn/api/anthropic"},"models":{"GLM-5.3":{}}}}}',
+        );
+        yield* writeTextFile(
+          NodePath.join(bundle, "config", "provider", "zcode-builtin.json"),
+          '{"revision":28}',
+        );
+
+        yield* materializeZcodeShadowHome({
+          shadowHomePath: shadow,
+          realHomeDir: realHome,
+          binaryPath,
+        });
+
+        const dir = NodePath.join(shadow, ".zcode", "v2", "t3-provider-config");
+        expect(NodeFS.readFileSync(NodePath.join(dir, "zcode-builtin.json"), "utf8")).toBe(
+          '{"revision":28}',
+        );
+        const personal = decodeUnknownJson(
+          NodeFS.readFileSync(NodePath.join(dir, "provider-personal.json"), "utf8"),
+        ) as {
+          schemaVersion: number;
+          config: { providerConfigRules: { providerRules: ReadonlyArray<{ providerId: string }> } };
+        };
+        expect(personal.schemaVersion).toBe(1);
+        expect(
+          personal.config.providerConfigRules.providerRules.map((rule) => rule.providerId),
+        ).toEqual(["bigmodel-coding-plan"]);
+        const env = zcodeShadowHomeEnvironment(shadow, {});
+        expect(env[ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV]).toBe(
+          NodePath.join(dir, "zcode-builtin.json"),
+        );
+        expect(env[ZCODE_PERSONAL_PROVIDER_CONFIG_FILE_ENV]).toBe(
+          NodePath.join(dir, "provider-personal.json"),
+        );
+      }),
+    );
+
+    it.effect("falls back to the newest runtime store when no bundle store exists", () =>
+      Effect.gen(function* () {
+        const realHome = yield* makeTempDir("t3code-zcode-real-");
+        const shadow = yield* makeTempDir("t3code-zcode-shadow-");
+        yield* writeTextFile(
+          NodePath.join(realHome, ".zcode", "v2", "config.json"),
+          '{"provider":{"builtin:p":{"kind":"openai","options":{"apiKey":"k","baseURL":"https://x.example"},"models":{"m":{}}}}}',
+        );
+        yield* writeTextFile(
+          NodePath.join(
+            realHome,
+            ".zcode",
+            "v2",
+            "runtime",
+            "provider",
+            "darwin-arm64",
+            "3.12.3",
+            "endpoint-abc",
+            "zcode-builtin.json",
+          ),
+          '{"revision":28}',
+        );
+
+        yield* materializeZcodeShadowHome({ shadowHomePath: shadow, realHomeDir: realHome });
+
+        expect(
+          NodeFS.readFileSync(
+            NodePath.join(shadow, ".zcode", "v2", "t3-provider-config", "zcode-builtin.json"),
+            "utf8",
+          ),
+        ).toBe('{"revision":28}');
+      }),
+    );
+
+    it.effect("drops a stale provider-config pair when it is no longer derivable", () =>
+      Effect.gen(function* () {
+        const realHome = yield* makeTempDir("t3code-zcode-real-");
+        const shadow = yield* makeTempDir("t3code-zcode-shadow-");
+        const bundle = yield* makeTempDir("t3code-zcode-bundle-");
+        const binaryPath = NodePath.join(bundle, "glm", "zcode.cjs");
+        const legacyConfig = NodePath.join(realHome, ".zcode", "v2", "config.json");
+        yield* writeTextFile(
+          legacyConfig,
+          '{"provider":{"builtin:p":{"kind":"openai","options":{"apiKey":"k","baseURL":"https://x.example"},"models":{"m":{}}}}}',
+        );
+        yield* writeTextFile(
+          NodePath.join(bundle, "config", "provider", "zcode-builtin.json"),
+          '{"revision":28}',
+        );
+        yield* materializeZcodeShadowHome({
+          shadowHomePath: shadow,
+          realHomeDir: realHome,
+          binaryPath,
+        });
+        expect(NodeFS.existsSync(NodePath.join(shadow, ".zcode", "v2", "t3-provider-config"))).toBe(
+          true,
+        );
+
+        // The provider map disappears → the stale pair must not survive.
+        yield* writeTextFile(legacyConfig, "{}");
+        yield* materializeZcodeShadowHome({
+          shadowHomePath: shadow,
+          realHomeDir: realHome,
+          binaryPath,
+        });
+        expect(NodeFS.existsSync(NodePath.join(shadow, ".zcode", "v2", "t3-provider-config"))).toBe(
+          false,
+        );
+        expect(zcodeProviderConfigEnvironment(shadow)).toEqual({});
       }),
     );
   });
