@@ -241,24 +241,14 @@ export function buildZcodePersonalProviderConfigFile(
 }
 
 /**
- * Locate a zcode-builtin store to copy: the app-bundle copy next to the CLI
- * (stable across desktop-managed CDN refreshes), else the newest runtime
- * store cache the desktop keeps under the real home. For runtime-tree sources
- * the path relative to `<home>/.zcode/v2` is returned too — standalone
- * (one-shot `--prompt`) CLIs resolve their "active" builtin release from that
- * runtime-store layout regardless of the env pair, so the shadow home needs
- * the same shape or those runs fall back to a network refresh that flakes.
+ * Locate a zcode-builtin store to copy for the env pair: the app-bundle copy
+ * next to the CLI (stable across desktop-managed CDN refreshes), else the
+ * newest runtime-store cache the desktop keeps under the real home.
  */
-interface ZcodeBuiltinStoreSource {
-  readonly path: string;
-  /** Path under `<home>/.zcode/v2` when copied from the real home's runtime tree. */
-  readonly runtimeRelPath?: string;
-}
-
 function resolveZcodeBuiltinStoreSource(
   binaryPath: string | undefined,
   realZcode: string,
-): ZcodeBuiltinStoreSource | undefined {
+): string | undefined {
   if (binaryPath !== undefined && binaryPath.trim().length > 0) {
     const bundled = NodePath.resolve(
       NodePath.dirname(binaryPath),
@@ -267,7 +257,7 @@ function resolveZcodeBuiltinStoreSource(
       "provider",
       BUILTIN_STORE_FILENAME,
     );
-    if (NodeFS.existsSync(bundled)) return { path: bundled };
+    if (NodeFS.existsSync(bundled)) return bundled;
   }
   const runtimeRoot = NodePath.join(realZcode, "v2", "runtime", "provider");
   let best: { readonly path: string; readonly mtime: number } | undefined;
@@ -290,10 +280,105 @@ function resolveZcodeBuiltinStoreSource(
     }
   };
   walk(runtimeRoot);
-  if (best === undefined) return undefined;
-  const relative = NodePath.relative(NodePath.join(realZcode, "v2"), best.path);
-  if (relative.length === 0 || relative.startsWith("..")) return { path: best.path };
-  return { path: best.path, runtimeRelPath: relative };
+  return best?.path;
+}
+
+/**
+ * The runtime-store-layout mirror target: standalone (one-shot `--prompt`)
+ * CLIs resolve their "active" builtin release from
+ * `.zcode/v2/runtime/provider/<platform>/<version>/endpoint-<hash>/` — not
+ * from the env pair — and without that layout they lean on a network refresh
+ * that flakes in windows. The desktop writes a directory per app version; the
+ * running CLI looks under its own version, so the mirror must track the
+ * HIGHEST version directory (not the newest file: a CDN refresh can rewrite
+ * an old version's file). Resolved independently of the env-pair source — a
+ * bundle source must not stop the mirror from refreshing after updates.
+ */
+interface ZcodeRuntimeStoreMirror {
+  readonly path: string;
+  /** Path under `<home>/.zcode/v2`, e.g. `runtime/provider/<plat>/<ver>/endpoint-<h>/zcode-builtin.json`. */
+  readonly relPath: string;
+}
+
+const parseVersionSegments = (raw: string): ReadonlyArray<number> | undefined => {
+  const parts = raw.split(".");
+  if (parts.length === 0 || parts.some((part) => !/^\d+$/.test(part))) return undefined;
+  return parts.map((part) => Number.parseInt(part, 10));
+};
+
+const compareVersionSegments = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): number => {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const left = a[i] ?? 0;
+    const right = b[i] ?? 0;
+    if (left !== right) return left - right;
+  }
+  return 0;
+};
+
+function resolveZcodeRuntimeStoreMirror(realZcode: string): ZcodeRuntimeStoreMirror | undefined {
+  const runtimeRoot = NodePath.join(realZcode, "v2", "runtime", "provider");
+  let platformDir;
+  try {
+    platformDir = NodeFS.readdirSync(runtimeRoot, { withFileTypes: true }).find((entry) =>
+      entry.isDirectory(),
+    );
+  } catch {
+    return undefined;
+  }
+  if (platformDir === undefined) return undefined;
+  let best:
+    | {
+        readonly path: string;
+        readonly relPath: string;
+        readonly version: ReadonlyArray<number>;
+        readonly mtime: number;
+      }
+    | undefined;
+  const platformRoot = NodePath.join(runtimeRoot, platformDir.name);
+  let versionDirs;
+  try {
+    versionDirs = NodeFS.readdirSync(platformRoot, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const versionDir of versionDirs) {
+    if (!versionDir.isDirectory()) continue;
+    const version = parseVersionSegments(versionDir.name);
+    if (version === undefined) continue;
+    let endpointDirs;
+    try {
+      endpointDirs = NodeFS.readdirSync(NodePath.join(platformRoot, versionDir.name), {
+        withFileTypes: true,
+      });
+    } catch {
+      continue;
+    }
+    for (const endpointDir of endpointDirs) {
+      if (!endpointDir.isDirectory()) continue;
+      const storePath = NodePath.join(
+        platformRoot,
+        versionDir.name,
+        endpointDir.name,
+        BUILTIN_STORE_FILENAME,
+      );
+      if (!NodeFS.existsSync(storePath)) continue;
+      const mtime = NodeFS.statSync(storePath).mtimeMs;
+      if (
+        best === undefined ||
+        compareVersionSegments(version, best.version) > 0 ||
+        (compareVersionSegments(version, best.version) === 0 && mtime > best.mtime)
+      ) {
+        best = {
+          path: storePath,
+          relPath: NodePath.relative(NodePath.join(realZcode, "v2"), storePath),
+          version,
+          mtime,
+        };
+      }
+    }
+  }
+  if (best === undefined || best.relPath.startsWith("..")) return undefined;
+  return { path: best.path, relPath: best.relPath };
 }
 
 const realHomeStub = (realHomeDir: string) =>
@@ -373,6 +458,12 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
     const builtinStorePath = NodePath.join(providerConfigDirPath, BUILTIN_STORE_FILENAME);
     const personalConfigPath = NodePath.join(providerConfigDirPath, PERSONAL_CONFIG_FILENAME);
     const builtinStoreSource = resolveZcodeBuiltinStoreSource(input.binaryPath, realZcode);
+    // Mirror target tracked independently of the env-pair source: the bundle
+    // usually wins for the pair, but the mirror must follow the runtime
+    // tree's newest app version or one-shot CLIs lose their active release
+    // after every desktop update.
+    const runtimeMirror = resolveZcodeRuntimeStoreMirror(realZcode);
+    const shadowRuntimeProviderRoot = NodePath.join(shadowZcode, "v2", "runtime", "provider");
     const encodePersonalConfigJson = Schema.encodeUnknownEffect(
       fromJsonStringPretty(Schema.Unknown),
     );
@@ -394,7 +485,7 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
     if (builtinStoreSource !== undefined && Option.isSome(personalConfig)) {
       yield* makeDirectory(providerConfigDirPath);
       yield* Effect.tryPromise({
-        try: () => NodeFS.promises.copyFile(builtinStoreSource.path, builtinStorePath),
+        try: () => NodeFS.promises.copyFile(builtinStoreSource, builtinStorePath),
         catch: fsError("copyFile", builtinStorePath),
       });
       yield* encodePersonalConfigJson(personalConfig.value).pipe(
@@ -413,17 +504,20 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
           }),
         ),
       );
-      // Mirror the builtin store into the runtime-store layout the CLI itself
-      // uses for its "active" release: standalone (one-shot `--prompt`) runs
-      // resolve from that layout, not the env pair, and without it they lean
-      // on a network refresh that flakes in windows. Mirrored at the real
-      // home's current version path — a desktop update may age it until the
-      // next T3 restart re-materializes.
-      if (builtinStoreSource.runtimeRelPath !== undefined) {
-        const mirrorPath = NodePath.join(shadowZcode, "v2", builtinStoreSource.runtimeRelPath);
+      // Runtime-store mirror: rebuilt from scratch so a desktop update (new
+      // version directory) replaces any aged mirror instead of accumulating.
+      if (runtimeMirror !== undefined) {
+        if (NodeFS.existsSync(shadowRuntimeProviderRoot)) {
+          yield* Effect.tryPromise({
+            try: () =>
+              NodeFS.promises.rm(shadowRuntimeProviderRoot, { recursive: true, force: true }),
+            catch: fsError("remove", shadowRuntimeProviderRoot),
+          });
+        }
+        const mirrorPath = NodePath.join(shadowZcode, "v2", runtimeMirror.relPath);
         yield* makeDirectory(NodePath.dirname(mirrorPath));
         yield* Effect.tryPromise({
-          try: () => NodeFS.promises.copyFile(builtinStoreSource.path, mirrorPath),
+          try: () => NodeFS.promises.copyFile(runtimeMirror.path, mirrorPath),
           catch: fsError("copyFile", mirrorPath),
         });
       }
@@ -436,14 +530,12 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
           catch: fsError("remove", providerConfigDirPath),
         });
       }
-      if (builtinStoreSource?.runtimeRelPath !== undefined) {
-        const mirrorPath = NodePath.join(shadowZcode, "v2", builtinStoreSource.runtimeRelPath);
-        if (NodeFS.existsSync(mirrorPath)) {
-          yield* Effect.tryPromise({
-            try: () => NodeFS.promises.rm(mirrorPath, { force: true }),
-            catch: fsError("remove", mirrorPath),
-          });
-        }
+      if (NodeFS.existsSync(shadowRuntimeProviderRoot)) {
+        yield* Effect.tryPromise({
+          try: () =>
+            NodeFS.promises.rm(shadowRuntimeProviderRoot, { recursive: true, force: true }),
+          catch: fsError("remove", shadowRuntimeProviderRoot),
+        });
       }
     }
 

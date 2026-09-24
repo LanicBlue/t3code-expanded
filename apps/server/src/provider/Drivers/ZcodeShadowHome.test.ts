@@ -359,6 +359,114 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
       }),
     );
 
+    it.effect(
+      "mirrors the runtime-store layout independently of the bundle source, replacing aged mirrors",
+      () =>
+        Effect.gen(function* () {
+          const realHome = yield* makeTempDir("t3code-zcode-real-");
+          const shadow = yield* makeTempDir("t3code-zcode-shadow-");
+          const bundle = yield* makeTempDir("t3code-zcode-bundle-");
+          const binaryPath = NodePath.join(bundle, "glm", "zcode.cjs");
+          yield* writeTextFile(
+            NodePath.join(realHome, ".zcode", "v2", "config.json"),
+            '{"provider":{"builtin:p":{"kind":"openai","options":{"apiKey":"k","baseURL":"https://x.example"},"models":{"m":{}}}}}',
+          );
+          yield* writeTextFile(
+            NodePath.join(bundle, "config", "provider", "zcode-builtin.json"),
+            '{"revision":99,"source":"bundle"}',
+          );
+          // Real home runtime tree with two versions: the newest wins for the
+          // mirror even though the bundle wins for the env-pair copy.
+          const oldVersion = NodePath.join(
+            realHome,
+            ".zcode",
+            "v2",
+            "runtime",
+            "provider",
+            "darwin-arm64",
+            "3.14.0",
+            "endpoint-abc",
+          );
+          const newVersion = NodePath.join(
+            realHome,
+            ".zcode",
+            "v2",
+            "runtime",
+            "provider",
+            "darwin-arm64",
+            "3.14.3",
+            "endpoint-abc",
+          );
+          yield* writeTextFile(
+            NodePath.join(oldVersion, "zcode-builtin.json"),
+            '{"revision":28,"source":"runtime-old"}',
+          );
+          yield* writeTextFile(
+            NodePath.join(newVersion, "zcode-builtin.json"),
+            '{"revision":30,"source":"runtime-new"}',
+          );
+          // An aged mirror from an earlier materialization (older version dir).
+          yield* writeTextFile(
+            NodePath.join(
+              shadow,
+              ".zcode",
+              "v2",
+              "runtime",
+              "provider",
+              "darwin-arm64",
+              "3.13.0",
+              "endpoint-abc",
+              "zcode-builtin.json",
+            ),
+            '{"revision":27,"source":"stale-mirror"}',
+          );
+
+          yield* materializeZcodeShadowHome({
+            shadowHomePath: shadow,
+            realHomeDir: realHome,
+            binaryPath,
+          });
+
+          // Env-pair copy prefers the bundle; the mirror tracks the runtime
+          // tree's highest version and the stale version dir is gone.
+          expect(
+            NodeFS.readFileSync(
+              NodePath.join(shadow, ".zcode", "v2", "t3-provider-config", "zcode-builtin.json"),
+              "utf8",
+            ),
+          ).toBe('{"revision":99,"source":"bundle"}');
+          expect(
+            NodeFS.readFileSync(
+              NodePath.join(
+                shadow,
+                ".zcode",
+                "v2",
+                "runtime",
+                "provider",
+                "darwin-arm64",
+                "3.14.3",
+                "endpoint-abc",
+                "zcode-builtin.json",
+              ),
+              "utf8",
+            ),
+          ).toBe('{"revision":30,"source":"runtime-new"}');
+          expect(
+            NodeFS.existsSync(
+              NodePath.join(
+                shadow,
+                ".zcode",
+                "v2",
+                "runtime",
+                "provider",
+                "darwin-arm64",
+                "3.13.0",
+              ),
+            ),
+          ).toBe(false);
+        }),
+    );
+
     it.effect("drops a stale provider-config pair when it is no longer derivable", () =>
       Effect.gen(function* () {
         const realHome = yield* makeTempDir("t3code-zcode-real-");
@@ -382,6 +490,21 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
         expect(NodeFS.existsSync(NodePath.join(shadow, ".zcode", "v2", "t3-provider-config"))).toBe(
           true,
         );
+        // A mirror from the pair era must be dropped along with the pair.
+        yield* writeTextFile(
+          NodePath.join(
+            shadow,
+            ".zcode",
+            "v2",
+            "runtime",
+            "provider",
+            "darwin-arm64",
+            "3.14.3",
+            "endpoint-abc",
+            "zcode-builtin.json",
+          ),
+          '{"revision":30}',
+        );
 
         // The provider map disappears → the stale pair must not survive.
         yield* writeTextFile(legacyConfig, "{}");
@@ -393,6 +516,9 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
         expect(NodeFS.existsSync(NodePath.join(shadow, ".zcode", "v2", "t3-provider-config"))).toBe(
           false,
         );
+        expect(
+          NodeFS.existsSync(NodePath.join(shadow, ".zcode", "v2", "runtime", "provider")),
+        ).toBe(false);
         expect(zcodeProviderConfigEnvironment(shadow)).toEqual({});
       }),
     );
