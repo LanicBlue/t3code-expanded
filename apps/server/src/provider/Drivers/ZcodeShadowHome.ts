@@ -34,6 +34,7 @@
  */
 // @effect-diagnostics nodeBuiltinImport:off
 import type { ZCodeSettings } from "@t3tools/contracts";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -61,6 +62,76 @@ export const ZCODE_PERSONAL_PROVIDER_CONFIG_FILE_ENV = "ZCODE_PERSONAL_PROVIDER_
 const PROVIDER_CONFIG_DIR = ["v2", "t3-provider-config"] as const;
 const BUILTIN_STORE_FILENAME = "zcode-builtin.json";
 const PERSONAL_CONFIG_FILENAME = "provider-personal.json";
+
+/** Shared credential store (encrypted values) inside the zcode v2 root. */
+const CREDENTIALS_FILE = ["v2", "credentials.json"] as const;
+
+/** Fork opt-in: protocol entry resolves account providers from the credential store. */
+export const ZCODE_PROTOCOL_STANDALONE_ACCOUNTS_ENV = "ZCODE_PROTOCOL_STANDALONE_ACCOUNTS";
+/** Decrypts the copied store; without it the shadow home derives a different fallback secret. */
+export const ZCODE_CREDENTIAL_SECRET_ENV = "ZCODE_CREDENTIAL_SECRET";
+
+/**
+ * `account-provider:coding-plan:<providerId>:account:<identity>:api-key` —
+ * the desktop login writes these but not the standalone identity keys the
+ * headless account resolution reads first, so the shadow copy synthesizes
+ * them from the identities already visible in the key names.
+ */
+const ACCOUNT_API_KEY_CREDENTIAL_KEY =
+  /^account-provider:coding-plan:(account:[a-z0-9-]+):account:([^:]+):api-key$/;
+
+const accountIdentityCredentialKey = (providerId: string) =>
+  `account-provider:${providerId}:identity`;
+
+/** Mirrors the CLI store's fallback secret: same platform/home/username, or nothing decrypts. */
+export function zcodeCredentialFallbackSecret(realHomeDir: string, username: string): string {
+  return `zcode-credential-fallback:${NodeOS.platform()}:${realHomeDir}:${username}`;
+}
+
+/** Mirrors the CLI store's `enc:v1:` AES-256-GCM value envelope. */
+function encryptCredentialValue(value: string, cipherSecret: string): string {
+  const key = createHash("sha256").update(cipherSecret).digest();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  return [
+    "enc:v1:",
+    iv.toString("base64url"),
+    ".",
+    cipher.getAuthTag().toString("base64url"),
+    ".",
+    ciphertext.toString("base64url"),
+  ].join("");
+}
+
+export interface ZcodeCredentialStoreMaterialization {
+  readonly store: Record<string, unknown>;
+  readonly accountProviderCount: number;
+}
+
+/**
+ * Copy of the parsed credential store plus synthesized standalone identity
+ * keys, or `undefined` when it has no coding-plan api-key entries — in that
+ * case standalone accounts would add nothing and the shadow keeps no
+ * credential file at all. Pre-existing identity keys are left untouched.
+ */
+export function synthesizeZcodeCredentialIdentityKeys(
+  store: Record<string, unknown>,
+  cipherSecret: string,
+): ZcodeCredentialStoreMaterialization | undefined {
+  const next = { ...store };
+  let accountProviderCount = 0;
+  for (const key of Object.keys(next)) {
+    const match = ACCOUNT_API_KEY_CREDENTIAL_KEY.exec(key);
+    if (match === null) continue;
+    accountProviderCount += 1;
+    const identityKey = accountIdentityCredentialKey(match[1]!);
+    if (typeof next[identityKey] === "string") continue;
+    next[identityKey] = encryptCredentialValue(match[2]!, cipherSecret);
+  }
+  if (accountProviderCount === 0) return undefined;
+  return { store: next, accountProviderCount };
+}
 
 export class ZcodeShadowHomePathConflictError extends Schema.TaggedError<ZcodeShadowHomePathConflictError>()(
   "ZcodeShadowHomePathConflictError",
@@ -478,6 +549,12 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
     const decodeLegacyProviderMap = Schema.decodeUnknownEffect(
       Schema.fromJsonString(Schema.Struct({ provider: Schema.optional(Schema.Unknown) })),
     );
+    const decodeCredentialsStoreJson = Schema.decodeUnknownEffect(
+      Schema.fromJsonString(Schema.Unknown),
+    );
+    const encodeCredentialsStoreJson = Schema.encodeUnknownEffect(
+      fromJsonStringPretty(Schema.Unknown),
+    );
     // An unreadable/unparsable legacy config keeps the previous behavior (no
     // personal providers) rather than failing the whole driver.
     const personalConfig = yield* fileSystem
@@ -547,6 +624,56 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
       }
     }
 
+    // OAuth credential store: the desktop login writes coding-plan api-key
+    // entries but not the standalone identity keys headless account
+    // resolution needs, so the shadow copy synthesizes them (encrypted with
+    // the REAL home's fallback secret — the copied values decrypt with it,
+    // and the spawn env passes the same secret). An unreadable store or one
+    // without account entries keeps the shadow credential-free rather than
+    // failing the driver; the API-key provider pair above remains the
+    // fallback. Fresh copy every materialization keeps rotated credentials
+    // current.
+    const realCredentialsPath = NodePath.join(realZcode, ...CREDENTIALS_FILE);
+    const shadowCredentialsPath = NodePath.join(shadowZcode, ...CREDENTIALS_FILE);
+    const credentialMaterialization = yield* fileSystem.readFileString(realCredentialsPath).pipe(
+      Effect.flatMap(decodeCredentialsStoreJson),
+      Effect.flatMap((parsed) => {
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          return Effect.succeedNone;
+        }
+        const synthesized = synthesizeZcodeCredentialIdentityKeys(
+          parsed as Record<string, unknown>,
+          zcodeCredentialFallbackSecret(realHomeDir, NodeOS.userInfo().username || "unknown"),
+        );
+        return synthesized === undefined ? Effect.succeedNone : Effect.succeedSome(synthesized);
+      }),
+      Effect.catch(() => Effect.succeedNone),
+    );
+    if (Option.isSome(credentialMaterialization)) {
+      yield* makeDirectory(NodePath.dirname(shadowCredentialsPath));
+      yield* encodeCredentialsStoreJson(credentialMaterialization.value.store).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ZcodeShadowHomeFileSystemError({
+              operation: "writeFile",
+              path: shadowCredentialsPath,
+              cause,
+            }),
+        ),
+        Effect.flatMap((json) =>
+          Effect.tryPromise({
+            try: () => NodeFS.promises.writeFile(shadowCredentialsPath, `${json}\n`),
+            catch: fsError("writeFile", shadowCredentialsPath),
+          }),
+        ),
+      );
+    } else if (NodeFS.existsSync(shadowCredentialsPath)) {
+      yield* Effect.tryPromise({
+        try: () => NodeFS.promises.rm(shadowCredentialsPath, { force: true }),
+        catch: fsError("remove", shadowCredentialsPath),
+      });
+    }
+
     // Static shared entries: symlink once; fix a stale link, never overwrite a
     // real file the operator placed.
     for (const entry of LINKED_ENTRIES) {
@@ -614,11 +741,36 @@ export function zcodeProviderConfigEnvironment(shadowHomePath: string): NodeJS.P
 export function zcodeShadowHomeEnvironment(
   shadowHomePath: string,
   base: NodeJS.ProcessEnv = {},
+  realHomeDir?: string,
 ): NodeJS.ProcessEnv {
   return {
     ...base,
     HOME: shadowHomePath,
     USERPROFILE: shadowHomePath,
     ...zcodeProviderConfigEnvironment(shadowHomePath),
+    ...zcodeStandaloneAccountsEnvironment(shadowHomePath, realHomeDir),
+  };
+}
+
+/**
+ * Env for the fork's opt-in standalone account providers: the gate itself
+ * plus the credential-store secret derived from the REAL home (the copied
+ * values were encrypted with it; the shadow home would derive a different
+ * fallback). Empty until the shadow credential file exists. Callers that
+ * materialized the shadow with an explicit realHomeDir must pass the same
+ * value here, or the secret will not match the synthesized identity keys.
+ */
+export function zcodeStandaloneAccountsEnvironment(
+  shadowHomePath: string,
+  realHomeDir?: string,
+): NodeJS.ProcessEnv {
+  if (!NodeFS.existsSync(NodePath.join(shadowHomePath, ".zcode", ...CREDENTIALS_FILE))) return {};
+  const home = NodePath.resolve(realHomeDir ?? NodeOS.homedir());
+  return {
+    [ZCODE_PROTOCOL_STANDALONE_ACCOUNTS_ENV]: "1",
+    [ZCODE_CREDENTIAL_SECRET_ENV]: zcodeCredentialFallbackSecret(
+      home,
+      NodeOS.userInfo().username || "unknown",
+    ),
   };
 }

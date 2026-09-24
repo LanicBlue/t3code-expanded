@@ -1,7 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import { createDecipheriv, createHash } from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -9,14 +11,29 @@ import * as Schema from "effect/Schema";
 
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
+const decryptCredentialValue = (value: string, cipherSecret: string): string => {
+  const [ivRaw, authTagRaw, cipherRaw] = value.slice("enc:v1:".length).split(".");
+  const key = createHash("sha256").update(cipherSecret).digest();
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(ivRaw!, "base64url"));
+  decipher.setAuthTag(Buffer.from(authTagRaw!, "base64url"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(cipherRaw!, "base64url")),
+    decipher.final(),
+  ]).toString("utf8");
+};
+
 import {
   buildZcodePersonalProviderRules,
   materializeZcodeShadowHome,
   resolveZcodeShadowHomePath,
+  synthesizeZcodeCredentialIdentityKeys,
+  zcodeCredentialFallbackSecret,
   zcodeProviderConfigEnvironment,
   zcodeShadowHomeEnvironment,
   ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV,
+  ZCODE_CREDENTIAL_SECRET_ENV,
   ZCODE_PERSONAL_PROVIDER_CONFIG_FILE_ENV,
+  ZCODE_PROTOCOL_STANDALONE_ACCOUNTS_ENV,
   ZcodeShadowHomeEntryConflictError,
   ZcodeShadowHomePathConflictError,
 } from "./ZcodeShadowHome.ts";
@@ -527,5 +544,90 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
         expect(zcodeProviderConfigEnvironment(shadow)).toEqual({});
       }),
     );
+
+    it.effect("copies the credential store with synthesized standalone identity keys", () =>
+      Effect.gen(function* () {
+        const { realHome } = yield* fixtureHome();
+        const shadow = yield* makeTempDir("t3code-zcode-shadow-");
+        const apiKeyCredentialKey =
+          "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:33561767921117797:api-key";
+        yield* writeTextFile(
+          NodePath.join(realHome, ".zcode", "v2", "credentials.json"),
+          JSON.stringify({
+            "oauth:active_provider": "enc:v1:different-secret",
+            [apiKeyCredentialKey]: "enc:v1:different-secret",
+          }),
+        );
+
+        yield* materializeZcodeShadowHome({ shadowHomePath: shadow, realHomeDir: realHome });
+
+        const shadowStore = decodeUnknownJson(
+          NodeFS.readFileSync(NodePath.join(shadow, ".zcode", "v2", "credentials.json"), "utf8"),
+        ) as Record<string, unknown>;
+        // The copied entries pass through untouched.
+        expect(shadowStore[apiKeyCredentialKey]).toBe("enc:v1:different-secret");
+        // The synthesized identity key decrypts with the real-home secret.
+        const identityKey = "account-provider:account:bigmodel-individual-coding-plan:identity";
+        expect(typeof shadowStore[identityKey]).toBe("string");
+        const decrypted = decryptCredentialValue(
+          shadowStore[identityKey] as string,
+          zcodeCredentialFallbackSecret(realHome, NodeOS.userInfo().username || "unknown"),
+        );
+        expect(decrypted).toBe("33561767921117797");
+        // The standalone env activates once the shadow credential file exists;
+        // the secret must be derived from the SAME real home as materialization.
+        const env = zcodeShadowHomeEnvironment(shadow, {}, realHome);
+        expect(env[ZCODE_PROTOCOL_STANDALONE_ACCOUNTS_ENV]).toBe("1");
+        expect(env[ZCODE_CREDENTIAL_SECRET_ENV]).toBe(
+          zcodeCredentialFallbackSecret(realHome, NodeOS.userInfo().username || "unknown"),
+        );
+      }),
+    );
+
+    it.effect("drops stale shadow credentials when the real store has no account entries", () =>
+      Effect.gen(function* () {
+        const { realHome } = yield* fixtureHome();
+        const shadow = yield* makeTempDir("t3code-zcode-shadow-");
+        yield* writeTextFile(
+          NodePath.join(realHome, ".zcode", "v2", "credentials.json"),
+          '{"oauth:active_provider":"enc:v1:x"}',
+        );
+        yield* writeTextFile(
+          NodePath.join(shadow, ".zcode", "v2", "credentials.json"),
+          '{"stale":true}',
+        );
+
+        yield* materializeZcodeShadowHome({ shadowHomePath: shadow, realHomeDir: realHome });
+
+        expect(NodeFS.existsSync(NodePath.join(shadow, ".zcode", "v2", "credentials.json"))).toBe(
+          false,
+        );
+        expect(
+          ZCODE_PROTOCOL_STANDALONE_ACCOUNTS_ENV in zcodeShadowHomeEnvironment(shadow, {}),
+        ).toBe(false);
+      }),
+    );
+  });
+});
+
+describe("synthesizeZcodeCredentialIdentityKeys (pure)", () => {
+  it("returns undefined without coding-plan api-key entries", () => {
+    expect(synthesizeZcodeCredentialIdentityKeys({ "oauth:zai:access_token": "x" }, "s")).toBe(
+      undefined,
+    );
+    expect(synthesizeZcodeCredentialIdentityKeys({}, "s")).toBe(undefined);
+  });
+
+  it("keeps an existing identity key and still counts the provider", () => {
+    const identityKey = "account-provider:account:bigmodel-team-coding-plan:identity";
+    const result = synthesizeZcodeCredentialIdentityKeys(
+      {
+        "account-provider:coding-plan:account:bigmodel-team-coding-plan:account:42:api-key": "x",
+        [identityKey]: "enc:v1:preset",
+      },
+      "s",
+    );
+    expect(result?.accountProviderCount).toBe(1);
+    expect((result?.store as Record<string, unknown>)[identityKey]).toBe("enc:v1:preset");
   });
 });
