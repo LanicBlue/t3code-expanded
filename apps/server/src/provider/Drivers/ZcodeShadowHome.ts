@@ -241,15 +241,23 @@ export function buildZcodePersonalProviderConfigFile(
 }
 
 /**
- * Locate a zcode-builtin store to copy for the env pair: the app-bundle copy
- * next to the CLI (stable across desktop-managed CDN refreshes), else the
- * newest runtime-store cache the desktop keeps under the real home.
+ * Locate a zcode-builtin store to copy for the env pair: the copy shipped
+ * next to the CLI (self-built CLIs place one at `<cli-dir>/provider/`, the
+ * CLI's own first lookup candidate — usable even with no desktop app), else
+ * the app-bundle copy, else the newest runtime-store cache the desktop keeps
+ * under the real home.
  */
 function resolveZcodeBuiltinStoreSource(
   binaryPath: string | undefined,
   realZcode: string,
 ): string | undefined {
   if (binaryPath !== undefined && binaryPath.trim().length > 0) {
+    const alongside = NodePath.join(
+      NodePath.dirname(binaryPath),
+      "provider",
+      BUILTIN_STORE_FILENAME,
+    );
+    if (NodeFS.existsSync(alongside)) return alongside;
     const bundled = NodePath.resolve(
       NodePath.dirname(binaryPath),
       "..",

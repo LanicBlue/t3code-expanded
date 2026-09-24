@@ -272,6 +272,11 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
           NodePath.join(realHome, ".zcode", "v2", "config.json"),
           '{"provider":{"builtin:bigmodel-coding-plan":{"name":"BigModel - Coding Plan","kind":"anthropic","options":{"apiKey":"sk-test","baseURL":"https://open.bigmodel.cn/api/anthropic"},"models":{"GLM-5.3":{}}}}}',
         );
+        // Self-built CLI ships its store alongside: <bundle>/glm/provider/.
+        yield* writeTextFile(
+          NodePath.join(bundle, "glm", "provider", "zcode-builtin.json"),
+          '{"revision":30,"source":"alongside"}',
+        );
         yield* writeTextFile(
           NodePath.join(bundle, "config", "provider", "zcode-builtin.json"),
           '{"revision":28}',
@@ -285,7 +290,7 @@ it.layer(NodeServices.layer)("ZcodeShadowHome", (it) => {
 
         const dir = NodePath.join(shadow, ".zcode", "v2", "t3-provider-config");
         expect(NodeFS.readFileSync(NodePath.join(dir, "zcode-builtin.json"), "utf8")).toBe(
-          '{"revision":28}',
+          '{"revision":30,"source":"alongside"}',
         );
         const personal = decodeUnknownJson(
           NodeFS.readFileSync(NodePath.join(dir, "provider-personal.json"), "utf8"),
