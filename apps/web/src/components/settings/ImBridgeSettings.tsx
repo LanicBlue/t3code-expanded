@@ -340,7 +340,6 @@ function ImBridgeMemberRow({
             lockedProvider={null}
             instanceEntries={entries}
             modelOptionsByInstance={modelOptionsByInstance}
-            triggerVariant="outline"
             triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
             triggerAriaLabel={`成员 ${member.id} 的实例与模型`}
             {...(environmentId
@@ -369,7 +368,6 @@ function ImBridgeMemberRow({
               modelOptions={memberOptionSelections(member.options)}
               allowPromptInjectedEffort={false}
               planModeEnabled={settings.planModeEnabled}
-              triggerVariant="outline"
               triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
               onModelOptionsChange={(nextOptions) => {
                 onPatch({ options: memberOptionsFromSelections(nextOptions) });
