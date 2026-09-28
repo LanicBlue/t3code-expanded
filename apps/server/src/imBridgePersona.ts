@@ -32,13 +32,13 @@ import * as Effect from "effect/Effect";
 import type {
   OrchestrationCommand,
   OrchestrationShellSnapshot,
-  ProjectionRepositoryError,
   ServerSettingsError,
   ThreadId,
 } from "@t3tools/contracts";
 import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 
+import type { ProjectionRepositoryError } from "./persistence/Errors.ts";
 import type { OrchestrationDispatchError } from "./orchestration/Errors.ts";
 import type { OrchestrationEngineShape } from "./orchestration/Services/OrchestrationEngine.ts";
 
