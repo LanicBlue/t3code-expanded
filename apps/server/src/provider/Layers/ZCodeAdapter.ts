@@ -15,8 +15,11 @@
  *     requests are bridged onto T3's approval flow, approval-carrying T3 modes
  *     map to zcode `edit` (see `runtimeModeToZcodeMode`) and
  *     `respondToRequest`/`respondToUserInput` fail;
- *   - attachments cannot be forwarded (`session/send` takes plain text);
- *   - tool-call event payloads have not been observed yet and are TODO.
+ *   - attachments cannot be forwarded (`session/send` takes plain text).
+ *   - tool-call lifecycle events (`tool.updated`: scheduled/started/result/
+ *     batch) bridge onto `item.started`/`item.updated`/`item.completed` so a
+ *     running turn shows per-tool activity rows; the terminal `batch` summary
+ *     carries no per-call information and is dropped.
  *
  * @module ZCodeAdapter
  */
@@ -25,6 +28,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
+  type ToolLifecycleItemType,
   type ZCodeSettings,
   type ModelSelection,
   RuntimeItemId,
@@ -229,13 +233,136 @@ function contentStreamKind(kind: unknown): "assistant_text" | "reasoning_text" |
   }
 }
 
+/** Cap on the tool output persisted per activity row — matches the UI's detail budget. */
+const MAX_TOOL_RESULT_CHARS = 8_000;
+
+/**
+ * zcode tool names (wire `toolName`: "Bash", "Read", "mcp__server__tool", …)
+ * onto the canonical tool-lifecycle item types ingestion filters by. Unknown
+ * names fall back to the generic dynamic-tool bucket so every call still
+ * surfaces as an activity row.
+ */
+function zcodeToolNameToItemType(toolName: string): ToolLifecycleItemType {
+  if (toolName === "Bash") return "command_execution";
+  if (toolName.startsWith("mcp__")) return "mcp_tool_call";
+  switch (toolName) {
+    case "WebSearch":
+    case "WebFetch":
+      return "web_search";
+    case "Write":
+    case "Edit":
+    case "MultiEdit":
+    case "NotebookEdit":
+      return "file_change";
+    default:
+      return "dynamic_tool_call";
+  }
+}
+
+type ToolUpdatedWirePayload = {
+  readonly kind?: unknown;
+  readonly toolCallId?: unknown;
+  readonly toolName?: unknown;
+  readonly readOnly?: unknown;
+  readonly result?: {
+    readonly success?: unknown;
+    readonly content?: unknown;
+  };
+  readonly duration?: unknown;
+};
+
+/**
+ * Map one zcode `tool.updated` session event onto the item lifecycle. The wire
+ * state machine per call is `scheduled` → `started` → `result` (plus a
+ * terminal `batch` rollup); `scheduled` opens the item, `started` marks it
+ * in progress, `result` closes it with the (bounded) tool output.
+ */
+function mapZcodeToolUpdated(
+  event: ProviderEvent,
+  canonicalThreadId: ThreadId,
+  wire: ToolUpdatedWirePayload,
+  toolCallNames: Map<string, string>,
+): ReadonlyArray<ProviderRuntimeEvent> {
+  const kind = typeof wire.kind === "string" ? wire.kind : undefined;
+  const toolCallId = typeof wire.toolCallId === "string" ? wire.toolCallId : undefined;
+  if (!toolCallId || (kind !== "scheduled" && kind !== "started" && kind !== "result")) {
+    return [];
+  }
+  const wireToolName =
+    typeof wire.toolName === "string" && wire.toolName.trim() ? wire.toolName : undefined;
+  if (wireToolName) {
+    toolCallNames.set(toolCallId, wireToolName);
+  }
+  // `result` carries no toolName — resolve the call's name from its scheduled
+  // event so started/completed keep the itemType the row opened with.
+  const toolName = wireToolName ?? toolCallNames.get(toolCallId) ?? "Tool";
+  if (toolCallNames.size > 1_024) toolCallNames.clear();
+  if (kind === "result") toolCallNames.delete(toolCallId);
+  const itemType = zcodeToolNameToItemType(toolName);
+  const base = {
+    ...runtimeEventBase(event, canonicalThreadId),
+    itemId: RuntimeItemId.make(toolCallId),
+  };
+  if (kind === "scheduled") {
+    return [
+      {
+        ...base,
+        type: "item.started" as const,
+        payload: { itemType, title: toolName },
+      },
+    ];
+  }
+  if (kind === "started") {
+    return [
+      {
+        ...base,
+        type: "item.updated" as const,
+        payload: { itemType, title: toolName, status: "inProgress" as const },
+      },
+    ];
+  }
+  const result = wire.result ?? {};
+  const succeeded = result.success === true;
+  const rawOutput = typeof result.content === "string" ? result.content : "";
+  const data =
+    rawOutput || typeof wire.duration === "number"
+      ? {
+          ...(rawOutput
+            ? {
+                output:
+                  rawOutput.length > MAX_TOOL_RESULT_CHARS
+                    ? `${rawOutput.slice(0, MAX_TOOL_RESULT_CHARS)}…`
+                    : rawOutput,
+                ...(rawOutput.length > MAX_TOOL_RESULT_CHARS ? { truncated: true } : {}),
+              }
+            : {}),
+          ...(typeof wire.duration === "number" ? { durationMs: wire.duration } : {}),
+        }
+      : undefined;
+  return [
+    {
+      ...base,
+      type: "item.completed" as const,
+      payload: {
+        itemType,
+        title: toolName,
+        status: succeeded ? ("completed" as const) : ("failed" as const),
+        ...(data !== undefined ? { data } : {}),
+      },
+    },
+  ];
+}
+
 /**
  * Map one zcode session-runtime `ProviderEvent` onto shared runtime events.
- * Pure so it can be asserted against captured wire traces.
+ * Deterministic against captured wire traces; the only injected state is
+ * `toolCallNames`, which remembers `toolName` per `toolCallId` because the
+ * wire `result` event identifies the call by id alone.
  */
 export function mapZcodeEventToRuntimeEvents(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  toolCallNames: Map<string, string> = new Map(),
 ): ReadonlyArray<ProviderRuntimeEvent> {
   if (event.kind === "session") {
     switch (event.method) {
@@ -328,6 +455,13 @@ export function mapZcodeEventToRuntimeEvents(
         },
       ];
     }
+    case "tool.updated":
+      return mapZcodeToolUpdated(
+        event,
+        canonicalThreadId,
+        wirePayload as ToolUpdatedWirePayload,
+        toolCallNames,
+      );
     case "turn.completed": {
       const usage = normalizeZcodeTokenUsage(asRecord(wirePayload?.usage));
       const state = toTurnState(trimText(wirePayload?.resultType));
@@ -589,9 +723,12 @@ export const makeZcodeAdapter = Effect.fn("makeZcodeAdapter")(function* (
         { client },
       ).pipe(Effect.provideService(Crypto.Crypto, crypto));
 
+      // Remembers `toolName` per `toolCallId` across the session-event stream:
+      // wire `result` events identify calls by id only (see mapZcodeToolUpdated).
+      const toolCallNames = new Map<string, string>();
       const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
         Effect.gen(function* () {
-          const runtimeEvents = mapZcodeEventToRuntimeEvents(event, event.threadId);
+          const runtimeEvents = mapZcodeEventToRuntimeEvents(event, event.threadId, toolCallNames);
           if (runtimeEvents.length === 0) {
             yield* Effect.logDebug("ignoring unhandled ZCode provider event", {
               method: event.method,

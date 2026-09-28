@@ -100,6 +100,164 @@ describe("mapZcodeEventToRuntimeEvents", () => {
     expect(reasoning[0]?.payload).toMatchObject({ streamKind: "reasoning_text" });
   });
 
+  it("maps tool.updated lifecycle onto item events (wire shapes captured live)", () => {
+    // Wire shapes captured from a real app-server session (2026-09-28 probe).
+    const scheduled = mapZcodeEventToRuntimeEvents(
+      zcodeEvent({
+        method: "tool.updated",
+        turnId: TurnId.make("turn_1"),
+        payload: {
+          type: "tool.updated",
+          sessionId: "sess_1",
+          turnId: "turn_wire",
+          payload: {
+            toolCallId: "call_abc",
+            assistantMessageId: "msg_1",
+            toolName: "Bash",
+            dependencies: [],
+            canRunParallel: false,
+            kind: "scheduled",
+            inputByteLength: 66,
+            inputOmitted: true,
+          },
+        },
+      }),
+      THREAD_ID,
+    );
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.type).toBe("item.started");
+    expect(scheduled[0]?.itemId).toBe("call_abc");
+    expect(scheduled[0]?.payload).toMatchObject({ itemType: "command_execution", title: "Bash" });
+
+    const started = mapZcodeEventToRuntimeEvents(
+      zcodeEvent({
+        method: "tool.updated",
+        turnId: TurnId.make("turn_1"),
+        payload: {
+          type: "tool.updated",
+          sessionId: "sess_1",
+          payload: {
+            toolCallId: "call_abc",
+            toolName: "Bash",
+            startedAt: 1790569474245,
+            readOnly: true,
+            sideEffectScope: "none",
+            kind: "started",
+          },
+        },
+      }),
+      THREAD_ID,
+    );
+    expect(started).toHaveLength(1);
+    expect(started[0]?.type).toBe("item.updated");
+    expect(started[0]?.payload).toMatchObject({
+      itemType: "command_execution",
+      status: "inProgress",
+    });
+
+    // Wire `result` events carry no toolName; production resolves the name
+    // from the shared cache the scheduled event populated.
+    const toolCallNames = new Map([["call_abc", "Bash"]]);
+    const result = mapZcodeEventToRuntimeEvents(
+      zcodeEvent({
+        method: "tool.updated",
+        turnId: TurnId.make("turn_1"),
+        payload: {
+          type: "tool.updated",
+          sessionId: "sess_1",
+          payload: {
+            toolCallId: "call_abc",
+            result: { success: true, content: "/tmp\n" },
+            duration: 20,
+            kind: "result",
+          },
+        },
+      }),
+      THREAD_ID,
+      toolCallNames,
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0]?.type).toBe("item.completed");
+    expect(result[0]?.payload).toMatchObject({
+      itemType: "command_execution",
+      status: "completed",
+      data: { output: "/tmp\n", durationMs: 20 },
+    });
+
+    const failed = mapZcodeEventToRuntimeEvents(
+      zcodeEvent({
+        method: "tool.updated",
+        payload: {
+          type: "tool.updated",
+          sessionId: "sess_1",
+          payload: {
+            toolCallId: "call_abc",
+            toolName: "mcp__srv__tool",
+            result: { success: false, content: "boom" },
+            kind: "result",
+          },
+        },
+      }),
+      THREAD_ID,
+    );
+    expect(failed[0]?.payload).toMatchObject({
+      itemType: "mcp_tool_call",
+      status: "failed",
+    });
+
+    // Terminal batch rollup and malformed payloads carry nothing — dropped.
+    const batch = mapZcodeEventToRuntimeEvents(
+      zcodeEvent({
+        method: "tool.updated",
+        payload: {
+          type: "tool.updated",
+          sessionId: "sess_1",
+          payload: { toolCallIds: ["call_abc"], successCount: 1, errorCount: 0, kind: "batch" },
+        },
+      }),
+      THREAD_ID,
+    );
+    expect(batch).toHaveLength(0);
+    const malformed = mapZcodeEventToRuntimeEvents(
+      zcodeEvent({
+        method: "tool.updated",
+        payload: { type: "tool.updated", sessionId: "sess_1", payload: { kind: "scheduled" } },
+      }),
+      THREAD_ID,
+    );
+    expect(malformed).toHaveLength(0);
+  });
+
+  it("bounds persisted tool output", () => {
+    const big = mapZcodeEventToRuntimeEvents(
+      zcodeEvent({
+        method: "tool.updated",
+        payload: {
+          type: "tool.updated",
+          sessionId: "sess_1",
+          payload: {
+            toolCallId: "call_big",
+            toolName: "Bash",
+            result: { success: true, content: "x".repeat(9_000) },
+            duration: 5,
+            kind: "result",
+          },
+        },
+      }),
+      THREAD_ID,
+    );
+    const data = big[0]?.payload as {
+      readonly data?: {
+        readonly output?: string;
+        readonly truncated?: boolean;
+        readonly durationMs?: number;
+      };
+    };
+    expect(data.data?.output?.length).toBeLessThanOrEqual(8_001);
+    expect(data.data?.truncated).toBe(true);
+    expect(data.data?.durationMs).toBe(5);
+  });
+
   it("maps turn.completed with usage and resultType", () => {
     const events = mapZcodeEventToRuntimeEvents(
       zcodeEvent({
