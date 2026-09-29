@@ -8,17 +8,21 @@
  * sessions surface (and can be hijacked) in the desktop UI. Isolation =
  * run every T3-spawned zcode process with `HOME` pointed at a shadow
  * directory:
- *   - `cli/config.json` (+ `v2/config.json`) are copied from the real home
- *     on every materialization — auth and model config travel along and
- *     stay fresh;
- *   - a personal provider-config pair is materialized under
- *     `v2/t3-provider-config/` and exported through the
+ *   - `cli/config.json`, `v2/config.json` and `v2/provider_config.json` are
+ *     copied from the real home on every materialization — auth, model config
+ *     and the desktop's personal provider config travel along and stay fresh;
+ *   - the provider registry inputs for the
  *     `ZCODE_{BUILTIN,PERSONAL}_PROVIDER_CONFIG_FILE` env pair (see
- *     `zcodeProviderConfigEnvironment`): ZCode ≥3.12.3 resolves the
- *     headless provider registry from the builtin store plus a personal
- *     provider config file ONLY, so the API-key providers the user keeps in
- *     the legacy `v2/config.json` provider map would otherwise vanish from
- *     every T3-spawned app-server (turns fail with "Model creation failed");
+ *     `zcodeProviderConfigEnvironment`) are materialized under the shadow:
+ *     the builtin store is copied from beside the CLI (ZCode ≥3.12.3 resolves
+ *     the headless registry from the builtin store plus a personal provider
+ *     config file ONLY, and the pair is both-or-neither), and the personal
+ *     side IS the mirrored desktop `v2/provider_config.json` — T3 must not
+ *     synthesize its own provider channels (a legacy API-key migration used
+ *     to do exactly that and surfaced desktop-invisible duplicate models);
+ *     when the desktop has no personal config yet, an empty-rules file is
+ *     written so the account providers from the cloned credential store still
+ *     light up;
  *   - `cli/{agents,plugins,memories}` and `skills` are symlinked — static
  *     user-level content stays shared;
  *   - everything else (db, rollout, log, exec, artifacts) is created fresh
@@ -47,7 +51,7 @@ import { expandHomePath } from "../../pathExpansion.ts";
 import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 
 /** Copied (not linked): auth/model config that must live in the shadow home. */
-const COPY_CONFIG_FILES = ["cli/config.json", "v2/config.json"] as const;
+const COPY_CONFIG_FILES = ["cli/config.json", "v2/config.json", "v2/provider_config.json"] as const;
 /** Symlinked: static user-level content shared with the real home. */
 const LINKED_ENTRIES = ["cli/agents", "cli/plugins", "cli/memories", "skills"] as const;
 
@@ -61,7 +65,16 @@ export const ZCODE_PERSONAL_PROVIDER_CONFIG_FILE_ENV = "ZCODE_PERSONAL_PROVIDER_
 
 const PROVIDER_CONFIG_DIR = ["v2", "t3-provider-config"] as const;
 const BUILTIN_STORE_FILENAME = "zcode-builtin.json";
-const PERSONAL_CONFIG_FILENAME = "provider-personal.json";
+/** Retired filename of the synthesized personal config — cleaned up on materialization. */
+const LEGACY_PERSONAL_CONFIG_FILENAME = "provider-personal.json";
+/**
+ * The personal side of the env pair: the desktop's own personal provider
+ * config, mirrored at its real-home-relative path (the desktop keeps it at
+ * `<zcode root>/v2/provider_config.json` and passes the very same file to its
+ * own CLIs).
+ */
+const PERSONAL_CONFIG_FILENAME = "provider_config.json";
+const PERSONAL_CONFIG_RELATIVE = ["v2", PERSONAL_CONFIG_FILENAME] as const;
 
 /** Shared credential store (encrypted values) inside the zcode v2 root. */
 const CREDENTIALS_FILE = ["v2", "credentials.json"] as const;
@@ -219,97 +232,25 @@ const fsError =
   (cause: unknown) =>
     new ZcodeShadowHomeFileSystemError({ operation, path, cause });
 
-// ── Personal provider config (ZCode ≥3.12.3 registry bridge) ─────────────
-
-type LegacyProviderEntry = {
-  readonly name?: unknown;
-  readonly kind?: unknown;
-  readonly enabled?: unknown;
-  readonly options?: unknown;
-  readonly models?: unknown;
-};
-
-/** One entry of the personal `providerRules` the current CLI accepts. */
-export interface ZcodePersonalProviderRule {
-  readonly providerId: string;
-  readonly providerName: string;
-  readonly enabled: boolean;
-  readonly config: {
-    readonly group: "standard-personal";
-    readonly access: { readonly type: "api-key"; readonly apiKey: string };
-    readonly api: {
-      readonly type: "anthropic-messages" | "openai-chat-completions";
-      readonly baseUrl: string;
-    };
-    readonly personalModelIds: ReadonlyArray<string>;
-  };
-}
-
-const LEGACY_PROVIDER_ID_PREFIX = "builtin:";
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null;
+// ── Provider registry inputs (ZCode ≥3.12.3 env pair) ────────────────────
 
 /**
- * Convert the legacy `v2/config.json` `provider` map (API-key providers the
- * desktop no longer feeds into the headless registry) into personal
- * `providerRules`. Entries without an API key + base URL (e.g. OAuth-backed
- * official entries) are skipped — they carry no migratable credentials.
+ * The personal side of the env pair mirrors the desktop's own personal
+ * provider config (`~/.zcode/v2/provider_config.json` — same file the desktop
+ * passes its CLIs, copied by `COPY_CONFIG_FILES`). When the desktop has not
+ * written one yet, an empty-rules file is materialized instead: the pair is
+ * mandatory for the headless registry, and with no personal channels the
+ * account providers from the cloned credential store light up exactly as on
+ * the desktop. T3 deliberately contributes NO provider channels of its own —
+ * the retired legacy API-key migration surfaced desktop-invisible duplicates.
  */
-export function buildZcodePersonalProviderRules(
-  providerMap: unknown,
-): ReadonlyArray<ZcodePersonalProviderRule> {
-  if (!isRecord(providerMap)) return [];
-  const rules: Array<ZcodePersonalProviderRule> = [];
-  for (const [rawId, rawEntry] of Object.entries(providerMap)) {
-    if (!isRecord(rawEntry)) continue;
-    const entry = rawEntry as LegacyProviderEntry;
-    const options = isRecord(entry.options) ? entry.options : undefined;
-    const apiKey = typeof options?.apiKey === "string" ? options.apiKey.trim() : "";
-    const baseURL = typeof options?.baseURL === "string" ? options.baseURL.trim() : "";
-    if (apiKey.length === 0 || !/^https?:\/\//.test(baseURL)) continue;
-    const modelIds = isRecord(entry.models) ? Object.keys(entry.models) : [];
-    rules.push({
-      providerId: rawId.startsWith(LEGACY_PROVIDER_ID_PREFIX)
-        ? rawId.slice(LEGACY_PROVIDER_ID_PREFIX.length)
-        : rawId,
-      providerName:
-        typeof entry.name === "string" && entry.name.trim().length > 0 ? entry.name : rawId,
-      enabled: typeof entry.enabled === "boolean" ? entry.enabled : true,
-      config: {
-        group: "standard-personal",
-        access: { type: "api-key", apiKey },
-        api: {
-          // The legacy `kind` is the wire protocol; the registry wants the
-          // API flavor. Both values the CLI ships (anthropic-messages,
-          // openai-chat-completions) map from the two legacy kinds.
-          type: entry.kind === "anthropic" ? "anthropic-messages" : "openai-chat-completions",
-          baseUrl: baseURL,
-        },
-        personalModelIds: modelIds,
-      },
-    });
-  }
-  return rules;
-}
-
-/**
- * The complete personal provider-config file, or undefined when the legacy
- * config has nothing migratable (no provider rules to contribute).
- */
-export function buildZcodePersonalProviderConfigFile(
-  providerMap: unknown,
-): { readonly schemaVersion: 1; readonly config: unknown } | undefined {
-  const rules = buildZcodePersonalProviderRules(providerMap);
-  if (rules.length === 0) return undefined;
-  return {
-    schemaVersion: 1,
-    config: {
-      providerConfigRules: { providerRules: rules },
-      modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] },
-    },
-  };
-}
+const EMPTY_PERSONAL_PROVIDER_CONFIG = {
+  schemaVersion: 1,
+  config: {
+    providerConfigRules: { providerRules: [] },
+    modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] },
+  },
+} as const;
 
 /**
  * Locate a zcode-builtin store to copy for the env pair: the copy shipped
@@ -528,14 +469,20 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
       });
     }
 
-    // Personal provider-config pair (see module doc): without it the current
-    // CLI drops the user's API-key providers from the headless registry.
-    // Generated from the legacy provider map in the just-copied v2 config so
-    // credentials never leave the shadow home; the builtin store is copied
-    // (not linked) so CDN refresh writes by the CLI stay inside the shadow.
+    // Provider registry inputs for the env pair. The personal side is the
+    // mirrored desktop `v2/provider_config.json` (copied above with the other
+    // config files; written as an empty-rules file when the desktop has none).
+    // Only the builtin store needs materializing here — copied (not linked)
+    // from beside the CLI so CDN refresh writes by the CLI stay inside the
+    // shadow. No personal channels are synthesized: the legacy API-key
+    // migration surfaced desktop-invisible duplicate models.
     const providerConfigDirPath = NodePath.join(shadowZcode, ...PROVIDER_CONFIG_DIR);
     const builtinStorePath = NodePath.join(providerConfigDirPath, BUILTIN_STORE_FILENAME);
-    const personalConfigPath = NodePath.join(providerConfigDirPath, PERSONAL_CONFIG_FILENAME);
+    const legacyPersonalConfigPath = NodePath.join(
+      providerConfigDirPath,
+      LEGACY_PERSONAL_CONFIG_FILENAME,
+    );
+    const shadowPersonalConfigPath = NodePath.join(shadowZcode, ...PERSONAL_CONFIG_RELATIVE);
     const builtinStoreSource = resolveZcodeBuiltinStoreSource(input.binaryPath, realZcode);
     // Mirror target tracked independently of the env-pair source: the bundle
     // usually wins for the pair, but the mirror must follow the runtime
@@ -546,49 +493,37 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
     const encodePersonalConfigJson = Schema.encodeUnknownEffect(
       fromJsonStringPretty(Schema.Unknown),
     );
-    const decodeLegacyProviderMap = Schema.decodeUnknownEffect(
-      Schema.fromJsonString(Schema.Struct({ provider: Schema.optional(Schema.Unknown) })),
-    );
-    const decodeCredentialsStoreJson = Schema.decodeUnknownEffect(
-      Schema.fromJsonString(Schema.Unknown),
-    );
-    const encodeCredentialsStoreJson = Schema.encodeUnknownEffect(
-      fromJsonStringPretty(Schema.Unknown),
-    );
-    // An unreadable/unparsable legacy config keeps the previous behavior (no
-    // personal providers) rather than failing the whole driver.
-    const personalConfig = yield* fileSystem
-      .readFileString(NodePath.join(shadowZcode, "v2", "config.json"))
-      .pipe(
-        Effect.flatMap((raw) => decodeLegacyProviderMap(raw)),
-        Effect.flatMap((legacy) => {
-          const file = buildZcodePersonalProviderConfigFile(legacy.provider);
-          return file === undefined ? Effect.succeedNone : Effect.succeedSome(file);
-        }),
-        Effect.catch(() => Effect.succeedNone),
-      );
-    if (builtinStoreSource !== undefined && Option.isSome(personalConfig)) {
+    if (builtinStoreSource !== undefined) {
       yield* makeDirectory(providerConfigDirPath);
       yield* Effect.tryPromise({
         try: () => NodeFS.promises.copyFile(builtinStoreSource, builtinStorePath),
         catch: fsError("copyFile", builtinStorePath),
       });
-      yield* encodePersonalConfigJson(personalConfig.value).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ZcodeShadowHomeFileSystemError({
-              operation: "writeFile",
-              path: personalConfigPath,
-              cause,
+      if (!NodeFS.existsSync(shadowPersonalConfigPath)) {
+        yield* encodePersonalConfigJson(EMPTY_PERSONAL_PROVIDER_CONFIG).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ZcodeShadowHomeFileSystemError({
+                operation: "writeFile",
+                path: shadowPersonalConfigPath,
+                cause,
+              }),
+          ),
+          Effect.flatMap((json) =>
+            Effect.tryPromise({
+              try: () => NodeFS.promises.writeFile(shadowPersonalConfigPath, `${json}\n`),
+              catch: fsError("writeFile", shadowPersonalConfigPath),
             }),
-        ),
-        Effect.flatMap((json) =>
-          Effect.tryPromise({
-            try: () => NodeFS.promises.writeFile(personalConfigPath, `${json}\n`),
-            catch: fsError("writeFile", personalConfigPath),
-          }),
-        ),
-      );
+          ),
+        );
+      }
+      // Retired synthesized personal config from the legacy-migration era.
+      if (NodeFS.existsSync(legacyPersonalConfigPath)) {
+        yield* Effect.tryPromise({
+          try: () => NodeFS.promises.rm(legacyPersonalConfigPath, { force: true }),
+          catch: fsError("remove", legacyPersonalConfigPath),
+        });
+      }
       // Runtime-store mirror: rebuilt from scratch so a desktop update (new
       // version directory) replaces any aged mirror instead of accumulating.
       if (runtimeMirror !== undefined) {
@@ -630,11 +565,16 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
     // the REAL home's fallback secret — the copied values decrypt with it,
     // and the spawn env passes the same secret). An unreadable store or one
     // without account entries keeps the shadow credential-free rather than
-    // failing the driver; the API-key provider pair above remains the
-    // fallback. Fresh copy every materialization keeps rotated credentials
-    // current.
+    // failing the driver. Fresh copy every materialization keeps rotated
+    // credentials current.
     const realCredentialsPath = NodePath.join(realZcode, ...CREDENTIALS_FILE);
     const shadowCredentialsPath = NodePath.join(shadowZcode, ...CREDENTIALS_FILE);
+    const decodeCredentialsStoreJson = Schema.decodeUnknownEffect(
+      Schema.fromJsonString(Schema.Unknown),
+    );
+    const encodeCredentialsStoreJson = Schema.encodeUnknownEffect(
+      fromJsonStringPretty(Schema.Unknown),
+    );
     const credentialMaterialization = yield* fileSystem.readFileString(realCredentialsPath).pipe(
       Effect.flatMap(decodeCredentialsStoreJson),
       Effect.flatMap((parsed) => {
@@ -722,9 +662,13 @@ export const materializeZcodeShadowHome = Effect.fn("materializeZcodeShadowHome"
  * exist, and always both-or-neither (the CLI rejects a lone value).
  */
 export function zcodeProviderConfigEnvironment(shadowHomePath: string): NodeJS.ProcessEnv {
-  const providerConfigDirPath = NodePath.join(shadowHomePath, ".zcode", ...PROVIDER_CONFIG_DIR);
-  const builtinStorePath = NodePath.join(providerConfigDirPath, BUILTIN_STORE_FILENAME);
-  const personalConfigPath = NodePath.join(providerConfigDirPath, PERSONAL_CONFIG_FILENAME);
+  const builtinStorePath = NodePath.join(
+    shadowHomePath,
+    ".zcode",
+    ...PROVIDER_CONFIG_DIR,
+    BUILTIN_STORE_FILENAME,
+  );
+  const personalConfigPath = NodePath.join(shadowHomePath, ".zcode", ...PERSONAL_CONFIG_RELATIVE);
   if (!NodeFS.existsSync(builtinStorePath) || !NodeFS.existsSync(personalConfigPath)) return {};
   return {
     [ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV]: builtinStorePath,
