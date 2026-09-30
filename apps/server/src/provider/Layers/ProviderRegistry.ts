@@ -105,12 +105,22 @@ export function upsertProviderWorkspaceSnapshot(
 const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
   const isAntigravity = provider.driver === ProviderDriverKind.make("antigravity");
   const isCodex = provider.driver === ProviderDriverKind.make("codex");
-  if (!isAntigravity && !isCodex && provider.driver !== ProviderDriverKind.make("opencode")) {
+  // zcode's catalog mirrors the desktop registry; a successful probe is the
+  // authoritative list, so retired providers (e.g. legacy synthesized
+  // channels) must disappear instead of being resurrected from stale
+  // snapshots.
+  const isZcode = provider.driver === ProviderDriverKind.make("zcode");
+  if (
+    !isAntigravity &&
+    !isCodex &&
+    !isZcode &&
+    provider.driver !== ProviderDriverKind.make("opencode")
+  ) {
     return true;
   }
 
   if (
-    (isAntigravity || isCodex) &&
+    (isAntigravity || isCodex || isZcode) &&
     (!provider.enabled || provider.auth.status === "unauthenticated")
   ) {
     return false;
@@ -348,7 +358,15 @@ export const ProviderRegistryLive = Layer.effect(
                   cachedDriver: cachedProvider.driver ?? null,
                 }).pipe(Effect.as(undefined as ServerProvider | undefined));
               }
-              return Effect.succeed(hydrateCachedProvider(correlation));
+              return Effect.succeed(
+                hydrateCachedProvider({
+                  ...correlation,
+                  // Boot fallbacks are freshly probed snapshots; for drivers
+                  // whose successful probe is authoritative (codex/zcode/...)
+                  // the cached model rows must not merge back retired models.
+                  retainMissingModels: shouldRetainMissingProviderModels(fallbackProvider),
+                }),
+              );
             }),
           );
         }),
