@@ -211,45 +211,6 @@ it.layer(NodeServices.layer)("providerStatusCache", (it) => {
     );
   });
 
-  it("does not merge cached models back when the fallback probe is authoritative", () => {
-    const live = {
-      slug: "account:bigmodel-individual-coding-plan/GLM-5.3",
-      name: "GLM-5.3",
-      isCustom: false,
-      capabilities: emptyCapabilities,
-    } as const;
-    const cachedZcode = makeProvider(ProviderDriverKind.make("zcode"), {
-      checkedAt: "2026-09-28T12:00:00.000Z",
-      models: [
-        live,
-        {
-          slug: "bigmodel-start-plan/GLM-5.3",
-          name: "GLM-5.3",
-          isCustom: false,
-          capabilities: emptyCapabilities,
-        },
-      ],
-    });
-    const fallbackZcode = makeProvider(ProviderDriverKind.make("zcode"), { models: [live] });
-
-    assert.deepStrictEqual(
-      hydrateCachedProvider({
-        cachedProvider: cachedZcode,
-        fallbackProvider: fallbackZcode,
-        retainMissingModels: false,
-      }).models,
-      [live],
-    );
-    // Default behaviour (probe outcome unknown at this layer) keeps the union.
-    assert.deepStrictEqual(
-      hydrateCachedProvider({
-        cachedProvider: cachedZcode,
-        fallbackProvider: fallbackZcode,
-      }).models,
-      [live, cachedZcode.models[1]],
-    );
-  });
-
   it("ignores stale cached enabled state when the provider is now disabled", () => {
     const cachedCodex = makeProvider(CODEX_DRIVER, {
       checkedAt: "2026-04-10T12:00:00.000Z",

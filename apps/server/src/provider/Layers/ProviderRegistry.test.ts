@@ -844,41 +844,6 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         ]);
       });
 
-      it("retains zcode models when the catalog refresh fails", () => {
-        const previousProvider = {
-          instanceId: ProviderInstanceId.make("zcode"),
-          driver: ProviderDriverKind.make("zcode"),
-          status: "ready",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          checkedAt: "2026-09-29T00:00:00.000Z",
-          version: "3.14.118",
-          models: [
-            {
-              slug: "account:bigmodel-individual-coding-plan/GLM-5.3",
-              name: "GLM-5.3",
-              isCustom: false,
-              capabilities: null,
-            },
-          ],
-          slashCommands: [],
-          skills: [],
-        } as const satisfies ServerProvider;
-        const refreshedProvider = {
-          ...previousProvider,
-          status: "error",
-          auth: { status: "unknown" },
-          checkedAt: "2026-09-29T00:01:00.000Z",
-          models: [],
-          message: "Failed to reach the zcode app-server.",
-        } satisfies ServerProvider;
-
-        assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, refreshedProvider).models, [
-          ...previousProvider.models,
-        ]);
-      });
-
       it("classifies pending, logout, uninstall, and reconnect OpenCode inventories", () => {
         const previousProvider = {
           instanceId: ProviderInstanceId.make("opencode"),

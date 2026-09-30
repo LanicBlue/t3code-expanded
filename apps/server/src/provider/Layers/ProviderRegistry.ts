@@ -105,10 +105,7 @@ export function upsertProviderWorkspaceSnapshot(
 const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
   const isAntigravity = provider.driver === ProviderDriverKind.make("antigravity");
   const isCodex = provider.driver === ProviderDriverKind.make("codex");
-  // zcode's catalog mirrors the desktop registry; a successful probe is the
-  // authoritative list, so retired providers (e.g. legacy synthesized
-  // channels) must disappear instead of being resurrected from stale
-  // snapshots.
+  // zcode 的目录镜像桌面注册表：成功探测即权威，退役 provider 不从旧快照复活。
   const isZcode = provider.driver === ProviderDriverKind.make("zcode");
   if (
     !isAntigravity &&
@@ -358,14 +355,12 @@ export const ProviderRegistryLive = Layer.effect(
                   cachedDriver: cachedProvider.driver ?? null,
                 }).pipe(Effect.as(undefined as ServerProvider | undefined));
               }
+              // 探测成功（retain=false）时新鲜快照即权威：直接采用，缓存不再
+              // 水合，退役模型无从复活；仅待探测/失败时借缓存兜底。
               return Effect.succeed(
-                hydrateCachedProvider({
-                  ...correlation,
-                  // Boot fallbacks are freshly probed snapshots; for drivers
-                  // whose successful probe is authoritative (codex/zcode/...)
-                  // the cached model rows must not merge back retired models.
-                  retainMissingModels: shouldRetainMissingProviderModels(fallbackProvider),
-                }),
+                shouldRetainMissingProviderModels(fallbackProvider)
+                  ? hydrateCachedProvider(correlation)
+                  : fallbackProvider,
               );
             }),
           );

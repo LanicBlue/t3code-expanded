@@ -18,17 +18,11 @@ const decodeProviderStatusCache = Schema.decodeUnknownEffect(
 const mergeProviderModels = (
   fallbackModels: ReadonlyArray<ServerProvider["models"][number]>,
   cachedModels: ReadonlyArray<ServerProvider["models"][number]>,
-  retainMissingModels = true,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
+  const fallbackSlugs = new Set(fallbackModels.map((model) => model.slug));
   // The fallback snapshot is built from current settings and already carries
   // every custom model, so cached custom rows that are not in it were removed
   // while the cache was stale and must not come back.
-  if (!retainMissingModels) {
-    // The fresh snapshot is authoritative (successful probe): cached rows
-    // must not resurrect retired models into the UI.
-    return fallbackModels;
-  }
-  const fallbackSlugs = new Set(fallbackModels.map((model) => model.slug));
   return [
     ...fallbackModels,
     ...cachedModels.filter((model) => !model.isCustom && !fallbackSlugs.has(model.slug)),
@@ -74,12 +68,6 @@ export const isCachedProviderCorrelated = (input: {
 export const hydrateCachedProvider = (input: {
   readonly cachedProvider: ServerProvider;
   readonly fallbackProvider: ServerProvider;
-  /**
-   * False when the fallback snapshot comes from a successful probe whose
-   * catalog is authoritative — cached model rows then never shadow it
-   * (retired providers stay retired instead of being merged back).
-   */
-  readonly retainMissingModels?: boolean;
 }): ServerProvider => {
   if (!isCachedProviderCorrelated(input)) {
     return input.fallbackProvider;
@@ -95,11 +83,7 @@ export const hydrateCachedProvider = (input: {
   const { message: _fallbackMessage, ...fallbackWithoutMessage } = input.fallbackProvider;
   const hydratedProvider: ServerProvider = {
     ...fallbackWithoutMessage,
-    models: mergeProviderModels(
-      input.fallbackProvider.models,
-      input.cachedProvider.models,
-      input.retainMissingModels ?? true,
-    ),
+    models: mergeProviderModels(input.fallbackProvider.models, input.cachedProvider.models),
     installed: input.cachedProvider.installed,
     version: input.cachedProvider.version,
     status: input.cachedProvider.status,
