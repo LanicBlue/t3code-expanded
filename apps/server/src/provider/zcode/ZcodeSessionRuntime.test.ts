@@ -1,7 +1,12 @@
+// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics preferSchemaOverJson:off
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import { RuntimeMode, type ProviderEvent, ThreadId } from "@t3tools/contracts";
 
@@ -112,6 +117,9 @@ const makeRuntime = (
       threadId: ThreadId.make("thr_scripted"),
       cwd: "/tmp",
       runtimeMode: "full-access",
+      // Point the desktop-config mirror at a path that cannot exist so the
+      // scripted tests never read the real ~/.zcode on this machine.
+      realHomeDir: "/nonexistent-t3-zcode-test-home",
       ...options,
     },
     { client },
@@ -132,6 +140,59 @@ const collectEvents = (
 const START_EVENT_COUNT = 3;
 
 describe("makeZcodeSessionRuntime (scripted client)", () => {
+  it.effect("mirrors the real home's user MCP servers into fresh session/create", () =>
+    Effect.gen(function* () {
+      const home = NodeFS.mkdtempSync(`${NodeOS.tmpdir()}/t3-zcode-mcp-home-`);
+      const configDir = NodePath.join(home, ".zcode", "cli");
+      NodeFS.mkdirSync(configDir, { recursive: true });
+      NodeFS.writeFileSync(
+        NodePath.join(configDir, "config.json"),
+        JSON.stringify({
+          mcp: {
+            servers: {
+              "ECS-MCP": {
+                type: "http",
+                url: "https://mcp.example.com/mcp",
+                headers: { Authorization: "Bearer t" },
+                enabled: false,
+              },
+              extra: { type: "http", url: "https://extra.example.com/mcp", headers: {} },
+            },
+          },
+        }),
+      );
+      const { client, calls } = makeScriptedClient({
+        "session/create": ok(createSnapshot("sess_1")),
+        "session/subscribe": ok({}),
+      });
+      const runtime = yield* makeRuntime(client, { realHomeDir: home });
+      yield* runtime.start();
+
+      const create = calls.find((call) => call.method === "session/create");
+      // Desktop-disabled entries are NOT forwarded; enabled ones are mirrored.
+      expect(create?.params).toMatchObject({
+        workspace: { workspacePath: "/tmp", workspaceKey: "/tmp" },
+        mcpServers: [
+          { name: "extra", type: "http", url: "https://extra.example.com/mcp", headers: [] },
+        ],
+      });
+    }),
+  );
+
+  it.effect("sends no mcpServers field when the real home has nothing to mirror", () =>
+    Effect.gen(function* () {
+      const { client, calls } = makeScriptedClient({
+        "session/create": ok(createSnapshot("sess_1")),
+        "session/subscribe": ok({}),
+      });
+      const runtime = yield* makeRuntime(client);
+      yield* runtime.start();
+
+      const create = calls.find((call) => call.method === "session/create");
+      expect(create?.params).not.toHaveProperty("mcpServers");
+    }),
+  );
+
   it.effect("resets the session on turn.failed so the turn cannot stick (B1)", () =>
     Effect.gen(function* () {
       const { client } = makeScriptedClient({

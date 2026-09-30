@@ -33,6 +33,7 @@
  *
  * @module provider/zcode/ZcodeSessionRuntime
  */
+import * as NodeOS from "node:os";
 import {
   EventId,
   ProviderDriverKind,
@@ -63,6 +64,7 @@ import {
   zcodeModelRefToSlug,
   zcodeSlugToModelRef,
 } from "./ZcodeProtocolClient.ts";
+import { resolveSessionMcpServers } from "./ZcodeSessionMcp.ts";
 
 const PROVIDER = ProviderDriverKind.make("zcode");
 
@@ -207,6 +209,12 @@ export interface ZcodeSessionRuntimeOptions {
   /** Reasoning level (low/high/max); applied via `session/setThoughtLevel`. */
   readonly thoughtLevel?: string | undefined;
   readonly resumeCursor?: ZcodeResumeCursor | undefined;
+  /**
+   * Real (desktop) home directory read at every fresh `session/create` to
+   * mirror the desktop's user MCP servers (see `ZcodeSessionMcp`). Defaults
+   * to `os.homedir()`; injectable so tests never touch the real home.
+   */
+  readonly realHomeDir?: string | undefined;
 }
 
 export interface ZcodeSessionRuntimeServices {
@@ -252,6 +260,7 @@ export const makeZcodeSessionRuntime = (
   Effect.gen(function* () {
     const crypto = services.crypto ?? (yield* Crypto.Crypto);
     const client = services.client;
+    const realHomeDir = options.realHomeDir ?? NodeOS.homedir();
     const events = yield* Queue.unbounded<ProviderEvent>();
     const sessionCreatedAt = DateTime.formatIso(yield* DateTime.now);
     const initialSession: ProviderSession = {
@@ -338,9 +347,14 @@ export const makeZcodeSessionRuntime = (
       yield* emitSessionEvent("session/connecting", "Starting ZCode app-server session.");
 
       const requestedModel = options.model ? zcodeSlugToModelRef(options.model) : undefined;
+      // Fresh creates mirror the desktop home's user MCP servers; a resumed
+      // session keeps whatever it was created with (resume has no mcpServers
+      // consumption on the zcode side anyway).
+      const desktopMcpServers = yield* resolveSessionMcpServers(realHomeDir);
       const createParams = {
         workspace: { workspacePath: options.cwd, workspaceKey: options.cwd },
         mode: runtimeModeToZcodeMode(options.runtimeMode),
+        ...(desktopMcpServers !== undefined ? { mcpServers: desktopMcpServers } : {}),
       };
 
       const resumeSessionId = options.resumeCursor?.sessionId;
@@ -572,9 +586,13 @@ export const makeZcodeSessionRuntime = (
     ) {
       const modelRef =
         requestedModel !== undefined ? zcodeSlugToModelRef(requestedModel) : undefined;
+      // Same mirror policy as start(): a re-materialized session is a fresh
+      // create, so it picks up the desktop's current MCP configuration.
+      const desktopMcpServers = yield* resolveSessionMcpServers(realHomeDir);
       const created = yield* client.request("session/create", {
         workspace: { workspacePath: options.cwd, workspaceKey: options.cwd },
         mode: runtimeModeToZcodeMode(options.runtimeMode),
+        ...(desktopMcpServers !== undefined ? { mcpServers: desktopMcpServers } : {}),
       });
       const snapshot = readZcodeSessionSnapshot(created);
       if (snapshot === undefined) {
