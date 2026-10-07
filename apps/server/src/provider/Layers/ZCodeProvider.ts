@@ -38,7 +38,6 @@ import {
   AUTH_PROBE_TIMEOUT_MS,
   buildServerProvider,
   COMPACT_SLASH_COMMAND,
-  DEFAULT_TIMEOUT_MS,
   type ServerProviderDraft,
   spawnAndCollect,
 } from "../providerSnapshot.ts";
@@ -54,6 +53,27 @@ import {
 import { resolveZcodeLaunchArgs, zcodeLaunchArgv } from "./zcodeLaunchArgs.ts";
 
 const isZcodeProtocolSpawnError = Schema.is(ZcodeProtocolSpawnError);
+
+// The zcode CLI is a ~30MB single-file bundle whose cold start (fresh boot,
+// shadow-home materialization racing the probe) can outrun the shared 4s
+// probe budget while several provider checks spawn concurrently at server
+// startup. A timed-out `--version` must not be read as "CLI missing".
+const ZCODE_VERSION_PROBE_TIMEOUT_MS = 15_000;
+
+export interface ZcodeVersionProbeOutcome {
+  readonly version: string | undefined;
+  readonly missing: boolean;
+  readonly timedOut: boolean;
+}
+
+/** Distinct messages: a timeout means the binary exists but was too slow — the old single wording misreported timeouts as "not found". */
+export const zcodeVersionProbeMessage = (
+  binaryPath: string,
+  outcome: Pick<ZcodeVersionProbeOutcome, "timedOut">,
+): string =>
+  outcome.timedOut
+    ? `ZCode CLI at '${binaryPath}' did not answer --version within ${ZCODE_VERSION_PROBE_TIMEOUT_MS / 1000}s (cold start or busy system).`
+    : `ZCode CLI was not found at '${binaryPath}'.`;
 
 const ZCODE_PRESENTATION = {
   displayName: "ZCode",
@@ -161,19 +181,29 @@ const probeZcodeVersion = Effect.fn("probeZcodeVersion")(function* (input: {
       ...(input.environment ? { env: input.environment } : {}),
     }),
   ).pipe(
-    Effect.timeoutOption(Duration.millis(DEFAULT_TIMEOUT_MS)),
+    Effect.timeoutOption(Duration.millis(ZCODE_VERSION_PROBE_TIMEOUT_MS)),
     Effect.map(
       Option.match({
-        onNone: () => ({ version: undefined as string | undefined, missing: true }),
-        onSome: (result) => ({
-          version: result.stdout.match(/(\d+\.\d+\.\d+)/)?.[1],
-          missing:
-            /Cannot find module|MODULE_NOT_FOUND/i.test(result.stderr) ||
-            (result.code !== 0 && result.stdout.trim().length === 0),
-        }),
+        onNone: () =>
+          ({
+            version: undefined,
+            missing: true,
+            timedOut: true,
+          }) satisfies ZcodeVersionProbeOutcome,
+        onSome: (result) =>
+          ({
+            version: result.stdout.match(/(\d+\.\d+\.\d+)/)?.[1],
+            missing:
+              /Cannot find module|MODULE_NOT_FOUND/i.test(result.stderr) ||
+              (result.code !== 0 && result.stdout.trim().length === 0),
+            timedOut: false,
+          }) satisfies ZcodeVersionProbeOutcome,
       }),
     ),
-    Effect.orElseSucceed(() => ({ version: undefined as string | undefined, missing: true })),
+    Effect.orElseSucceed(
+      () =>
+        ({ version: undefined, missing: true, timedOut: false }) satisfies ZcodeVersionProbeOutcome,
+    ),
   );
 });
 
@@ -338,7 +368,7 @@ export const checkZcodeProviderStatus = Effect.fn("checkZcodeProviderStatus")(fu
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: `ZCode CLI was not found at '${zcodeSettings.binaryPath}'.`,
+        message: zcodeVersionProbeMessage(zcodeSettings.binaryPath, versionProbe),
       },
     });
   }

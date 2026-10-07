@@ -99,6 +99,12 @@ const refreshedSnapshotSecond: ServerProvider = {
   message: "Refreshed provider availability again.",
 };
 
+const erroredSnapshot: ServerProvider = {
+  ...refreshedSnapshot,
+  status: "error",
+  message: "ZCode CLI at '/bin/zcode' did not answer --version within 15s.",
+};
+
 function makeBackgroundPolicyLayer(shouldRunScopeWork: boolean) {
   return Layer.mock(BackgroundPolicy.BackgroundPolicy)({
     reportClientActivity: () => Effect.void,
@@ -219,6 +225,47 @@ describe("makeManagedServerProvider", () => {
         yield* Effect.yieldNow;
 
         assert.strictEqual(yield* Ref.get(checkCalls), 1);
+      }),
+    ).pipe(Effect.provide(Layer.mergeAll(NeverRunTestLayer, TestClock.layer()))),
+  );
+
+  it.effect("keeps retrying an errored provider even without foreground demand", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const checkCalls = yield* Ref.make(0);
+        const initialCheckDone = yield* Deferred.make<void>();
+        const retryCheckDone = yield* Deferred.make<void>();
+        yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          // First check fails (all CLI probes time out on a cold boot); the
+          // errored snapshot must still be retried on the next tick even
+          // though the background policy parks periodic refreshes.
+          checkProvider: Ref.updateAndGet(checkCalls, (count) => count + 1).pipe(
+            Effect.tap((count) =>
+              count === 1
+                ? Deferred.succeed(initialCheckDone, undefined).pipe(Effect.ignore)
+                : Deferred.succeed(retryCheckDone, undefined).pipe(Effect.ignore),
+            ),
+            Effect.map((count) => (count === 1 ? erroredSnapshot : refreshedSnapshot)),
+          ),
+          refreshInterval: "1 second",
+        });
+
+        yield* Deferred.await(initialCheckDone);
+        yield* TestClock.adjust("1 second");
+        yield* Deferred.await(retryCheckDone);
+
+        assert.strictEqual(yield* Ref.get(checkCalls), 2);
+
+        // Once the retry lands a non-error snapshot the background policy
+        // gates periodic refreshes again — the retry loop does not spin.
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.yieldNow;
+        assert.strictEqual(yield* Ref.get(checkCalls), 2);
       }),
     ).pipe(Effect.provide(Layer.mergeAll(NeverRunTestLayer, TestClock.layer()))),
   );

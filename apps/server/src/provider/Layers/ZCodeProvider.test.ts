@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 
-import { zcodeModelCatalogToServerModels } from "./ZCodeProvider.ts";
+import { zcodeModelCatalogToServerModels, zcodeVersionProbeMessage } from "./ZCodeProvider.ts";
 import type { ZcodeModelDescriptor, ZcodeModelRef } from "../zcode/ZcodeProtocolClient.ts";
 
 const ref = (providerId: string, modelId: string): ZcodeModelRef => ({ providerId, modelId });
@@ -65,5 +65,21 @@ describe("zcodeModelCatalogToServerModels thoughtLevel capabilities", () => {
     expect(models[0]!.capabilities).toBeNull();
     expect(models[1]!.isCustom).toBe(true);
     expect(models[1]!.capabilities).toBeNull();
+  });
+});
+
+describe("zcodeVersionProbeMessage", () => {
+  it("reports a timeout as a slow answer, not a missing CLI", () => {
+    const message = zcodeVersionProbeMessage("/Users/x/.local/zcode-cli/zcode.cjs", {
+      timedOut: true,
+    });
+    expect(message).toContain("did not answer --version");
+    expect(message).not.toContain("was not found");
+  });
+
+  it("keeps the not-found wording for spawn/module failures", () => {
+    expect(
+      zcodeVersionProbeMessage("/Users/x/.local/zcode-cli/zcode.cjs", { timedOut: false }),
+    ).toBe("ZCode CLI was not found at '/Users/x/.local/zcode-cli/zcode.cjs'.");
   });
 });

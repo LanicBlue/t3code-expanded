@@ -212,6 +212,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   const hasProviderStatusDemand = Effect.gen(function* () {
     const state = yield* Ref.get(snapshotStateRef);
     const instanceId = state.snapshot.instanceId;
+    // An errored snapshot must keep retrying even when the background policy
+    // parks periodic refreshes (no foreground demand). Otherwise a startup
+    // probe that failed once — e.g. all CLI spawns timing out on a cold boot —
+    // is frozen in the cache until a user happens to be connected at a tick.
+    if (state.snapshot.status === "error") {
+      return true;
+    }
     const [genericDemand, instanceDemand] = yield* Effect.all([
       backgroundPolicy.shouldRunScopeWork({ type: "provider-status" }),
       backgroundPolicy.shouldRunScopeWork({ type: "provider-status", instanceId }),
