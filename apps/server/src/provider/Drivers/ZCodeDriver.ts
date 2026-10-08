@@ -1,28 +1,33 @@
 /**
  * ZCodeDriver — `ProviderDriver` for the ZCode CLI runtime.
  *
- * Mirrors `GrokDriver`: a plain value whose `create()` returns one
- * `ProviderInstance` bundling `snapshot` / `adapter` / `textGeneration`
- * closures captured over the per-instance `ZCodeSettings`. The adapter owns
- * ONE shared zcode app-server process for all of the instance's sessions
- * (see `Layers/ZCodeAdapter` for the sharing rationale).
+ * Mirrors `CodexDriver`: a plain value whose `create()` returns one
+ * `ProviderInstance` bundling `snapshot` / `orchestrationAdapter` /
+ * `textGeneration` closures captured over the per-instance `ZCodeSettings`.
+ * The orchestration-v2 adapter (`ZcodeAdapterV2`) owns ONE shared zcode
+ * app-server process for all of the instance's sessions — see its module
+ * notes for the sharing rationale. Shadow-home materialization stays here:
+ * the driver prepares the isolated HOME and hands the composed spawn
+ * environment to the adapter, which never touches the filesystem layout.
  *
  * @module provider/Drivers/ZCodeDriver
  */
 import { ProviderDriverKind, ZCodeSettings } from "@t3tools/contracts";
-import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcessSpawner } from "effect/process";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { makeZcodeTextGeneration } from "../../textGeneration/ZCodeTextGeneration.ts";
+import {
+  createZcodeAdapterV2,
+  type ZcodeAdapterV2DriverEnv,
+} from "../../orchestration-v2/Adapters/ZcodeAdapterV2.ts";
 import { ProviderDriverError } from "../Errors.ts";
-import { makeZcodeAdapter } from "../Layers/ZCodeAdapter.ts";
-import { checkZcodeProviderStatus, makePendingZcodeProvider } from "../Layers/ZCodeProvider.ts";
+import { checkZcodeProviderStatus, makePendingZcodeProvider } from "../ZCodeProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -63,9 +68,8 @@ const UPDATE: ProviderMaintenanceCapabilitiesResolver = {
 };
 
 export type ZCodeDriverEnv =
+  | ZcodeAdapterV2DriverEnv
   | BackgroundPolicy.BackgroundPolicy
-  | ChildProcessSpawner.ChildProcessSpawner
-  | Crypto.Crypto
   | FileSystem.FileSystem
   | Path.Path
   | ServerSettingsService;
@@ -142,10 +146,20 @@ export const ZCodeDriver: ProviderDriver<ZCodeSettings, ZCodeDriverEnv> = {
         ),
       );
 
-      const adapter = yield* makeZcodeAdapter(effectiveConfig, {
-        instanceId,
-        environment: zcodeProcessEnv,
-      });
+      const orchestrationAdapter = yield* createZcodeAdapterV2(
+        { instanceId, displayName, accentColor, environment, enabled, config },
+        { environment: zcodeProcessEnv },
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderDriverError({
+              driver: DRIVER_KIND,
+              instanceId,
+              detail: "Failed to build ZCode orchestration adapter.",
+              cause,
+            }),
+        ),
+      );
       const textGeneration = yield* makeZcodeTextGeneration(effectiveConfig, zcodeProcessEnv);
 
       const checkProvider = checkZcodeProviderStatus(effectiveConfig, zcodeProcessEnv).pipe(
@@ -184,7 +198,7 @@ export const ZCodeDriver: ProviderDriver<ZCodeSettings, ZCodeDriverEnv> = {
         accentColor,
         enabled,
         snapshot,
-        adapter,
+        orchestrationAdapter,
         textGeneration,
       } satisfies ProviderInstance;
     }),

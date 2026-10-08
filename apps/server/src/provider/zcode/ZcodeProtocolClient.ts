@@ -39,7 +39,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
@@ -357,7 +357,11 @@ export const makeZcodeProtocolClient = Effect.fn("makeZcodeProtocolClient")(func
   ChildProcessSpawner.ChildProcessSpawner | Scope.Scope
 > {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const scope = yield* Scope.Scope;
+  // Own resources in a fresh closeable scope (the ambient Scope service is
+  // not closeable in Effect 4 and belongs to the caller). The finalizer keeps
+  // the owning scope as the safety net; `close` releases eagerly instead.
+  const scope = yield* Scope.make();
+  yield* Effect.addFinalizer((exit) => Scope.close(scope, exit));
 
   const extendEnv = options.environment === undefined;
   const spawnCommand = yield* resolveSpawnCommand(

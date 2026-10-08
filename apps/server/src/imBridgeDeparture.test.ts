@@ -1,4 +1,4 @@
-import { ThreadId } from "@t3tools/contracts";
+import { ThreadId, type OrchestrationV2Command } from "@t3tools/contracts";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -10,10 +10,6 @@ import {
   settleDepartedImBridgeThreads,
   type DepartureThreadRow,
 } from "./imBridgeDeparture.ts";
-import { OrchestrationThreadSettleBlockedError } from "./orchestration/Errors.ts";
-import { PersistenceSqlError } from "./persistence/Errors.ts";
-import type { OrchestrationEngineShape } from "./orchestration/Services/OrchestrationEngine.ts";
-import type { ProjectionSnapshotQueryShape } from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 
 const settingsWith = (ids: ReadonlyArray<string>): Pick<ServerSettings, "imBridge"> =>
   ({ imBridge: { members: ids.map((id) => ({ id })) } }) as unknown as Pick<
@@ -58,7 +54,7 @@ describe("liveImBridgeThreads", () => {
   const threads = [
     thread("im-m-a-ms_aaaabbbbccccdddd"),
     thread("im-m-a-ms_aaaabbbbccccdddd-3"), // create-race suffix
-    thread("im-m-a-ms_1111222233334444", { settledAt: "2026-09-11T00:00:00.000Z" }),
+    thread("im-m-a-ms_1111222233334444", { settledAt: "2026-09-11T00:00:00.000Z" as never }),
     thread("im-m-a-ms_5555666677778888", { settledOverride: "settled" }),
     thread("im-m-b-ms_9999aaaabbbbcccc"),
     thread("ordinary-chat-thread"),
@@ -79,39 +75,28 @@ describe("liveImBridgeThreads", () => {
   });
 });
 
-function fakeEngine(failFor: ReadonlyArray<string> = []) {
+function fakeDispatch(failFor: ReadonlyArray<string> = []) {
   const dispatched: Array<{ type: string; threadId: string; commandId: string }> = [];
-  const engine = {
-    dispatch: (command: { type: string; threadId: string; commandId: string }) => {
-      dispatched.push(command);
-      return failFor.includes(command.threadId)
-        ? Effect.fail(
-            new OrchestrationThreadSettleBlockedError({
-              threadId: ThreadId.make(command.threadId),
-            }),
-          )
-        : Effect.succeed({ sequence: dispatched.length });
-    },
-  } as unknown as OrchestrationEngineShape;
-  return { engine, dispatched };
+  const dispatchCommand = (command: OrchestrationV2Command) => {
+    const record = command as unknown as { type: string; threadId: string; commandId: string };
+    dispatched.push(record);
+    return failFor.includes(record.threadId)
+      ? Effect.fail("settle-blocked" as never)
+      : Effect.succeed({ sequence: dispatched.length });
+  };
+  return { dispatchCommand, dispatched };
 }
 
 const snapshotsWith = (threads: ReadonlyArray<DepartureThreadRow>) => {
   let queried = 0;
-  const snapshots = {
-    getShellSnapshot: () => {
-      queried += 1;
-      return Effect.succeed({ threads });
-    },
-  } as unknown as Pick<ProjectionSnapshotQueryShape, "getShellSnapshot">;
-  return { snapshots, queried: () => queried };
+  const getShellSnapshot = () => {
+    queried += 1;
+    return Effect.succeed({ threads }) as never;
+  };
+  return { getShellSnapshot: getShellSnapshot as never, queried: () => queried };
 };
 
-const failingSnapshots = () =>
-  ({
-    getShellSnapshot: () =>
-      Effect.fail(new PersistenceSqlError({ operation: "getShellSnapshot", detail: "db down" })),
-  }) as unknown as Pick<ProjectionSnapshotQueryShape, "getShellSnapshot">;
+const failingSnapshots = () => () => Effect.fail("db down" as never);
 
 const cryptoStub = { randomUUIDv4: Effect.succeed("uuid-fixed") } as unknown as Crypto.Crypto;
 
@@ -120,13 +105,15 @@ const run = <A>(effect: Effect.Effect<A, never, Crypto.Crypto>) =>
 
 describe("settleDepartedImBridgeThreads", () => {
   it("dispatches thread.settle for each removed member's live threads", async () => {
-    const { engine, dispatched } = fakeEngine();
-    const { snapshots } = snapshotsWith([
+    const { dispatchCommand, dispatched } = fakeDispatch();
+    const { getShellSnapshot } = snapshotsWith([
       thread("im-m-a-ms_aaaabbbbccccdddd"),
       thread("im-m-b-ms_1111222233334444"),
-      thread("im-m-a-ms_5555666677778888", { settledAt: "2026-09-11T00:00:00.000Z" }),
+      thread("im-m-a-ms_5555666677778888", { settledAt: "2026-09-11T00:00:00.000Z" as never }),
     ]);
-    const settled = await run(settleDepartedImBridgeThreads(engine, snapshots, ["m-a"]));
+    const settled = await run(
+      settleDepartedImBridgeThreads(dispatchCommand, getShellSnapshot, ["m-a"]),
+    );
     expect(dispatched).toEqual([
       {
         type: "thread.settle",
@@ -138,29 +125,32 @@ describe("settleDepartedImBridgeThreads", () => {
   });
 
   it("skips the snapshot query entirely when no member was removed", async () => {
-    const { engine, dispatched } = fakeEngine();
-    const { snapshots, queried } = snapshotsWith([]);
-    const settled = await run(settleDepartedImBridgeThreads(engine, snapshots, []));
+    const { dispatchCommand, dispatched } = fakeDispatch();
+    const { getShellSnapshot, queried } = snapshotsWith([]);
+    const settled = await run(settleDepartedImBridgeThreads(dispatchCommand, getShellSnapshot, []));
     expect(settled).toEqual([]);
     expect(dispatched).toEqual([]);
     expect(queried()).toBe(0);
   });
 
   it("returns empty (never throws) when the shell snapshot fails", async () => {
-    const { engine, dispatched } = fakeEngine();
-    const snapshots = failingSnapshots();
-    const settled = await run(settleDepartedImBridgeThreads(engine, snapshots, ["m-a"]));
+    const { dispatchCommand, dispatched } = fakeDispatch();
+    const settled = await run(
+      settleDepartedImBridgeThreads(dispatchCommand, failingSnapshots(), ["m-a"]),
+    );
     expect(settled).toEqual([]);
     expect(dispatched).toEqual([]);
   });
 
   it("keeps settling the remaining threads when one dispatch fails", async () => {
-    const { engine, dispatched } = fakeEngine(["im-m-a-ms_1111222233334444"]);
-    const { snapshots } = snapshotsWith([
+    const { dispatchCommand, dispatched } = fakeDispatch(["im-m-a-ms_1111222233334444"]);
+    const { getShellSnapshot } = snapshotsWith([
       thread("im-m-a-ms_aaaabbbbccccdddd"),
       thread("im-m-a-ms_1111222233334444"),
     ]);
-    const settled = await run(settleDepartedImBridgeThreads(engine, snapshots, ["m-a"]));
+    const settled = await run(
+      settleDepartedImBridgeThreads(dispatchCommand, getShellSnapshot, ["m-a"]),
+    );
     expect(dispatched.map((command) => command.threadId)).toEqual([
       "im-m-a-ms_aaaabbbbccccdddd",
       "im-m-a-ms_1111222233334444",

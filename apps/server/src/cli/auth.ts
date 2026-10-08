@@ -10,7 +10,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as References from "effect/References";
 import * as Schema from "effect/Schema";
-import { Argument, Command, Flag, GlobalFlag } from "effect/unstable/cli";
+import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 
@@ -44,7 +44,7 @@ const runWithEnvironmentAuth = <A, E>(
       return yield* run(environmentAuth);
     }).pipe(
       Effect.provide(
-        Layer.mergeAll(EnvironmentAuth.runtimeLayer).pipe(
+        Layer.mergeAll(EnvironmentAuth.layerRuntime).pipe(
           Layer.provide(ServerConfig.layer(config)),
           Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
         ),

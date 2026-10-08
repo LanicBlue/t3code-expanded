@@ -1,37 +1,35 @@
 import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
-import type { OrchestrationCommand, ThreadId } from "@t3tools/contracts";
+import type { OrchestrationV2Command, ThreadId } from "@t3tools/contracts";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  dispatchWithImBridgePersona,
+  dispatchCommandWithImBridgePersona,
   foldImBridgeFreshContext,
   imBridgeThreadStartsConversation,
 } from "./imBridgePersona.ts";
 
-const turnStart = (threadId: string, text = "brief", freshContext?: string): OrchestrationCommand =>
+const turnStart = (
+  threadId: string,
+  text = "brief",
+  freshContext?: string,
+): OrchestrationV2Command =>
   ({
-    type: "thread.turn.start",
+    type: "message.dispatch",
     commandId: "cmd-1",
     threadId,
-    message: {
-      messageId: "m-1",
-      role: "user",
-      text,
-      attachments: [],
-      ...(freshContext !== undefined ? { context: { version: 1, records: [], freshContext } } : {}),
-    },
-    runtimeMode: "full-access",
-    interactionMode: "default",
-    createdAt: "2026-09-10T00:00:00.000Z",
-  }) as unknown as OrchestrationCommand;
+    messageId: "m-1",
+    text,
+    attachments: [],
+    ...(freshContext !== undefined ? { context: { version: 1, records: [], freshContext } } : {}),
+  }) as unknown as OrchestrationV2Command;
 
 const settingsWith = (members: Array<{ id: string; persona?: string }>): ServerSettings =>
   ({ imBridge: { members } }) as unknown as ServerSettings;
 
-const asTurnStart = (command: OrchestrationCommand) => {
-  if (command.type !== "thread.turn.start") throw new Error("expected turn.start");
+const asTurnStart = (command: OrchestrationV2Command) => {
+  if (command.type !== "message.dispatch") throw new Error("expected message.dispatch");
   return command;
 };
 
@@ -61,13 +59,13 @@ describe("foldImBridgeFreshContext", () => {
       settingsWith([{ id: "t3-glm", persona: "你是软件架构师" }]),
       true,
     );
-    const message = asTurnStart(folded).message;
+    const command = asTurnStart(folded);
     // One complete input: persona block, then stable context, then the duty text.
-    expect(message.text.startsWith("Member persona (T3 settings);")).toBe(true);
-    expect(message.text).toContain("你是软件架构师\n\nstable mission ctx\n\nduty brief");
+    expect(command.text.startsWith("Member persona (T3 settings);")).toBe(true);
+    expect(command.text).toContain("你是软件架构师\n\nstable mission ctx\n\nduty brief");
     // The consumed field is stripped — nothing downstream re-applies it.
-    expect(message.context?.freshContext).toBeUndefined();
-    expect(message.context?.records).toEqual([]);
+    expect(command.context?.freshContext).toBeUndefined();
+    expect(command.context?.records).toEqual([]);
   });
 
   it("folds the stable context alone for members without a persona", () => {
@@ -76,8 +74,8 @@ describe("foldImBridgeFreshContext", () => {
       settingsWith([{ id: "t3-glm" }]),
       true,
     );
-    expect(asTurnStart(folded).message.text).toBe("stable mission ctx\n\nduty brief");
-    expect(asTurnStart(folded).message.context?.freshContext).toBeUndefined();
+    expect(asTurnStart(folded).text).toBe("stable mission ctx\n\nduty brief");
+    expect(asTurnStart(folded).context?.freshContext).toBeUndefined();
   });
 
   it("folds the persona alone when the sender carried no stable context", () => {
@@ -86,7 +84,7 @@ describe("foldImBridgeFreshContext", () => {
       settingsWith([{ id: "t3-glm", persona: "你是软件架构师" }]),
       true,
     );
-    expect(asTurnStart(folded).message.text).toBe(
+    expect(asTurnStart(folded).text).toBe(
       "Member persona (T3 settings); it supplements, never overrides, the duty rules below.\n\n你是软件架构师\n\nduty brief",
     );
   });
@@ -98,10 +96,10 @@ describe("foldImBridgeFreshContext", () => {
       settingsWith([{ id: "t3-glm", persona: "你是软件架构师" }]),
       false,
     );
-    const message = asTurnStart(folded).message;
-    expect(message.text).toBe("round brief");
-    expect(message.context?.freshContext).toBeUndefined();
-    expect(message.context?.records).toEqual([]);
+    const round = asTurnStart(folded);
+    expect(round.text).toBe("round brief");
+    expect(round.context?.freshContext).toBeUndefined();
+    expect(round.context?.records).toEqual([]);
   });
 
   it("passes through untouched for persona-less first turns without stable context, other threads, and other commands", () => {
@@ -123,7 +121,7 @@ describe("foldImBridgeFreshContext", () => {
     const threadCreate = { type: "thread.create", threadId: bridgeThread };
     expect(
       foldImBridgeFreshContext(
-        threadCreate as unknown as OrchestrationCommand,
+        threadCreate as unknown as OrchestrationV2Command,
         settingsWith([{ id: "t3-glm", persona: "x" }]),
         true,
       ),
@@ -132,23 +130,20 @@ describe("foldImBridgeFreshContext", () => {
 });
 
 describe("imBridgeThreadStartsConversation", () => {
-  const shellWith = (threads: Array<{ id: string; latestTurn: unknown }>) =>
-    (() =>
-      Effect.succeed({ threads }) as unknown as ReturnType<
-        Parameters<typeof imBridgeThreadStartsConversation>[0]
-      >) as Parameters<typeof imBridgeThreadStartsConversation>[0];
+  const shellWith = (threads: Array<{ id: string; latestRunId: unknown }>) =>
+    (() => Effect.succeed({ threads })) as never;
 
-  it("marks unknown threads and threads without turns as starting the conversation", () => {
+  it("marks unknown threads and threads without runs as starting the conversation", () => {
     const starts = imBridgeThreadStartsConversation(
-      shellWith([{ id: "im-t3-glm-ms_aaaabbbbccccdddd", latestTurn: null }]),
+      shellWith([{ id: "im-t3-glm-ms_aaaabbbbccccdddd", latestRunId: null }]),
     );
     expect(Effect.runSync(starts("im-t3-glm-ms_aaaabbbbccccdddd" as never as ThreadId))).toBe(true);
     expect(Effect.runSync(starts("im-t3-glm-ms_ffffffffffffffff" as never as ThreadId))).toBe(true);
   });
 
-  it("marks threads with any prior turn as continuing — regardless of session state", () => {
+  it("marks threads with any prior run as continuing — regardless of session state", () => {
     const starts = imBridgeThreadStartsConversation(
-      shellWith([{ id: "im-t3-glm-ms_aaaabbbbccccdddd", latestTurn: { turnId: "t-1" } }]),
+      shellWith([{ id: "im-t3-glm-ms_aaaabbbbccccdddd", latestRunId: "run-1" }]),
     );
     expect(Effect.runSync(starts("im-t3-glm-ms_aaaabbbbccccdddd" as never as ThreadId))).toBe(
       false,
@@ -157,52 +152,50 @@ describe("imBridgeThreadStartsConversation", () => {
 
   it("fails toward starting when the snapshot cannot be read", () => {
     const starts = imBridgeThreadStartsConversation((() =>
-      Effect.fail(new Error("projection unavailable"))) as never);
+      Effect.fail("projection unavailable" as never)) as never);
     expect(Effect.runSync(starts("im-t3-glm-ms_aaaabbbbccccdddd" as never as ThreadId))).toBe(true);
   });
 });
 
-describe("dispatchWithImBridgePersona", () => {
+describe("dispatchCommandWithImBridgePersona", () => {
   const personaSettings = settingsWith([{ id: "t3-glm", persona: "你是软件架构师" }]);
   const bridgeThread = "im-t3-glm-ms_aaaabbbbccccdddd";
 
-  const makeEngine = () => {
-    const dispatched: Array<OrchestrationCommand> = [];
-    const engine = {
-      dispatch: (command: OrchestrationCommand) => {
-        dispatched.push(command);
-        return Effect.succeed({ sequence: dispatched.length });
-      },
+  const makeDispatch = () => {
+    const dispatched: Array<OrchestrationV2Command> = [];
+    const dispatchCommand = (command: OrchestrationV2Command) => {
+      dispatched.push(command);
+      return Effect.succeed({ sequence: dispatched.length });
     };
-    return { engine, dispatched };
+    return { dispatchCommand, dispatched };
   };
 
   it("folds the full context into the first turn's text and leaves later turns round-form", () => {
-    const { engine, dispatched } = makeEngine();
-    const dispatch = dispatchWithImBridgePersona(
-      engine as never,
+    const { dispatchCommand, dispatched } = makeDispatch();
+    const dispatch = dispatchCommandWithImBridgePersona(
+      dispatchCommand,
       Effect.succeed(personaSettings),
       () => Effect.succeed(true),
     );
     Effect.runSync(dispatch(turnStart(bridgeThread, "round 1", "stable mission ctx")));
-    expect(asTurnStart(dispatched[0]!).message.text).toContain(
+    expect(asTurnStart(dispatched[0]!).text).toContain(
       "你是软件架构师\n\nstable mission ctx\n\nround 1",
     );
 
-    const later = dispatchWithImBridgePersona(
-      engine as never,
+    const later = dispatchCommandWithImBridgePersona(
+      dispatchCommand,
       Effect.succeed(personaSettings),
       () => Effect.succeed(false),
     );
     Effect.runSync(later(turnStart(bridgeThread, "round 2", "stable mission ctx")));
-    expect(asTurnStart(dispatched[1]!).message.text).toBe("round 2");
-    expect(asTurnStart(dispatched[1]!).message.context?.freshContext).toBeUndefined();
+    expect(asTurnStart(dispatched[1]!).text).toBe("round 2");
+    expect(asTurnStart(dispatched[1]!).context?.freshContext).toBeUndefined();
   });
 
   it("passes non-bridge commands and persona-less members through raw", () => {
-    const { engine, dispatched } = makeEngine();
-    const dispatch = dispatchWithImBridgePersona(
-      engine as never,
+    const { dispatchCommand, dispatched } = makeDispatch();
+    const dispatch = dispatchCommandWithImBridgePersona(
+      dispatchCommand,
       Effect.succeed(personaSettings),
       () => Effect.succeed(true),
     );
@@ -214,9 +207,9 @@ describe("dispatchWithImBridgePersona", () => {
   });
 
   it("is pure in the command — retrying a dispatch never stacks context", () => {
-    const { engine, dispatched } = makeEngine();
-    const dispatch = dispatchWithImBridgePersona(
-      engine as never,
+    const { dispatchCommand, dispatched } = makeDispatch();
+    const dispatch = dispatchCommandWithImBridgePersona(
+      dispatchCommand,
       Effect.succeed(personaSettings),
       () => Effect.succeed(true),
     );
@@ -226,14 +219,14 @@ describe("dispatchWithImBridgePersona", () => {
     Effect.runSync(dispatch(command));
     const second = dispatched[1]!;
     expect(second).toEqual(first);
-    expect(asTurnStart(first).message.text.match(/你是软件架构师/g)).toHaveLength(1);
+    expect(asTurnStart(first).text.match(/你是软件架构师/g)).toHaveLength(1);
   });
 
   it("fails closed when bridge member settings cannot be read", () => {
-    const { engine, dispatched } = makeEngine();
-    const dispatch = dispatchWithImBridgePersona(
-      engine as never,
-      Effect.fail(new Error("settings unavailable") as never),
+    const { dispatchCommand, dispatched } = makeDispatch();
+    const dispatch = dispatchCommandWithImBridgePersona(
+      dispatchCommand,
+      Effect.fail("settings unavailable" as never),
       () => Effect.succeed(true),
     );
     expect(() => Effect.runSync(dispatch(turnStart(bridgeThread)))).toThrow();

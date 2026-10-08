@@ -11,14 +11,21 @@
  * @module imBridgeDeparture
  */
 import { CommandId, ThreadId } from "@t3tools/contracts";
+import type {
+  OrchestrationV2Command,
+  OrchestrationV2ThreadShellSnapshot,
+} from "@t3tools/contracts";
 import { imBridgeMemberIdOfThreadId } from "@t3tools/contracts/settings";
 import type { ServerSettings } from "@t3tools/contracts/settings";
 import * as Crypto from "effect/Crypto";
+import type * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 
-import type { OrchestrationEngineShape } from "./orchestration/Services/OrchestrationEngine.ts";
-import type { ProjectionSnapshotQueryShape } from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+/** Orchestration v2 command dispatch (e.g. `ThreadMessageIntake.dispatchCommand`). */
+export type ImBridgeDispatchCommand<E, R = never> = (
+  command: OrchestrationV2Command,
+) => Effect.Effect<{ readonly sequence: number }, E, R>;
 
 /**
  * Member ids present in `previous` but gone from `next`. Removal only — a
@@ -36,10 +43,10 @@ export function removedImBridgeMemberIds(
   return removed;
 }
 
-/** The shell fields the liveness rule needs; satisfied by `OrchestrationThreadShell`. */
+/** The shell fields the liveness rule needs; satisfied by the v2 thread shell. */
 export interface DepartureThreadRow {
   readonly id: ThreadId;
-  readonly settledAt: string | null;
+  readonly settledAt: DateTime.Utc | null;
   readonly settledOverride: string | null;
 }
 
@@ -70,15 +77,15 @@ export function liveImBridgeThreads<T extends DepartureThreadRow>(
 export const settleDepartedImBridgeThreads = Effect.fn(
   "imBridgeDeparture.settleDepartedImBridgeThreads",
 )(
-  (
-    engine: OrchestrationEngineShape,
-    snapshots: Pick<ProjectionSnapshotQueryShape, "getShellSnapshot">,
+  <E, R, S>(
+    dispatchCommand: ImBridgeDispatchCommand<E, R>,
+    getShellSnapshot: () => Effect.Effect<OrchestrationV2ThreadShellSnapshot, S>,
     memberIds: ReadonlyArray<string>,
-  ): Effect.Effect<ReadonlyArray<ThreadId>, never, Crypto.Crypto> =>
+  ): Effect.Effect<ReadonlyArray<ThreadId>, never, R | Crypto.Crypto> =>
     Effect.gen(function* () {
       if (memberIds.length === 0) return [];
       const crypto = yield* Crypto.Crypto;
-      const snapshot = yield* Effect.result(snapshots.getShellSnapshot());
+      const snapshot = yield* Effect.result(getShellSnapshot());
       if (Result.isFailure(snapshot)) {
         yield* Effect.logWarning(
           "IM bridge departure settle skipped — shell snapshot unavailable",
@@ -98,7 +105,7 @@ export const settleDepartedImBridgeThreads = Effect.fn(
       for (const thread of targets) {
         const dispatched = yield* Effect.result(
           Effect.flatMap(crypto.randomUUIDv4, (uuid) =>
-            engine.dispatch({
+            dispatchCommand({
               type: "thread.settle",
               commandId: CommandId.make(`server:im-bridge-departure:${thread.id}:${uuid}`),
               threadId: thread.id,

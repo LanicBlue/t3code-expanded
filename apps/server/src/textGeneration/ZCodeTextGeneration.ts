@@ -20,7 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { type ModelSelection, TextGenerationError, type ZCodeSettings } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
@@ -40,7 +40,7 @@ import {
   sanitizePrTitle,
   sanitizeThreadTitle,
 } from "./TextGenerationUtils.ts";
-import { resolveZcodeLaunchArgs, zcodeLaunchArgv } from "../provider/Layers/zcodeLaunchArgs.ts";
+import { resolveZcodeLaunchArgs, zcodeLaunchArgv } from "../provider/zcodeLaunchArgs.ts";
 
 const ZCODE_TIMEOUT_MS = 180_000;
 /** macOS ARG_MAX is ~1 MiB shared with the environment; stay well below it. */

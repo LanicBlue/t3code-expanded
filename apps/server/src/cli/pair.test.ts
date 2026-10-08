@@ -11,7 +11,7 @@ import { afterAll, assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestConsole from "effect/testing/TestConsole";
-import { Command } from "effect/unstable/cli";
+import { Command } from "effect/cli";
 
 // Fixture dirs are tracked and removed in afterAll; a killed run still leaks,
 // but normal runs no longer strand one mkdtemp per test in $TMPDIR.
@@ -25,7 +25,7 @@ afterAll(() => {
   for (const dir of tempDirs) NodeFS.rmSync(dir, { recursive: true, force: true });
 });
 
-import { cli } from "../bin.ts";
+import { cli } from "../binCli.ts";
 import {
   SERVICE_LAUNCHER_CONTEXT_ENV,
   SERVICE_LAUNCHER_PROTOCOL,
@@ -44,7 +44,7 @@ import {
 
 import packageJson from "../../package.json" with { type: "json" };
 
-const CliRuntimeLayer = Layer.mergeAll(NodeServices.layer, NetService.layer);
+const layerCliRuntime = Layer.mergeAll(NodeServices.layer, NetService.layer);
 
 const baseState = {
   version: 1,
@@ -106,7 +106,7 @@ describe("pair tailscale local target", () => {
 const runCli = (args: ReadonlyArray<string>) => Command.runWith(cli, { version: "0.0.0" })(args);
 
 const provideCliTestLayers = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  Effect.provide(effect, Layer.mergeAll(CliRuntimeLayer, TestConsole.layer));
+  Effect.provide(effect, Layer.mergeAll(layerCliRuntime, TestConsole.layer));
 
 // Console output accumulates across CLI runs within a test, and each
 // Console.log call is one entry — so the latest command's output is the last
@@ -185,7 +185,6 @@ describe("t3 pair", () => {
         const listed = yield* captureStdout(
           runCli(["auth", "pairing", "list", "--base-dir", baseDir, "--json"]),
         );
-        // @effect-diagnostics-next-line preferSchemaOverJson:off - CLI JSON output is decoded as a presentation DTO.
         const credentials = JSON.parse(listed) as ReadonlyArray<{ readonly label?: string }>;
         assert.equal(credentials.length, 1);
         assert.equal(credentials[0]?.label, "t3 pair");
