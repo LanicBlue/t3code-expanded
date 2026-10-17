@@ -34,6 +34,7 @@ import {
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
+  type OrchestrationV2TurnItem,
   ProviderDriverKind,
   type ProviderEvent,
   type ProviderInstanceId,
@@ -92,10 +93,11 @@ const DEFAULT_ZCODE_SETTINGS = Schema.decodeSync(ZCodeSettingsSchema)({});
 /**
  * What the zcode app-server protocol actually supports (probe-verified; see
  * the module notes in `provider/zcode/`). Deliberately narrower than most
- * adapters: no native rollback/fork, no approvals bridge, no subagents, and
- * no streamed assistant text projected onto the v2 algebra (deltas arrive on
- * the wire but T3 keeps its own canonical transcript from the turn's coarse
- * completion).
+ * adapters: no native rollback/fork, no approvals bridge, no subagents.
+ * Assistant text streams live via `model.streaming` text_deltas accumulated
+ * per wire assistantMessageId; `message.upserted` (when delivered) is the
+ * authoritative full-text overwrite, and `turn.completed.payload.response`
+ * backstops a turn that produced no streamed segment at all.
  */
 const ZcodeProviderCapabilitiesV2 = {
   sessions: {
@@ -130,11 +132,11 @@ const ZcodeProviderCapabilitiesV2 = {
     terminalStatusQuality: "strong",
   },
   streaming: {
-    streamsAssistantText: false,
+    streamsAssistantText: true,
     streamsReasoning: false,
     streamsToolOutput: false,
     streamsPlanText: false,
-    emitsMessageCompleted: false,
+    emitsMessageCompleted: true,
   },
   tools: {
     exposesToolItemIds: true,
@@ -404,6 +406,15 @@ interface ActiveZcodeTurn {
   readonly rootNodeId: ProviderAdapter.ProviderAdapterV2TurnInput["rootNodeId"];
   readonly itemOrdinals: Map<string, number>;
   nextItemOrdinal: number;
+  /**
+   * Assistant text accumulated per wire `assistantMessageId` — each
+   * `model.streaming` text_delta appends; `message.upserted` overwrites with
+   * the authoritative full text. Keyed by the wire id so every emission
+   * derives one stable message/node/item id triple per assistant segment.
+   * `final` marks segments already emitted with streaming=false (done delta
+   * or authoritative overwrite) so turn completion does not re-emit them.
+   */
+  readonly streamedText: Map<string, { text: string; startedAt: DateTime.Utc; final: boolean }>;
   interrupted: boolean;
   finalized: boolean;
 }
@@ -704,6 +715,97 @@ export function makeZcodeAdapterV2(
 
         // ── ProviderEvent projection ──────────────────────────────────
 
+        /**
+         * Project one assistant text segment (OpenCode2 adapter pattern):
+         * execution node + conversation message + turn item, all keyed off
+         * the wire message id so re-emissions upsert the same ids. Called
+         * with the accumulated text on every `model.streaming` text_delta
+         * (streaming=true) and once more on finalize with streaming=false.
+         */
+        const emitAssistantMessage = Effect.fn("ZcodeAdapterV2.emitAssistantMessage")(function* (
+          turn: ActiveZcodeTurn,
+          nativeMessageId: string,
+          text: string,
+          input: {
+            readonly streaming: boolean;
+            readonly startedAt: DateTime.Utc;
+            readonly occurredAt: DateTime.Utc;
+          },
+        ) {
+          const messageId = idAllocator.derive.messageFromProviderItem({
+            driver: ZCODE_PROVIDER,
+            nativeItemId: nativeMessageId,
+          });
+          const nodeId = idAllocator.derive.nodeFromProviderItem({
+            driver: ZCODE_PROVIDER,
+            nativeItemId: nativeMessageId,
+          });
+          const completedAt = input.streaming ? null : input.occurredAt;
+          yield* emitProviderEvent({
+            type: "node.updated",
+            driver: ZCODE_PROVIDER,
+            node: {
+              id: nodeId,
+              threadId: turn.threadId,
+              runId: turn.runId,
+              parentNodeId: turn.rootNodeId,
+              rootNodeId: turn.rootNodeId,
+              kind: "assistant_message",
+              status: input.streaming ? "running" : "completed",
+              countsForRun: false,
+              providerThreadId: turn.providerThreadId,
+              providerTurnId: turn.providerTurn.id,
+              nativeItemRef: providerRef(nativeMessageId),
+              runtimeRequestId: null,
+              checkpointScopeId: null,
+              startedAt: input.startedAt,
+              completedAt,
+            },
+          });
+          yield* emitProviderEvent({
+            type: "message.updated",
+            driver: ZCODE_PROVIDER,
+            message: {
+              createdBy: "agent",
+              creationSource: "provider",
+              id: messageId,
+              threadId: turn.threadId,
+              runId: turn.runId,
+              nodeId,
+              role: "assistant",
+              text,
+              attachments: [],
+              streaming: input.streaming,
+              createdAt: input.startedAt,
+              updatedAt: input.occurredAt,
+            },
+          });
+          const turnItem: OrchestrationV2TurnItem = {
+            id: idAllocator.derive.turnItemFromProviderItem({
+              driver: ZCODE_PROVIDER,
+              nativeItemId: nativeMessageId,
+            }),
+            threadId: turn.threadId,
+            runId: turn.runId,
+            nodeId,
+            providerThreadId: turn.providerThreadId,
+            providerTurnId: turn.providerTurn.id,
+            nativeItemRef: providerRef(nativeMessageId),
+            parentItemId: null,
+            ordinal: itemOrdinal(turn, nativeMessageId),
+            status: input.streaming ? "running" : "completed",
+            title: null,
+            startedAt: input.startedAt,
+            completedAt,
+            updatedAt: input.occurredAt,
+            type: "assistant_message",
+            messageId,
+            text,
+            streaming: input.streaming,
+          };
+          yield* emitProviderEvent({ type: "turn_item.updated", driver: ZCODE_PROVIDER, turnItem });
+        });
+
         const handleRuntimeEvent = Effect.fn("ZcodeAdapterV2.handleRuntimeEvent")(function* (
           event: ProviderEvent,
         ) {
@@ -765,6 +867,58 @@ export function makeZcodeAdapterV2(
               }
               return;
             }
+            case "model.streaming": {
+              if (turn === null) return;
+              const kind = trimText(wirePayload?.kind);
+              if (kind !== "text_delta") return;
+              const nativeMessageId = trimText(wirePayload?.assistantMessageId);
+              if (nativeMessageId === undefined) return;
+              const delta = typeof wirePayload?.delta === "string" ? wirePayload.delta : "";
+              const final = wirePayload?.done === true;
+              const entry = turn.streamedText.get(nativeMessageId) ?? {
+                text: "",
+                startedAt: occurredAt,
+                final: false,
+              };
+              entry.text += delta;
+              entry.final = final;
+              turn.streamedText.set(nativeMessageId, entry);
+              if (entry.text.length === 0) return;
+              yield* emitAssistantMessage(turn, nativeMessageId, entry.text, {
+                streaming: !final,
+                startedAt: entry.startedAt,
+                occurredAt,
+              });
+              return;
+            }
+            case "message.upserted": {
+              // Authoritative full-text overwrite when the CLI delivers it
+              // (persistence/rehydration path). Only clearly-assistant
+              // records project: `toolCalls` is assistant-only on the wire,
+              // and payloads carrying `type` (system messages) or
+              // `attachments` (user echo, already in T3's canonical
+              // transcript) are skipped.
+              if (turn === null) return;
+              if (wirePayload?.toolCalls === undefined) return;
+              const nativeMessageId =
+                trimText(wirePayload?.messageId) ?? trimText(payload?.entityId);
+              const text = typeof wirePayload?.content === "string" ? wirePayload.content : "";
+              if (nativeMessageId === undefined || text.trim().length === 0) return;
+              const entry = turn.streamedText.get(nativeMessageId) ?? {
+                text: "",
+                startedAt: occurredAt,
+                final: false,
+              };
+              entry.text = text;
+              entry.final = true;
+              turn.streamedText.set(nativeMessageId, entry);
+              yield* emitAssistantMessage(turn, nativeMessageId, text, {
+                streaming: false,
+                startedAt: entry.startedAt,
+                occurredAt,
+              });
+              return;
+            }
             case "tool.updated": {
               if (turn === null || state.providerThread === null) return;
               const node = projectZcodeToolNode(
@@ -790,6 +944,33 @@ export function makeZcodeAdapterV2(
               if (turn === null) return;
               const resultType = trimText(wirePayload?.resultType);
               const status = zcodeResultTypeToTerminalStatus(resultType, turn.interrupted);
+              // Close out the streamed assistant segments: a `done:true`
+              // delta may not always arrive (stream cut short), so re-emit
+              // every still-streaming entry with streaming=false. If the
+              // turn produced NO streamed segment at all but the wire
+              // completion carries a non-empty `response`, backstop with
+              // that full text (segment id scoped to the provider turn).
+              if (status !== "failed" && turn.streamedText.size === 0) {
+                const response =
+                  typeof wirePayload?.response === "string" ? wirePayload.response : "";
+                if (response.trim().length > 0) {
+                  const nativeMessageId = `turn:${turn.providerTurn.id}:response`;
+                  turn.streamedText.set(nativeMessageId, {
+                    text: response,
+                    startedAt: occurredAt,
+                    final: false,
+                  });
+                }
+              }
+              for (const [nativeMessageId, entry] of turn.streamedText) {
+                if (entry.final) continue;
+                yield* emitAssistantMessage(turn, nativeMessageId, entry.text, {
+                  streaming: false,
+                  startedAt: entry.startedAt,
+                  occurredAt,
+                });
+              }
+              turn.streamedText.clear();
               const errorMessage =
                 status === "failed" ? readZcodeErrorMessage(wirePayload) : undefined;
               const usage = normalizeZcodeTokenUsage(asRecord(wirePayload?.usage));
@@ -829,6 +1010,16 @@ export function makeZcodeAdapterV2(
             case "turn.failed": {
               if (turn === null) return;
               // Failure paths emit `turn.failed` INSTEAD of `turn.completed`.
+              // Close any partially-streamed assistant text so the UI does
+              // not keep a forever-streaming item.
+              for (const [nativeMessageId, entry] of turn.streamedText) {
+                yield* emitAssistantMessage(turn, nativeMessageId, entry.text, {
+                  streaming: false,
+                  startedAt: entry.startedAt,
+                  occurredAt,
+                });
+              }
+              turn.streamedText.clear();
               yield* finalizeTurn(turn, "failed", {
                 failure: makeProviderFailure({
                   message: readZcodeErrorMessage(wirePayload),
@@ -1094,6 +1285,7 @@ export function makeZcodeAdapterV2(
                 rootNodeId: turnInput.rootNodeId,
                 itemOrdinals: new Map(),
                 nextItemOrdinal: turnInput.providerTurnOrdinal * 100,
+                streamedText: new Map(),
                 interrupted: false,
                 finalized: false,
               };

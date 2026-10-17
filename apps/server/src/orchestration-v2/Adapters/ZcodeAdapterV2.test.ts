@@ -620,4 +620,149 @@ describe("ZcodeAdapterV2", () => {
       expect(harness.spawned).toHaveLength(2);
       expect(thread.nativeThreadRef?.nativeId).toBe("sess_1");
     }).pipe(Effect.scoped, Effect.provide(layerTest), Effect.runPromise));
+
+  it("streams assistant text from model.streaming deltas and finalizes on turn completion", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const runtime = yield* harness.openSession();
+      const { waitUntil } = yield* collectRuntimeEvents(runtime);
+      const providerThread = yield* runtime.ensureThread(ensureThreadInput());
+      yield* runtime.startTurn(startTurnInput(providerThread));
+      const fake = harness.spawned[0]!;
+
+      yield* fake.pushNotification({
+        type: "model.streaming",
+        sessionId: "sess_1",
+        payload: { assistantMessageId: "msg_a1", delta: "你好", done: false, kind: "text_delta" },
+      });
+      yield* fake.pushNotification({
+        type: "model.streaming",
+        sessionId: "sess_1",
+        payload: { assistantMessageId: "msg_a1", delta: "，世界", done: false, kind: "text_delta" },
+      });
+      yield* fake.pushNotification({
+        type: "model.streaming",
+        sessionId: "sess_1",
+        payload: {
+          assistantMessageId: "msg_a1",
+          delta: "思考",
+          done: false,
+          kind: "reasoning_delta",
+        },
+      });
+      yield* fake.pushNotification({
+        type: "turn.completed",
+        sessionId: "sess_1",
+        payload: { resultType: "success", usage: { totalTokens: 10 } },
+      });
+
+      const events = yield* waitUntil((collected) =>
+        collected.some((event) => event.type === "turn.terminal"),
+      );
+      const messageEvents = events.filter(
+        (event): event is Extract<ProviderAdapterV2Event, { type: "message.updated" }> =>
+          event.type === "message.updated",
+      );
+      // reasoning_delta is skipped; both deltas stream, turn.completed
+      // finalizes the accumulated segment (done never arrived).
+      expect(messageEvents.map((event) => event.message.text)).toEqual([
+        "你好",
+        "你好，世界",
+        "你好，世界",
+      ]);
+      expect(messageEvents.map((event) => event.message.streaming)).toEqual([true, true, false]);
+      expect(messageEvents.every((event) => event.message.role === "assistant")).toBe(true);
+
+      const itemEvents = events.filter(
+        (event): event is Extract<ProviderAdapterV2Event, { type: "turn_item.updated" }> =>
+          event.type === "turn_item.updated",
+      );
+      expect(itemEvents.map((event) => event.turnItem.type)).toEqual([
+        "assistant_message",
+        "assistant_message",
+        "assistant_message",
+      ]);
+      const lastItem = itemEvents[2]!.turnItem;
+      expect(lastItem.type === "assistant_message" && lastItem.streaming === false).toBe(true);
+
+      const nodeKinds = events
+        .filter(
+          (event): event is Extract<ProviderAdapterV2Event, { type: "node.updated" }> =>
+            event.type === "node.updated",
+        )
+        .map((event) => event.node.kind);
+      expect(nodeKinds).toContain("assistant_message");
+    }).pipe(Effect.scoped, Effect.provide(layerTest), Effect.runPromise));
+
+  it("treats message.upserted as the authoritative overwrite and skips user echo", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const runtime = yield* harness.openSession();
+      const { waitUntil } = yield* collectRuntimeEvents(runtime);
+      const providerThread = yield* runtime.ensureThread(ensureThreadInput());
+      yield* runtime.startTurn(startTurnInput(providerThread));
+      const fake = harness.spawned[0]!;
+
+      yield* fake.pushNotification({
+        type: "model.streaming",
+        sessionId: "sess_1",
+        payload: { assistantMessageId: "msg_a2", delta: "草稿", done: false, kind: "text_delta" },
+      });
+      // User echo (attachments, no toolCalls) must NOT project a second copy.
+      yield* fake.pushNotification({
+        type: "message.upserted",
+        sessionId: "sess_1",
+        payload: { content: "hello zcode", attachments: [] },
+      });
+      yield* fake.pushNotification({
+        type: "message.upserted",
+        sessionId: "sess_1",
+        payload: { messageId: "msg_a2", content: "定稿文本", toolCalls: [] },
+      });
+      yield* fake.pushNotification({
+        type: "turn.completed",
+        sessionId: "sess_1",
+        payload: { resultType: "success", usage: { totalTokens: 10 } },
+      });
+
+      const events = yield* waitUntil((collected) =>
+        collected.some((event) => event.type === "turn.terminal"),
+      );
+      const messageEvents = events
+        .filter(
+          (event): event is Extract<ProviderAdapterV2Event, { type: "message.updated" }> =>
+            event.type === "message.updated",
+        )
+        .map((event) => event.message);
+      expect(messageEvents.map((message) => message.text)).toEqual(["草稿", "定稿文本"]);
+      // One stable id across streaming + overwrite + finalize re-emit.
+      expect(new Set(messageEvents.map((message) => message.id)).size).toBe(1);
+      expect(messageEvents.at(-1)?.streaming).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(layerTest), Effect.runPromise));
+
+  it("backstops a turn with no streamed segments using turn.completed response", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const runtime = yield* harness.openSession();
+      const { waitUntil } = yield* collectRuntimeEvents(runtime);
+      const providerThread = yield* runtime.ensureThread(ensureThreadInput());
+      yield* runtime.startTurn(startTurnInput(providerThread));
+      const fake = harness.spawned[0]!;
+
+      yield* fake.pushNotification({
+        type: "turn.completed",
+        sessionId: "sess_1",
+        payload: { resultType: "success", response: "成功", usage: { totalTokens: 10 } },
+      });
+
+      const events = yield* waitUntil((collected) =>
+        collected.some((event) => event.type === "turn.terminal"),
+      );
+      const messageEvents = events.filter(
+        (event): event is Extract<ProviderAdapterV2Event, { type: "message.updated" }> =>
+          event.type === "message.updated",
+      );
+      expect(messageEvents.map((event) => event.message.text)).toEqual(["成功"]);
+      expect(messageEvents[0]?.message.streaming).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(layerTest), Effect.runPromise));
 });
